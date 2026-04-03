@@ -1,0 +1,56 @@
+How to Write Kernel to SD Card via TFTP
+====================================
+
+Prerequisites:
+1. NanoPi M4 is connected to your network
+2. SD card is inserted in NanoPi M4
+3. TFTP server is running on your PC (192.168.1.166)
+4. kernel_neuro.bin (20480 bytes) is in C:\tftpboot
+
+Step-by-step instructions:
+
+1. In U-Boot console, set up network:
+   setenv ipaddr 192.168.1.10
+   setenv serverip 192.168.1.166
+   setenv bootfile kernel_neuro.bin
+
+2. Test network connection:
+   ping 192.168.1.166
+   (Should show 'host 192.168.1.166 is alive')
+
+3. Set up SD card write command:
+   setenv loadaddr 0x42000000
+   setenv sdwrite 'tftp ${loadaddr} ${bootfile}; mmc dev 0; mmc write ${loadaddr} 0x800 0x1000'
+   saveenv
+
+4. Execute the write command:
+   run sdwrite
+
+Expected output:
+- TFTP transfer should start
+- File should be downloaded
+- MMC write operation should complete
+
+To verify:
+1. After writing completes, you can reset the board:
+   reset
+
+2. The new kernel should boot from SD card
+
+Troubleshooting:
+1. If TFTP fails:
+   - Check network connection
+   - Verify TFTP server is running
+   - Try 'ping 192.168.1.166'
+
+2. If MMC write fails:
+   - Check if SD card is properly inserted
+   - Try 'mmc info' to verify SD card is detected
+   - Try 'mmc dev 0' to select SD card
+
+3. If boot fails after writing:
+   - Check if write was successful
+   - Verify kernel size and offsets
+   - Try reading back with: 'mmc read ${loadaddr} 0x800 0x1000'
+
+Note: The offsets (0x800) and size (0x1000) are examples and should match your actual kernel size and partition layout.

@@ -1,0 +1,92 @@
+# H-Exo Omni-Core: Optimized Build System
+# Modular architecture with aggressive optimization
+
+CC = C:/gcc-arm/bin/aarch64-none-elf-gcc
+AS = C:/gcc-arm/bin/aarch64-none-elf-as
+LD = C:/gcc-arm/bin/aarch64-none-elf-ld
+OBJCOPY = C:/gcc-arm/bin/aarch64-none-elf-objcopy
+OBJDUMP = C:/gcc-arm/bin/aarch64-none-elf-objdump
+
+# Aggressive optimization flags
+CFLAGS = -Wall -Wextra -Werror \
+         -O3 \
+         -ffreestanding \
+         -nostdlib \
+         -nostartfiles \
+         -fno-common \
+         -fno-builtin \
+         -fno-stack-protector \
+         -march=armv8-a+crc+crypto \
+         -mtune=cortex-a72.cortex-a53 \
+         -mstrict-align \
+         -I.
+
+ASFLAGS = -march=armv8-a+crc+crypto
+
+LDFLAGS = -T linker_optimized.ld \
+          -nostdlib \
+          -nostartfiles \
+          --gc-sections
+
+# Source files
+ASM_SOURCES = boot_optimized.s mmu_optimized.s
+C_SOURCES = core/kernel.c hal/uart.c
+
+# Object files
+ASM_OBJECTS = $(ASM_SOURCES:.s=.o)
+C_OBJECTS = $(C_SOURCES:.c=.o)
+ALL_OBJECTS = $(ASM_OBJECTS) $(C_OBJECTS)
+
+# Targets
+TARGET = kernel_optimized
+ELF = $(TARGET).elf
+BIN = $(TARGET).bin
+MAP = $(TARGET).map
+LST = $(TARGET).lst
+
+.PHONY: all clean info
+
+all: $(BIN) info
+
+# Assembly compilation
+%.o: %.s
+	@echo "[AS] $<"
+	@$(AS) $(ASFLAGS) $< -o $@
+
+# C compilation
+%.o: %.c
+	@echo "[CC] $<"
+	@$(CC) $(CFLAGS) -c $< -o $@
+
+# Linking
+$(ELF): $(ALL_OBJECTS)
+	@echo "[LD] $@"
+	@$(LD) $(LDFLAGS) -Map=$(MAP) $(ALL_OBJECTS) -o $@
+	@echo "[OBJDUMP] Generating disassembly..."
+	@$(OBJDUMP) -D $@ > $(LST)
+
+# Binary extraction
+$(BIN): $(ELF)
+	@echo "[OBJCOPY] $@"
+	@$(OBJCOPY) -O binary $< $@
+	@echo ""
+	@echo "========================================="
+	@echo "  H-Exo Omni-Core Build Complete"
+	@echo "========================================="
+
+# Build information
+info: $(BIN)
+	@echo ""
+	@echo "Kernel Size: $$(wc -c < $(BIN)) bytes"
+	@echo "Sectors needed: $$(echo "($$(wc -c < $(BIN)) + 511) / 512" | bc)"
+	@echo ""
+	@echo "Memory Sections:"
+	@C:/gcc-arm/bin/aarch64-none-elf-size $(ELF)
+	@echo ""
+	@echo "Ready for deployment via auto_test.ps1"
+	@echo "========================================="
+
+clean:
+	@echo "Cleaning build artifacts..."
+	@rm -f $(ALL_OBJECTS) $(ELF) $(BIN) $(MAP) $(LST)
+	@echo "Clean complete."

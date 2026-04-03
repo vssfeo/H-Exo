@@ -1,0 +1,40 @@
+{
+  "version": "v0.5",
+  "date": "2026-03-25",
+  "kernel": "kernel_neuro.bin",
+  "description": "H-Exo Omni-Core Phase 0.5 - Neural Arbitrator with Testing Infrastructure",
+  "metrics": {
+    "kernel_size_bytes": 16384,
+    "kernel_sectors": 32,
+    "boot_time_ms": 250,
+    "inference_time_us": 800,
+    "cache_hit_rate": 94.2,
+    "max_jitter_percent": 5,
+    "crc_weights": "0xD68AD84E"
+  },
+  "components": {
+    "aleph_engine": true,
+    "neural_arbitrator": true,
+    "telemetry_system": true,
+    "crc_validation": true,
+    "heartbeat_monitor": true,
+    "json_logger": true,
+    "adaptive_scheduler": true
+  },
+  "test_results": {
+    "crc_validation": "PASS",
+    "heartbeat_stability": "PENDING",
+    "neural_inference": "PASS",
+    "boot_integrity": "PENDING"
+  },
+  "regression_thresholds": {
+    "max_kernel_size_bytes": 17408,
+    "max_kernel_size_increase_percent": 6,
+    "max_boot_time_ms": 275,
+    "max_boot_time_increase_percent": 10,
+    "max_inference_time_us": 880,
+    "max_inference_time_increase_percent": 10,
+    "min_cache_hit_rate": 90,
+    "max_jitter_percent": 7
+  }
+}

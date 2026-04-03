@@ -1,0 +1,89 @@
+# H-Exo Omni-Core: ULTRA OPTIMIZED Build for Minimal Size
+# Maximum size optimization with performance retention
+
+CC = C:/gcc-arm/bin/aarch64-none-elf-gcc
+OBJCOPY = C:/gcc-arm/bin/aarch64-none-elf-objcopy
+STRIP = C:/gcc-arm/bin/aarch64-none-elf-strip
+
+# ULTRA OPTIMIZED: Maximum size optimization flags
+CFLAGS = -Os -ffreestanding -nostdlib -nostartfiles \
+         -fno-common -fno-builtin -fno-exceptions -fno-asynchronous-unwind-tables \
+         -fdata-sections -ffunction-sections -fomit-frame-pointer -fno-unwind-tables \
+         -fmerge-all-constants -fno-ident -fno-zero-initialized-in-bss \
+         -march=armv8-a -mgeneral-regs-only \
+         -I. -DNDEBUG -DMINIMAL_OUTPUT
+
+# ULTRA OPTIMIZED: Linker flags for maximum dead code elimination
+LDFLAGS = -static -nostdlib -nostartfiles -gc-sections -print-gc-sections --hash-style=gnu
+
+# Source files (ultra optimized selection)
+ASM_SOURCES = boot.s mmu.s vectors.s
+C_SOURCES = main_neuro.c hal/uart.c neuro/neuro_sync_optimized.c neuro/telemetry.c neuro/weight_validation.c
+
+# Object files
+ASM_OBJECTS = $(ASM_SOURCES:.s=.o)
+C_OBJECTS = $(C_SOURCES:.c=.o)
+ALL_OBJECTS = $(ASM_OBJECTS) $(C_OBJECTS)
+
+TARGET = kernel_neuro_ultra
+
+.PHONY: all clean size ultra-clean
+
+all: $(TARGET).bin
+	@echo ""
+	@echo "========================================="
+	@echo "  H-Exo Neural Arbitrator ULTRA OPTIMIZED Build"
+	@echo "========================================="
+	@echo "Kernel size: $$(wc -c < $(TARGET).bin) bytes"
+	@echo "Sectors: $$(echo \"($$(wc -c < $(TARGET).bin) + 511) / 512\" | bc)"
+	@echo ""
+
+%.o: %.s
+	@echo "[AS] $<"
+	@$(CC) $(CFLAGS) -c $< -o $@
+
+%.o: %.c
+	@echo "[CC] $<"
+	@$(CC) $(CFLAGS) -c $< -o $@
+
+$(TARGET).elf: $(ALL_OBJECTS)
+	@echo "[LD] $@"
+	@$(CC) $(LDFLAGS) -T linker.ld -o $@ $(ALL_OBJECTS)
+
+$(TARGET).bin: $(TARGET).elf
+	@echo "[OBJCOPY] $@"
+	@$(OBJCOPY) -O binary $< $@
+	@echo "[STRIP] Removing debug symbols"
+	@$(STRIP) --strip-debug --strip-unneeded $<
+
+size:
+	@echo "=== KERNEL SIZE ANALYSIS ==="
+	@if [ -f $(TARGET).bin ]; then \
+		echo "Final binary size: $$(wc -c < $(TARGET).bin) bytes"; \
+	else \
+		echo "Binary not built yet"; \
+	fi
+
+# ULTRA OPTIMIZED: Ultra clean target removes everything
+ultra-clean:
+	@echo "Ultra cleaning..."
+	@rm -f $(ALL_OBJECTS) $(TARGET).elf $(TARGET).bin
+	@rm -f hal/*.o neuro/*.o
+	@rm -f *.o *.bin *.elf *.map
+	@echo "All build artifacts removed"
+
+# ULTRA OPTIMIZED: Clean with directory cleanup
+ultra-clean-all:
+	@echo "Ultra cleaning all..."
+	@find . -name "*.o" -type f -delete
+	@find . -name "*.bin" -type f -delete
+	@find . -name "*.elf" -type f -delete
+	@find . -name "*.map" -type f -delete
+	@echo "All build artifacts removed recursively"
+
+# ULTRA OPTIMIZED: Advanced size analysis
+size-analysis:
+	@echo "=== ADVANCED SIZE ANALYSIS ==="
+	@echo "Text size (code): $$(aarch64-none-elf-size -t $(TARGET).elf | grep TOTALS | awk '{print $$1}') bytes"
+	@echo "Data size (initialized): $$(aarch64-none-elf-size -t $(TARGET).elf | grep TOTALS | awk '{print $$2}') bytes"
+	@echo "BSS size (zero-init): $$(aarch64-none-elf-size -t $(TARGET).elf | grep TOTALS | awk '{print $$3}') bytes"

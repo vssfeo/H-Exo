@@ -1,0 +1,183 @@
+
+Merging program properties
+
+
+Discarded input sections
+
+ .text          0x0000000000000000        0x0 boot_optimized.o
+ .bss           0x0000000000000000        0x0 boot_optimized.o
+ .bss           0x0000000000000000        0x0 mmu_optimized.o
+ .data          0x0000000000000000        0x0 hal/uart.o
+ .bss           0x0000000000000000        0x0 hal/uart.o
+ .comment       0x0000000000000000       0x46 hal/uart.o
+ .data          0x0000000000000000        0x0 core/kernel.o
+ .comment       0x0000000000000000       0x46 core/kernel.o
+ .note.gnu.property
+                0x0000000000000000        0x0 core/kernel.o
+
+Memory Configuration
+
+Name             Origin             Length             Attributes
+RAM              0x0000000002080000 0x0000000001000000 xrw
+*default*        0x0000000000000000 0xffffffffffffffff
+
+Linker script and memory map
+
+
+.text           0x0000000002080000     0x2000
+                0x0000000002080000                __text_start = .
+ *(.text.boot)
+ .text.boot     0x0000000002080000     0x1040 boot_optimized.o
+                0x0000000002080000                _start
+ *(.text*)
+ .text          0x0000000002081040      0x22c mmu_optimized.o
+                0x0000000002081040                mmu_init
+                0x0000000002081174                mmu_enable
+                0x00000000020811a4                mmu_map_remote_region
+                0x00000000020811a8                tlb_invalidate_all
+                0x00000000020811bc                tlb_invalidate_va
+                0x00000000020811d0                dcache_clean_invalidate_all
+                0x000000000208125c                icache_invalidate_all
+ *fill*         0x000000000208126c       0x14 
+ .text          0x0000000002081280      0x230 hal/uart.o
+                0x0000000002081280                uart_init
+                0x0000000002081340                uart_putc
+                0x0000000002081384                uart_getc
+                0x00000000020813ac                uart_puts
+                0x000000000208140c                uart_put_hex
+                0x0000000002081470                uart_rx_ready
+                0x0000000002081484                uart_tx_ready
+                0x00000000020814a0                uart_dma_tx
+                0x00000000020814a8                uart_dma_rx
+ *fill*         0x00000000020814b0       0x10 
+ .text          0x00000000020814c0      0x58c core/kernel.o
+                0x00000000020814c0                handle_sync_exception
+                0x0000000002081588                kmain
+                0x0000000002082000                . = ALIGN (0x1000)
+ *fill*         0x0000000002081a4c      0x5b4 
+                0x0000000002082000                __text_end = .
+
+.iplt           0x0000000002082000        0x0
+ .iplt          0x0000000002082000        0x0 boot_optimized.o
+
+.vectors        0x0000000002082000        0x0
+                0x0000000002082000                __vectors_start = .
+ *(.vectors)
+                0x0000000002082000                . = ALIGN (0x800)
+                0x0000000002082000                __vectors_end = .
+
+.rodata         0x0000000002082000      0x580
+                0x0000000002082000                __rodata_start = .
+ *(.rodata*)
+ .rodata        0x0000000002082000       0x11 hal/uart.o
+ *fill*         0x0000000002082011        0x7 
+ .rodata.str1.8
+                0x0000000002082018      0x51d core/kernel.o
+ *fill*         0x0000000002082535        0x3 
+ .rodata        0x0000000002082538        0xc core/kernel.o
+                0x0000000002082580                . = ALIGN (0x40)
+ *fill*         0x0000000002082544       0x3c 
+                0x0000000002082580                __rodata_end = .
+
+.rela.dyn       0x0000000002082580        0x0
+ .rela.iplt     0x0000000002082580        0x0 boot_optimized.o
+ .rela.text.boot
+                0x0000000002082580        0x0 boot_optimized.o
+ .rela.text     0x0000000002082580        0x0 boot_optimized.o
+
+.data           0x0000000002083000     0x6000
+                0x0000000002083000                __data_start = .
+ *(.data*)
+ .data          0x0000000002083000      0x148 boot_optimized.o
+                0x0000000002083000                secondary_cores_wake
+                0x0000000002083008                node_identity
+                0x0000000002083048                distributed_memory_map
+ *fill*         0x0000000002083148      0xeb8 
+ .data          0x0000000002084000     0x5000 mmu_optimized.o
+                0x0000000002084000                page_table_l1
+                0x0000000002085000                page_table_l2_ram
+                0x0000000002086000                page_table_l2_peripherals
+                0x0000000002087000                remote_memory_tables
+                0x0000000002089000                . = ALIGN (0x8)
+                0x0000000002089000                __data_end = .
+
+.igot.plt       0x0000000002089000        0x0
+ .igot.plt      0x0000000002089000        0x0 boot_optimized.o
+
+.page_tables    0x0000000002089000        0x0
+                0x0000000002089000                __page_tables_start = .
+ *(.page_tables)
+ *(.data.page_table*)
+                0x0000000002089000                . = ALIGN (0x1000)
+                0x0000000002089000                __page_tables_end = .
+
+.bss            0x0000000002089000       0x18
+                0x0000000002089000                __bss_start = .
+ *(.bss*)
+ .bss           0x0000000002089000       0x18 core/kernel.o
+ *(COMMON)
+                0x0000000002089018                . = ALIGN (0x8)
+                0x0000000002089018                __bss_end = .
+
+.distributed_mem
+                0x000000000208a000        0x0
+                0x000000000208a000                __distributed_mem_start = .
+ *(.data.distributed_memory_map)
+ *(.data.remote_memory_tables)
+                0x000000000208a000                . = ALIGN (0x1000)
+                0x000000000208a000                __distributed_mem_end = .
+
+.crypto         0x0000000002089040        0x0
+                0x0000000002089040                __crypto_start = .
+ *(.data.node_identity)
+                0x0000000002089040                . = ALIGN (0x40)
+                0x0000000002089040                __crypto_end = .
+
+.stack          0x000000000208a000    0x54000
+                0x000000000208a000                __stack_bottom = .
+                0x00000000020ca000                . = (. + 0x40000)
+ *fill*         0x000000000208a000    0x40000 
+                0x00000000020ca000                __stack_top = .
+                0x00000000020ca000                __core0_stack_top = .
+                0x00000000020ce000                . = (. + 0x4000)
+ *fill*         0x00000000020ca000     0x4000 
+                0x00000000020ce000                __core1_stack_top = .
+                0x00000000020d2000                . = (. + 0x4000)
+ *fill*         0x00000000020ce000     0x4000 
+                0x00000000020d2000                __core2_stack_top = .
+                0x00000000020d6000                . = (. + 0x4000)
+ *fill*         0x00000000020d2000     0x4000 
+                0x00000000020d6000                __core3_stack_top = .
+                0x00000000020da000                . = (. + 0x4000)
+ *fill*         0x00000000020d6000     0x4000 
+                0x00000000020da000                __core4_stack_top = .
+                0x00000000020de000                . = (. + 0x4000)
+ *fill*         0x00000000020da000     0x4000 
+                0x00000000020de000                __core5_stack_top = .
+
+.heap           0x00000000020de000   0x400000
+                0x00000000020de000                __heap_start = .
+                0x00000000024de000                . = (. + 0x400000)
+ *fill*         0x00000000020de000   0x400000 
+                0x00000000024de000                __heap_end = .
+
+.dma_buffers    0x00000000024de000   0x100000
+                0x00000000024de000                __dma_buffers_start = .
+                0x00000000025de000                . = (. + 0x100000)
+ *fill*         0x00000000024de000   0x100000 
+                0x00000000025de000                __dma_buffers_end = .
+                0x00000000025de000                __kernel_end = .
+
+/DISCARD/
+ *(.comment)
+ *(.note*)
+ *(.eh_frame*)
+                0x000000000055e000                __kernel_size = (__kernel_end - __text_start)
+                0x0000000000000018                __bss_size = (__bss_end - __bss_start)
+                0x0000000000054000                __total_stack_size = (__core5_stack_top - __stack_bottom)
+LOAD boot_optimized.o
+LOAD mmu_optimized.o
+LOAD hal/uart.o
+LOAD core/kernel.o
+OUTPUT(kernel_optimized.elf elf64-littleaarch64)
+LOAD linker stubs

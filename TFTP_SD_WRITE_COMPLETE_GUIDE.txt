@@ -1,0 +1,97 @@
+Complete Guide: Writing Kernel to SD Card via TFTP
+==================================================
+
+PREREQUISITES:
+1. NanoPi M4 board with U-Boot
+2. SD card inserted in NanoPi M4
+3. Network connection between PC and NanoPi M4
+4. kernel_neuro.bin file (20480 bytes)
+
+SETUP TFTP SERVER:
+Option 1 - Manual Setup:
+1. Download and install Tftpd64 from https://bitbucket.org/phjounin/tftpd64/downloads/
+2. Configure Tftpd64:
+   - Base Directory: C:\tftpboot
+   - IP Address: 192.168.1.166
+   - Port: 69
+3. Ensure kernel_neuro.bin is in C:\tftpboot directory
+4. Start Tftpd64 service
+
+Option 2 - Use provided scripts:
+1. Run run_tftp_server.bat (may require Administrator rights)
+2. Or run start_tftp_server_fixed.ps1
+3. Or manually start a TFTP server
+
+CONFIGURE NANAPI M4:
+1. Connect to NanoPi M4 U-Boot console (serial or SSH)
+2. Set network parameters:
+   setenv ipaddr 192.168.1.10
+   setenv serverip 192.168.1.166
+   setenv bootfile kernel_neuro.bin
+   
+3. Test network connection:
+   ping 192.168.1.166
+   (Should respond: "host 192.168.1.166 is alive")
+
+4. Set up SD write command:
+   setenv loadaddr 0x42000000
+   setenv sdwrite 'tftp ${loadaddr} ${bootfile}; mmc dev 0; mmc write ${loadaddr} 0x800 0x1000'
+   saveenv
+
+WRITE KERNEL TO SD CARD:
+1. Execute write command:
+   run sdwrite
+   
+2. Expected output:
+   - TFTP transfer starts
+   - File downloads (20480 bytes)
+   - MMC write operation completes
+
+3. Verify write success:
+   - System should show write completion
+   - You can read back with: 'mmc read ${loadaddr} 0x800 0x1000'
+
+BOOT FROM SD CARD:
+1. Reset the board:
+   reset
+   
+2. New kernel should boot from SD card
+
+TROUBLESHOOTING:
+1. If TFTP fails:
+   - Check network cable connection
+   - Verify TFTP server is running on PC
+   - Try "ping 192.168.1.166" in U-Boot
+   - Check firewall settings on PC
+
+2. If MMC write fails:
+   - Check if SD card is properly inserted
+   - Try "mmc info" to verify SD card detection
+   - Try "mmc dev 0" to select SD card
+
+3. If boot fails after write:
+   - Verify write was successful
+   - Check kernel size and partition alignment
+   - Try reading back with mmc read command
+
+FILES IN PROJECT:
+- kernel_neuro.bin (20480 bytes) - The kernel to write
+- deploy_kernel_tftp.ps1 - Advanced deployment script
+- start_tftp_server.ps1 - TFTP server startup script
+- setup_tftp_environment.ps1 - Environment setup script
+- Tftpd64.ini - Tftpd64 configuration file
+- run_tftp_server.bat - Batch file to run TFTP server
+- ps_tftp_server.ps1 - PowerShell TFTP server implementation
+- simple_tftp_server.py - Python TFTP server (if Python available)
+- TFTP_SETUP_REPORT.txt - Setup information
+- TFTP_SD_WRITE_INSTRUCTIONS.txt - Detailed instructions
+- manual_tftp_setup.txt - Manual setup instructions
+
+BENEFITS:
+- Write kernel to SD card in ~2 seconds (instead of 3-5 minutes)
+- No need to physically remove SD card for each update
+- Network-based deployment automation
+- Simplified development workflow
+
+STATUS: READY
+You can now write kernel to SD card via TFTP network connection!

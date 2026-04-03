@@ -1,0 +1,51 @@
+# H-Exo Omni-Core: Neural Arbitrator Build
+# Includes TinyML inference engine
+
+CC = C:/gcc-arm/bin/aarch64-none-elf-gcc
+OBJCOPY = C:/gcc-arm/bin/aarch64-none-elf-objcopy
+
+CFLAGS = -Wall -O2 -ffreestanding -nostdlib -nostartfiles \
+         -fno-common -fno-builtin -march=armv8-a -I.
+
+# Source files
+ASM_SOURCES = boot.s mmu.s
+C_SOURCES = main_neuro.c hal/uart.c neuro/neuro_sync.c neuro/telemetry.c
+
+# Object files
+ASM_OBJECTS = $(ASM_SOURCES:.s=.o)
+C_OBJECTS = $(C_SOURCES:.c=.o)
+ALL_OBJECTS = $(ASM_OBJECTS) $(C_OBJECTS)
+
+TARGET = kernel_neuro
+
+.PHONY: all clean
+
+all: $(TARGET).bin
+	@echo ""
+	@echo "========================================="
+	@echo "  H-Exo Neural Arbitrator Build Complete"
+	@echo "========================================="
+	@echo "Kernel size: $$(wc -c < $(TARGET).bin) bytes"
+	@echo "Sectors: $$(echo "($$(wc -c < $(TARGET).bin) + 511) / 512" | bc)"
+	@echo ""
+
+%.o: %.s
+	@echo "[AS] $<"
+	@$(CC) -c $< -o $@
+
+%.o: %.c
+	@echo "[CC] $<"
+	@$(CC) $(CFLAGS) -c $< -o $@
+
+$(TARGET).elf: $(ALL_OBJECTS)
+	@echo "[LD] $@"
+	@$(CC) -T linker.ld -o $@ $(ALL_OBJECTS) $(CFLAGS)
+
+$(TARGET).bin: $(TARGET).elf
+	@echo "[OBJCOPY] $@"
+	@$(OBJCOPY) -O binary $< $@
+
+clean:
+	@echo "Cleaning..."
+	@rm -f $(ALL_OBJECTS) $(TARGET).elf $(TARGET).bin
+	@rm -f hal/*.o neuro/*.o

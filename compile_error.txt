@@ -1,0 +1,2 @@
+boot_optimized.s: Assembler messages:
+boot_optimized.s:157: Error: immediate cannot be moved by a single instruction

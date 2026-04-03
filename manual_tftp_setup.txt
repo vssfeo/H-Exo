@@ -1,0 +1,48 @@
+Manual TFTP Server Setup Instructions
+====================================
+
+1. Download Tftpd64 manually:
+   - Go to https://bitbucket.org/phjounin/tftpd64/downloads/
+   - Download Tftpd64-4.64-setup.exe (or latest version)
+   - Install it on your system
+
+2. Configure Tftpd64:
+   - Run Tftpd64 application
+   - Go to Settings tab
+   - Set Base Directory to: C:\tftpboot
+   - Set IP address to: 192.168.1.166
+   - Set Port to: 69
+   - Click Save Settings
+
+3. Verify TFTP server is running:
+   - Check that Tftpd64 shows "Server is running" 
+   - Make sure kernel_neuro.bin is in C:\tftpboot directory
+
+4. Test from NanoPi M4:
+   In U-Boot console:
+   setenv ipaddr 192.168.1.10
+   setenv serverip 192.168.1.166
+   setenv bootfile kernel_neuro.bin
+   ping 192.168.1.166
+   
+   If you see "host 192.168.1.166 is alive", then TFTP is working
+
+5. Write to SD card via TFTP:
+   In U-Boot console:
+   setenv loadaddr 0x42000000
+   setenv sdwrite 'tftp ${loadaddr} ${bootfile}; mmc dev 0; mmc write ${loadaddr} 0x800 0x1000'
+   saveenv
+   run sdwrite
+
+Alternative: Use built-in Windows TFTP server
+=============================================
+
+1. Enable TFTP Server feature in Windows:
+   - Open Control Panel
+   - Go to Programs -> Turn Windows features on or off
+   - Check "TFTP Client" and "TFTP Server" if available
+
+2. Or download a portable TFTP server:
+   - Tftpd32 portable version
+   - Place it in your project directory
+   - Configure it to use C:\tftpboot as root directory

@@ -1,0 +1,38 @@
+# H-Exo build artifacts
+*.o
+*.elf
+*.bin
+*.img
+*.map
+*.hex
+
+# Backup files
+*.bak
+*.tmp
+*~
+
+# Test results
+heartbeat_results_*.json
+test_results_*.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Serial logs
+*.log
+
+# Large documentation files (keep in repo but optional)
+docs/*.pdf
+
+# TFTP server files (user-specific)
+C:/tftpboot/
