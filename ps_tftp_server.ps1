@@ -54,6 +54,23 @@ try {
             }
             $filename = [System.Text.Encoding]::ASCII.GetString($filenameBytes)
             
+            # Check if filename is empty
+            if ([string]::IsNullOrWhiteSpace($filename)) {
+                Write-Host "ERROR: Empty filename in request" -ForegroundColor Red
+                # Send error packet
+                $errorMsg = "Empty filename"
+                $errorBytes = [System.Text.Encoding]::ASCII.GetBytes($errorMsg)
+                $errorPacket = [byte[]]::new(5 + $errorBytes.Length + 1)
+                $errorPacket[0] = 0
+                $errorPacket[1] = 5  # ERROR opcode
+                $errorPacket[2] = 0
+                $errorPacket[3] = 0  # Error code: Not defined
+                [System.Array]::Copy($errorBytes, 0, $errorPacket, 4, $errorBytes.Length)
+                $errorPacket[$errorPacket.Length - 1] = 0
+                $udp.Send($errorPacket, $errorPacket.Length, $remoteEndPoint) | Out-Null
+                continue
+            }
+            
             Write-Host "Read request for file: $filename" -ForegroundColor Yellow
             
             # Check if file exists

@@ -29,6 +29,10 @@
 .endm
 
 _start:
+    // CRITICAL: Initialize UART2 clocks BEFORE any UART access
+    // This prevents Synchronous Abort on first DEBUG_PUTC
+    INIT_UART2_CLOCK
+    
     // 1. Check CPU ID (only core 0 continues)
     mrs     x0, mpidr_el1
     and     x0, x0, #0xFF
