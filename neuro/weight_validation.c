@@ -1,4 +1,4 @@
-// H-Exo Omni-Core: Neural Weight Integrity Validation Implementation
+﻿// H-Exo Omni-Core: Neural Weight Integrity Validation Implementation
 
 #include "weight_validation.h"
 
@@ -63,5 +63,5 @@ bool validate_weights_integrity(const neural_weights_t* weights, u32 expected_cr
 // Expected CRC32 of neural network weights
 // Computed offline by tools/extract_weights_crc.ps1
 u32 get_expected_weights_crc(void) {
-    return 0x0EBF1C07;
+    return 0x1F1BA056;
 }

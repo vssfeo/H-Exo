@@ -44,7 +44,7 @@ SECTIONS
         __bss_end = .;
     }
     
-    /* Stack - OPTIMIZED from 64KB to 16KB */
+    /* Stack pool for all 6 cores: 6 * 4KB = 24KB, keep headroom. */
     . = ALIGN(4K);
-    __stack_top = . + 0x4000;  /* 16KB stack instead of 64KB */
+    __stack_top = . + 0x8000;  /* 32KB shared stack pool */
 }

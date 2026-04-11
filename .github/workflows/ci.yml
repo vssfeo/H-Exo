@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+jobs:
+  build-kernel:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install AArch64 bare-metal toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+
+      - name: Build kernel (Makefile.neuro)
+        run: |
+          make -f Makefile.neuro \
+            CC=aarch64-linux-gnu-gcc \
+            OBJCOPY=aarch64-linux-gnu-objcopy \
+            all
+
+      - name: Upload kernel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel_neuro
+          path: kernel_neuro.bin
+          if-no-files-found: error

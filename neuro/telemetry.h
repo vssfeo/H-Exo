@@ -11,6 +11,9 @@
 typedef struct {
     u64 last_cycle_count;
     u64 total_cycles;
+    u64 last_sample_cycles;
+    u64 packets_total;
+    u64 last_packet_snapshot;
     u32 sample_count;
     telemetry_t current;
 } telemetry_collector_t;
@@ -20,11 +23,12 @@ result_t telemetry_init(telemetry_collector_t* tc);
 
 // Collect current system telemetry
 result_t telemetry_collect(telemetry_collector_t* tc, telemetry_t* output);
+void telemetry_note_packet(telemetry_collector_t* tc);
 
-// Read CPU cycle counter (PMU)
+// Read generic timer counter (24MHz, always accessible at EL1/EL0 on RK3399)
 static inline u64 read_cycle_counter(void) {
     u64 val;
-    asm volatile("mrs %0, pmccntr_el0" : "=r"(val));
+    asm volatile("mrs %0, cntpct_el0" : "=r"(val));
     return val;
 }
 
@@ -38,6 +42,12 @@ u32 telemetry_get_l2_latency(void);
 u32 telemetry_get_memory_pressure(void);
 
 // Get thermal state (placeholder - will read actual thermal sensor)
-u32 telemetry_get_thermal_state(void);
+u32 telemetry_get_thermal_state(telemetry_collector_t* tc);
+
+// Real packets-per-second estimate from runtime traffic.
+u32 telemetry_get_packet_rate(telemetry_collector_t* tc);
+
+// Active compute nodes currently available to the runtime.
+u32 telemetry_get_node_count(void);
 
 #endif // HEXO_TELEMETRY_H

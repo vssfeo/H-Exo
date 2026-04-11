@@ -1,22 +1,12 @@
-// H-Exo Omni-Core: Memory Dominance Module
-// MMU Interface for distributed address space foundation
+// H-Exo Omni-Core: EL2 MMU Identity Map
+// 4 × 1GB L1 blocks: DRAM=Normal WB, MMIO=Device-nGnRnE
 
 #ifndef MMU_H
 #define MMU_H
 
-#include <stdint.h>
-
-// Initialize MMU page tables
-// Maps:
-//   0x00000000-0x7FFFFFFF -> Normal Cacheable (RAM)
-//   0xC0000000-0xFFFFFFFF -> Device Memory (Peripherals)
-void mmu_init(void);
-
-// Enable MMU and caches
-// Activates the distributed address space
-void mmu_enable(void);
-
-// Disable MMU (for debugging)
-void mmu_disable(void);
+void mmu_init(void);                   // Build L1 table, switch TTBR0_EL2, flush TLB
+void mmu_enable(void);                 // Ensure SCTLR_EL2 M+C+I set (idempotent)
+void mmu_disable(void);                // Clear M bit -- debug/emergency only
+void mmu_secondary_el1_enable(void);   // EL1 MMU+D-cache for secondary cores
 
 #endif // MMU_H

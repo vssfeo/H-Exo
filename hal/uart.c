@@ -32,7 +32,7 @@ static inline u32 uart_read_reg(volatile u32* base, u32 offset) {
 result_t uart_init(uart_t* uart, const uart_config_t* config) {
     if (!uart || !config) return ERR_INVALID_PARAM;
     
-    uart->base = (volatile u32*)config->base_addr;
+    uart->base = (volatile u32*)(uintptr_t)config->base_addr;
     uart->config = *config;
     
     // Calculate divisor for baud rate (24MHz clock)

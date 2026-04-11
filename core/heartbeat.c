@@ -19,9 +19,9 @@ static inline u64 read_cycles(void) {
 void heartbeat_init(uart_t* uart) {
     uart_console = uart;
     
-    uart_puts(uart, "[*] Heartbeat: Reading PMU (already initialized in boot.s)...\r\n");
+    uart_puts(uart, "[*] Heartbeat: Using Generic Timer (cntpct_el0 @ 24MHz)...\r\n");
     
-    // PMU is already configured in boot.s - just read it
+    // cntpct_el0 is always accessible - no setup needed
     u64 initial_cycles = read_cycles();
     uart_puts(uart, "[*] Heartbeat: Initial cycles = 0x");
     uart_put_hex(uart, initial_cycles);
@@ -34,7 +34,7 @@ void heartbeat_init(uart_t* uart) {
     stats.last_beat_cycles = initial_cycles;
     stats.jitter_percent = 0;
     
-    uart_puts(uart, "[OK] Heartbeat: PMU ready\r\n");
+    uart_puts(uart, "[OK] Heartbeat: Generic Timer ready\r\n");
 }
 
 void heartbeat_run(uart_t* uart) {
@@ -43,8 +43,6 @@ void heartbeat_run(uart_t* uart) {
     uart_puts(uart, "\r\n[*] Entering Heartbeat Mode (Generic Timer)\r\n");
     uart_puts(uart, "[*] Interval: 100ms (2.4M ticks @ 24MHz)\r\n");
     uart_puts(uart, "[*] Press 'q' to exit\r\n\r\n");
-    
-    u64 start_cycles = read_cycles();
     
     while (1) {
         u64 now = read_cycles();

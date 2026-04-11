@@ -36,42 +36,59 @@ $weightsBytes = $bytes[$offset..($offset + $weightsSize - 1)]
 Write-Host "[*] Extracted $weightsSize bytes from offset 0x$($offset.ToString('X'))" -ForegroundColor Yellow
 
 # Compute CRC32 (IEEE 802.3 polynomial)
-function Compute-CRC32 {
+function Get-Crc32 {
     param([byte[]]$data)
     
-    # CRC32 lookup table
-    $table = @(0) * 256
+    # [uint32] ensures logical (zero-fill) right-shift, matching C's u32 >> operator
+    $poly = [uint32]3988292384  # 0xEDB88320
+    $table = New-Object 'uint32[]' 256
     for ($i = 0; $i -lt 256; $i++) {
-        $c = $i
+        [uint32]$c = [uint32]$i
         for ($j = 0; $j -lt 8; $j++) {
-            if ($c -band 1) {
-                $c = (($c -shr 1) -bxor 0xEDB88320)
-            } else {
-                $c = $c -shr 1
-            }
+            if ($c -band 1) { $c = ($c -shr 1) -bxor $poly }
+            else             { $c = $c -shr 1 }
         }
         $table[$i] = $c
     }
     
-    # Compute CRC
-    $crc = 0xFFFFFFFF
-    foreach ($byte in $data) {
-        $index = ($crc -bxor $byte) -band 0xFF
-        $crc = (($crc -shr 8) -bxor $table[$index]) -band 0xFFFFFFFF
+    [uint32]$crc = [uint32]4294967295
+    foreach ($b in $data) {
+        [uint32]$idx = ($crc -bxor [uint32]$b) -band 255
+        $crc = ($crc -shr 8) -bxor $table[$idx]
     }
     
-    return (-bnot $crc) -band 0xFFFFFFFF
+    return -bnot $crc
 }
 
-$crc = Compute-CRC32 $weightsBytes
+$crc = Get-Crc32 $weightsBytes
 
-Write-Host ""
-Write-Host "========================================" -ForegroundColor Cyan
-Write-Host "  Neural Weights CRC32" -ForegroundColor Cyan
-Write-Host "========================================" -ForegroundColor Cyan
-Write-Host "CRC32: 0x$($crc.ToString('X8'))" -ForegroundColor Green
-Write-Host ""
-Write-Host "Update neuro/weight_validation.c:" -ForegroundColor Yellow
-Write-Host "u32 get_expected_weights_crc(void) {" -ForegroundColor Gray
-Write-Host "    return 0x$($crc.ToString('X8'));" -ForegroundColor Gray
-Write-Host "}" -ForegroundColor Gray
+$crcHex = "0x$($crc.ToString('X8'))"
+Write-Host "[*] Computed CRC32: $crcHex" -ForegroundColor Yellow
+
+# Resolve weight_validation.c - works both from project root (build.bat) and tools\ directory
+$projectRoot = if ($PSScriptRoot -match 'tools$') { Split-Path $PSScriptRoot -Parent } else { (Get-Location).Path }
+$validationPath = Join-Path $projectRoot "neuro\weight_validation.c"
+
+$currentContent = Get-Content $validationPath -Raw
+if ($currentContent -match 'return (0x[0-9A-Fa-f]{8});') {
+    $currentCrc = $matches[1]
+} else {
+    $currentCrc = ""
+}
+
+if ($currentCrc -eq $crcHex) {
+    Write-Host "[OK] CRC match: $crcHex - no update needed" -ForegroundColor Green
+    exit 0
+}
+
+Write-Host "[!] CRC mismatch: expected $currentCrc, computed $crcHex" -ForegroundColor Yellow
+Write-Host "[*] Auto-updating neuro\weight_validation.c..." -ForegroundColor Cyan
+
+$newContent = $currentContent -replace 'return 0x[0-9A-Fa-f]{8};', "return $crcHex;"
+Set-Content $validationPath $newContent -Encoding UTF8 -NoNewline
+
+Write-Host "[OK] Updated: get_expected_weights_crc() now returns $crcHex" -ForegroundColor Green
+Write-Host "[!] Rebuild required to embed updated CRC into kernel" -ForegroundColor Yellow
+
+# Exit code 2 = CRC was updated, rebuild needed
+exit 2

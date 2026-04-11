@@ -13,7 +13,9 @@
 
 # Test results
 heartbeat_results_*.json
+test_result_*.json
 test_results_*.json
+auto_test_*.log
 
 # IDE
 .vscode/
@@ -36,3 +38,12 @@ docs/*.pdf
 
 # TFTP server files (user-specific)
 C:/tftpboot/
+
+# Cursor / local IDE
+.cursor/
+
+# Serial / test dumps
+logs/
+
+# Vendor trees (multi-GB); clone locally — see patches/THIRD_PARTY.txt
+third_party/

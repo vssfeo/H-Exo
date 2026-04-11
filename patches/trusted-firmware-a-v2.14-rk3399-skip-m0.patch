@@ -1,0 +1,18 @@
+Allow building BL31 on hosts without arm-none-eabi-gcc by skipping the M0
+sub-make when SKIP_M0_BUILD=1 (expects prebuilt M0 blobs in the tree).
+
+Apply from TF-A root (tag v2.14.x), path: plat/rockchip/rk3399/platform.mk
+
+--- a/plat/rockchip/rk3399/platform.mk
++++ b/plat/rockchip/rk3399/platform.mk
+@@ -105,7 +105,11 @@ export CCACHE_EXTRAFILES
+ .PHONY: $(RK3399M0FW)
+ $(RK3399M0FW): | $$(@D)/
++ifeq (${SKIP_M0_BUILD},1)
++	@echo "SKIP_M0_BUILD=1: using existing M0 firmware artifacts"
++else
+ 	$(MAKE) -C ${RK_PLAT_SOC}/drivers/m0 BUILD=$(abspath ${BUILD_PLAT}/m0)
++endif
+ 
+ # Do not enable SVE
+ ENABLE_SVE_FOR_NS	:=	0

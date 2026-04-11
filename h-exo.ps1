@@ -71,10 +71,14 @@ function Invoke-Build {
     & $GCC @CFLAGS -c neuro\neuro_sync.c -o neuro\neuro_sync.o
     & $GCC @CFLAGS -c neuro\telemetry.c -o neuro\telemetry.o
     & $GCC @CFLAGS -c neuro\weight_validation.c -o neuro\weight_validation.o
+    & $GCC @CFLAGS -c neuro\adaptive_scheduler.c -o neuro\adaptive_scheduler.o
+    & $GCC @CFLAGS -c core\smp.c -o core\smp.o
+    & $GCC @CFLAGS -c core\workqueue.c -o core\workqueue.o
+    & $GCC @CFLAGS -c hal\net.c -o hal\net.o
     & $GCC @CFLAGS -c main_neuro.c -o main_neuro.o
     
     # Link
-    $OBJS = @("boot.o","mmu.o","vectors.o","main_neuro.o","hal\uart.o","hal\gicv3.o","hal\gmac.o","hal\exceptions.o","core\heartbeat.o","core\slab.o","core\chaos.o","core\logger.o","neuro\neuro_sync.o","neuro\telemetry.o","neuro\weight_validation.o")
+    $OBJS = @("boot.o","mmu.o","vectors.o","main_neuro.o","hal\uart.o","hal\gicv3.o","hal\gmac.o","hal\exceptions.o","hal\net.o","core\heartbeat.o","core\slab.o","core\chaos.o","core\logger.o","core\smp.o","core\workqueue.o","neuro\neuro_sync.o","neuro\telemetry.o","neuro\weight_validation.o","neuro\adaptive_scheduler.o")
     & $GCC -T linker.ld -o kernel_neuro.elf @OBJS @("-ffreestanding","-nostdlib")
     & $OBJCOPY -O binary kernel_neuro.elf kernel_neuro.bin
     

@@ -1,5 +1,10 @@
 #include "../core/types.h"
 #include "uart.h"
+#include "gicv3.h"
+#include "gmac.h"
+
+// Set by IRQ handler; cleared + drained by main loop.
+volatile u32 gmac_rx_pending = 0;
 
 // Context structure saved by vectors.s
 // CRITICAL: Must match SAVE_CONTEXT layout exactly!
@@ -94,9 +99,16 @@ void handle_sync_exception(exception_context_t* ctx) {
 }
 
 void handle_irq_exception(exception_context_t* ctx) {
-    extern uart_t console;
-    // For now, just a placeholder for GICv3
-    uart_puts(&console, "[IRQ]\r\n");
+    (void)ctx;
+    u32 intid = gicv3_ack_irq();
+    if (intid == GMAC_GIC_INTID) {
+        gmac_clear_irq();
+        gmac_rx_pending = 1;
+    }
+    // INTID 1023 = spurious interrupt — no EOI needed
+    if (intid != 1023u) {
+        gicv3_eoi_irq(intid);
+    }
 }
 
 void handle_fiq_exception(exception_context_t* ctx) {

@@ -63,8 +63,7 @@ bool adaptive_scheduler_update(adaptive_scheduler_t* sched, u32 jitter_percent) 
             sched->stability_score -= penalty;
         }
     } else {
-        // Slow recovery towards 100
-        sched->stability_score = (sched->stability_score * STABILITY_DECAY_FACTOR) / 100;
+        // Slow recovery towards 100 (gain 1 point per stable update)
         if (sched->stability_score < 100) {
             sched->stability_score++;
         }

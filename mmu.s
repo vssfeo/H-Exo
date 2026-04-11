@@ -1,173 +1,176 @@
-// H-Exo Omni-Core: Memory Dominance Module
-// AArch64 MMU Initialization for RK3399
-// Phase 1: Establish foundation for distributed address space
+// H-Exo Omni-Core: EL2 MMU Identity Map for RK3399
+//
+// VA = PA (identity), 4KB granule, T0SZ=32 (4GB), four 1GB L1 block entries:
+//   [0] 0x00000000–0x3FFFFFFF  Normal WB Cacheable  (DRAM low 1GB)
+//   [1] 0x40000000–0x7FFFFFFF  Normal WB Cacheable  (DRAM high 1GB)
+//   [2] 0x80000000–0xBFFFFFFF  Device-nGnRnE        (unused — mapped safe)
+//   [3] 0xC0000000–0xFFFFFFFF  Device-nGnRnE        (UART/GIC/GMAC/PMU MMIO)
+//
+// MAIR_EL2:  Attr0=Device-nGnRnE(0x00)  Attr1=Normal WB(0xFF)
+// U-Boot leaves EL2 MMU active — mmu_init() switches TTBR0_EL2 to our table.
 
-.section .data
-.align 12  // Page tables must be 4KB aligned
-
-// Level 1 Translation Table (covers 512GB, we use first few entries)
+// ---- Page table in BSS (zeroed by _start, 4KB-aligned) --------------------
+.section .bss
+.align 12
 .global page_table_l1
 page_table_l1:
-    .space 4096  // 512 entries x 8 bytes
+    .space 4096          // 512 × 8B; only first 4 entries used (4 × 1GB)
 
+// ---- Code ------------------------------------------------------------------
 .section .text
 .global mmu_init
 .global mmu_enable
+.global mmu_disable
+.global mmu_secondary_el1_enable
 
-// Memory Attribute Indirection Register values
-// Index 0: Device-nGnRnE (non-Gathering, non-Reordering, no Early Write Ack)
-// Index 1: Normal Memory, Inner/Outer Write-Back Cacheable
-.equ MAIR_DEVICE_nGnRnE,  0x00
-.equ MAIR_NORMAL_WB,      0xFF
+// Descriptor bit constants
+.equ PTE_BLOCK,      0x1          // [1:0]=01  block entry
+.equ PTE_ATTR_DEV,   0x0          // [4:2]=000 AttrIdx=0 (Device-nGnRnE)
+.equ PTE_ATTR_NORM,  0x4          // [4:2]=001 AttrIdx=1 (Normal WB)
+.equ PTE_SH_IS,      (3 << 8)     // [9:8]=11  Inner Shareable
+.equ PTE_AF,         (1 << 10)    // [10]=1    Access Flag (required)
+// XN bits live in the upper 16-bit field — assembled via movk
+// bits[54:53] = UXN|PXN = 0x0060 in bits[63:48]
+.equ PTE_XN_HI,      0x0060       // movk ..., lsl #48
 
-// Page table descriptor bits
-.equ PTE_VALID,           0x1        // (1 << 0)
-.equ PTE_TABLE,           0x2        // (1 << 1)
-.equ PTE_BLOCK,           0x0        // (0 << 1)
-.equ PTE_AF,              0x400      // (1 << 10) Access Flag
-.equ PTE_SH_INNER,        0x300      // (3 << 8) Inner Shareable
-.equ PTE_SH_OUTER,        0x200      // (2 << 8) Outer Shareable
+// Normal 1GB block attrs = AF(0x400)|SH_IS(0x300)|AttrIdx1(0x4)|Block(0x1) = 0x705
+// Device 1GB block attrs = AF(0x400)|AttrIdx0(0x0)|Block(0x1) = 0x401 + XN upper bits
 
-// Memory attributes (index into MAIR)
-.equ PTE_ATTR_DEVICE,     0x0        // (0 << 2) MAIR index 0
-.equ PTE_ATTR_NORMAL,     0x4        // (1 << 2) MAIR index 1
-
-// Access permissions
-.equ PTE_AP_RW_EL1,       0x0        // (0 << 6) Read/Write at EL1
-.equ PTE_UXN,             0x0040000000000000  // (1 << 54) Unprivileged Execute Never
-.equ PTE_PXN,             0x0020000000000000  // (1 << 53) Privileged Execute Never
-
-//==============================================================================
-// mmu_init: Initialize page tables and MMU configuration registers
-// This function sets up the foundation for H-Exo's distributed address space
-//==============================================================================
+//===========================================================================
+// mmu_init — build L1 table, configure MAIR/TCR/TTBR0_EL2, flush TLB
+//===========================================================================
 mmu_init:
-    // Save link register
     stp     x29, x30, [sp, #-16]!
     mov     x29, sp
 
-    //--------------------------------------------------------------------------
-    // Step 1: Configure MAIR_EL1 (Memory Attribute Indirection Register)
-    //--------------------------------------------------------------------------
-    // MAIR_EL1[7:0]   = 0x00 (Device-nGnRnE)
-    // MAIR_EL1[15:8]  = 0xFF (Normal, Inner/Outer Write-Back Cacheable)
-    mov     x0, #MAIR_DEVICE_nGnRnE
-    orr     x0, x0, #(MAIR_NORMAL_WB << 8)
+    // ---- 1. MAIR_EL2 -------------------------------------------------------
+    // Attr0 [7:0]  = 0x00  Device-nGnRnE
+    // Attr1 [15:8] = 0xFF  Normal Inner/Outer WB WA RA
+    mov     x0, #0xFF00          // Attr1=0xFF at byte 1, Attr0=0x00 at byte 0
+    msr     mair_el2, x0
+    isb
+
+    // ---- 2. L1 page table (BSS, already zeroed by _start) -----------------
+    adr     x8, page_table_l1
+
+    // Entry 0: PA=0x00000000  Normal WB  (AttrIdx=1, SH=IS, AF, Block)
+    // 0x0000_0000_0000_0705
+    mov     x1, #(PTE_BLOCK | PTE_ATTR_NORM | PTE_SH_IS | PTE_AF)
+    str     x1, [x8, #0]
+
+    // Entry 1: PA=0x40000000  Normal WB
+    // 0x0000_0000_4000_0705
+    movk    x1, #0x4000, lsl #16          // insert PA[31:16] = 0x4000
+    str     x1, [x8, #8]
+
+    // Entry 2: PA=0x80000000  Device-nGnRnE  (AttrIdx=0, SH=00, AF, Block, XN)
+    // 0x0060_0000_8000_0401
+    mov     x1, #(PTE_BLOCK | PTE_ATTR_DEV | PTE_AF)
+    movk    x1, #0x8000, lsl #16          // PA[31:16]
+    movk    x1, #PTE_XN_HI, lsl #48      // UXN|PXN
+    str     x1, [x8, #16]
+
+    // Entry 3: PA=0xC0000000  Device-nGnRnE  (UART/GIC/GMAC all here)
+    // 0x0060_0000_C000_0401
+    mov     x1, #(PTE_BLOCK | PTE_ATTR_DEV | PTE_AF)
+    movk    x1, #0xC000, lsl #16
+    movk    x1, #PTE_XN_HI, lsl #48
+    str     x1, [x8, #24]
+
+    // DSB: ensure table stores reach coherency point before TTBR update
+    dsb     sy
+
+    // ---- 3. TCR_EL2 (non-VHE, 32-bit effective) ----------------------------
+    // T0SZ=32  IRGN0=01  ORGN0=01  SH0=11  TG0=00(4KB)  PS=010(40-bit PA)
+    mov     x0, #32                        // T0SZ=32 → 4GB VA space
+    orr     x0, x0, #(1 << 8)             // IRGN0=01  Inner WB WA
+    orr     x0, x0, #(1 << 10)            // ORGN0=01  Outer WB WA
+    orr     x0, x0, #(3 << 12)            // SH0=11    Inner Shareable
+    orr     x0, x0, #(2 << 16)            // PS=010    40-bit PA (safe on RK3399)
+    msr     tcr_el2, x0
+    isb
+
+    // ---- 4. TTBR0_EL2 → our L1 table (VA=PA identity so adr gives PA) -----
+    adr     x0, page_table_l1
+    msr     ttbr0_el2, x0
+    isb
+
+    // ---- 5. Invalidate all EL2 TLBs (IS = broadcast across Inner Shareable) -
+    tlbi    alle2is
+    dsb     sy
+    isb
+
+    ldp     x29, x30, [sp], #16
+    ret
+
+//===========================================================================
+// mmu_enable — set M+C+I in SCTLR_EL2 (idempotent; U-Boot already set them)
+//===========================================================================
+mmu_enable:
+    mrs     x0, sctlr_el2
+    orr     x0, x0, #(1 << 0)     // M=1  MMU enable
+    orr     x0, x0, #(1 << 2)     // C=1  D-cache enable
+    orr     x0, x0, #(1 << 12)    // I=1  I-cache enable
+    msr     sctlr_el2, x0
+    isb
+    ret
+
+//===========================================================================
+// mmu_disable — clear M bit only (debug / emergency)
+//===========================================================================
+mmu_disable:
+    mrs     x0, sctlr_el2
+    bic     x0, x0, #(1 << 0)     // M=0
+    msr     sctlr_el2, x0
+    dsb     sy
+    isb
+    ret
+
+//===========================================================================
+// mmu_secondary_el1_enable — EL1 MMU + D-cache for secondary cores (EL1)
+// Shares the same identity-map page table built by mmu_init() at EL2.
+// Must be called after mmu_init() (page_table_l1 populated) and before
+// smp_secondary_main().  No arguments.  Clobbers x0, x1.
+//===========================================================================
+mmu_secondary_el1_enable:
+    // 1. MAIR_EL1 — match EL2: Attr0=Device(0x00), Attr1=Normal WB(0xFF)
+    mov     x0, #0xFF00
     msr     mair_el1, x0
     isb
 
-    //--------------------------------------------------------------------------
-    // Step 2: Build Level 1 Page Table
-    //--------------------------------------------------------------------------
-    adr     x0, page_table_l1
-    
-    // Clear entire L1 table
-    mov     x1, #512              // 512 entries
-    mov     x2, #0
-1:  str     x2, [x0], #8
-    subs    x1, x1, #1
-    b.ne    1b
-
-    // Reset pointer to start of table
-    adr     x0, page_table_l1
-
-    //--------------------------------------------------------------------------
-    // Entry 0: Map 0x00000000 - 0x3FFFFFFF (1GB) as Normal Cacheable (RAM)
-    // Descriptor = PA | Valid(1) | AF(0x400) | AttrIdx1(4) | SH_Inner(0x300)
-    //--------------------------------------------------------------------------
-    mov     x1, #0x1                           // Valid bit
-    orr     x1, x1, #0x4                       // AttrIdx = 1 (Normal memory)
-    orr     x1, x1, #(3 << 8)                  // SH = Inner Shareable
-    orr     x1, x1, #(1 << 10)                 // AF = Access Flag
-    str     x1, [x0, #0]                       // Store at index 0
-
-    //--------------------------------------------------------------------------
-    // Entry 1: Map 0x40000000 - 0x7FFFFFFF (1GB) as Normal Cacheable (RAM)
-    //--------------------------------------------------------------------------
-    movz    x1, #0x4000, lsl #16               // 0x40000000
-    orr     x1, x1, #0x1                       // Valid
-    orr     x1, x1, #0x4                       // AttrIdx = 1
-    orr     x1, x1, #(3 << 8)                  // SH = Inner
-    orr     x1, x1, #(1 << 10)                 // AF
-    str     x1, [x0, #8]                       // Store at index 1
-
-    //--------------------------------------------------------------------------
-    // Entry 3: Map 0xC0000000 - 0xFFFFFFFF (1GB) as Device Memory (Peripherals)
-    // This covers the RK3399 peripheral region at 0xFF000000
-    // Descriptor = PA | Valid(1) | AF(0x400) | AttrIdx0(0) | SH_Outer(0x200)
-    //--------------------------------------------------------------------------
-    movz    x1, #0xC000, lsl #16               // 0xC0000000
-    orr     x1, x1, #0x1                       // Valid
-    orr     x1, x1, #(2 << 8)                  // SH = Outer Shareable
-    orr     x1, x1, #(1 << 10)                 // AF
-    movk    x1, #0x0060, lsl #48               // PXN(bit53) + UXN(bit54)
-    str     x1, [x0, #24]                      // Store at index 3
-
-    //--------------------------------------------------------------------------
-    // Step 3: Configure TCR_EL1 (Translation Control Register)
-    //--------------------------------------------------------------------------
-    // TCR_EL1 configuration:
-    // - T0SZ = 32 (2^(64-32) = 4GB address space for TTBR0)
-    // - IRGN0 = 0b01 (Inner Write-Back Cacheable)
-    // - ORGN0 = 0b01 (Outer Write-Back Cacheable)
-    // - SH0 = 0b11 (Inner Shareable)
-    // - TG0 = 0b00 (4KB granule)
-    // - IPS = 0b010 (40-bit physical address, 1TB)
-    
-    mov     x0, #32                            // T0SZ = 32 (4GB VA space)
-    orr     x0, x0, #0x100                     // IRGN0 = 0b01 << 8 (Inner WB)
-    orr     x0, x0, #0x400                     // ORGN0 = 0b01 << 10 (Outer WB)
-    orr     x0, x0, #0x3000                    // SH0 = 0b11 << 12 (Inner Shareable)
-    // TG0 = 0 (4KB granule) - already zero, no need to set
-    movk    x0, #0x0002, lsl #32               // IPS = 0b010 << 32 (40-bit PA)
+    // 2. TCR_EL1 — T0SZ=32 (4GB VA), 4KB granule, WB Inner-Shareable, 40-bit PA
+    //    EPD1=1 disables TTBR1 region (we only use low 4GB identity map)
+    mov     x0, #32                // T0SZ=32
+    orr     x0, x0, #0x100         // IRGN0=01  Inner WB RA WA
+    orr     x0, x0, #0x400         // ORGN0=01  Outer WB RA WA
+    orr     x0, x0, #0x3000        // SH0=11    Inner Shareable
+    orr     x0, x0, #0x200000      // T1SZ=32
+    orr     x0, x0, #0x800000      // EPD1=1    disable TTBR1 walks
+    orr     x0, x0, #0x1000000     // IRGN1=01
+    orr     x0, x0, #0x4000000     // ORGN1=01
+    orr     x0, x0, #0x30000000    // SH1=11
+    orr     x0, x0, #0x80000000    // TG1=10    4KB
+    movk    x0, #0x0002, lsl #32   // IPS=010   40-bit intermediate PA
     msr     tcr_el1, x0
     isb
 
-    //--------------------------------------------------------------------------
-    // Step 4: Set TTBR0_EL1 to point to our page table
-    //--------------------------------------------------------------------------
+    // 3. TTBR0_EL1 — same page table as EL2 (VA=PA identity map)
     adr     x0, page_table_l1
     msr     ttbr0_el1, x0
     isb
 
-    //--------------------------------------------------------------------------
-    // Step 5: Invalidate TLB and caches
-    //--------------------------------------------------------------------------
-    tlbi    vmalle1                            // Invalidate all TLB entries
-    dsb     sy                                 // Data Synchronization Barrier
-    isb                                        // Instruction Synchronization Barrier
+    // 4. Invalidate EL1 TLBs + I-cache (Inner Shareable broadcast)
+    tlbi    vmalle1is
+    ic      ialluis
+    dsb     ish
+    isb
 
-    // Restore and return
-    ldp     x29, x30, [sp], #16
-    ret
-
-//==============================================================================
-// mmu_enable: Enable MMU and caches
-// This activates the distributed address space
-//==============================================================================
-mmu_enable:
-    // Read current SCTLR_EL1
+    // 5. Enable MMU (M=1), D-cache (C=1), I-cache (I=1) in SCTLR_EL1
     mrs     x0, sctlr_el1
-
-    // Enable MMU, caches, and alignment checking
-    orr     x0, x0, #(1 << 0)                  // M bit: Enable MMU
-    orr     x0, x0, #(1 << 2)                  // C bit: Enable D-cache
-    orr     x0, x0, #(1 << 12)                 // I bit: Enable I-cache
-    orr     x0, x0, #(1 << 1)                  // A bit: Enable alignment check
-
-    // Write back to SCTLR_EL1
-    msr     sctlr_el1, x0
-    isb                                        // Ensure MMU is enabled before continuing
-
-    ret
-
-//==============================================================================
-// mmu_disable: Disable MMU (for debugging)
-//==============================================================================
-.global mmu_disable
-mmu_disable:
-    mrs     x0, sctlr_el1
-    bic     x0, x0, #(1 << 0)                  // Clear M bit
+    orr     x0, x0, #(1 << 0)     // M=1
+    orr     x0, x0, #(1 << 2)     // C=1
+    orr     x0, x0, #(1 << 12)    // I=1
     msr     sctlr_el1, x0
     isb
+
     ret

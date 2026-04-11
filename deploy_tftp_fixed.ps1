@@ -1,5 +1,7 @@
 # deploy_tftp_fixed.ps1 - Исправленный скрипт развертывания с автоопределением IP
 # Исправляет проблему ARP timeout при несоответствии IP-адресов
+# Требуется PowerShell 7+ (pwsh). В Windows PowerShell 5.1 разбор этого файла может завершаться ошибкой.
+#requires -Version 7.0
 
 param(
     [string]$PortName = "COM3",
@@ -31,6 +33,10 @@ Write-Host "========================================" -ForegroundColor Cyan
 Write-Host "  H-Exo TFTP Deploy (Fixed IP)" -ForegroundColor Cyan
 Write-Host "========================================" -ForegroundColor Cyan
 Write-Host ""
+Write-Host "Подсказка: если на UART застряло на LPDDR3 933MHz failed после прошивки u-boot," -ForegroundColor DarkYellow
+Write-Host "  SPL собран не под твою плату (DDR3 vs LPDDR3). Восстанови загрузчик с рабочей SD" -ForegroundColor DarkYellow
+Write-Host "  или прошивай idbloader/u-boot.itb, собранные под NanoPi M4 (DDR3)." -ForegroundColor DarkYellow
+Write-Host ""
 Write-Host "Обнаружен IP ПК: $localIP" -ForegroundColor Green
 Write-Host "TFTP директория: $TftpDir" -ForegroundColor Cyan
 Write-Host ""
@@ -44,25 +50,21 @@ if (-not (Test-Path $kernelPath)) {
 }
 
 $kernelSize = (Get-Item $kernelPath).Length
-Write-Host "Файл ядра: $KernelFile ($kernelSize bytes)" -ForegroundColor Green
+Write-Host "Файл ядра: $KernelFile ($($kernelSize) bytes)" -ForegroundColor Green
 Write-Host ""
 
-# Проверяем TFTP сервер
-$tftpRunning = $false
-try {
-    $udp = New-Object System.Net.Sockets.UdpClient
-    $udp.Client.ReceiveTimeout = 1000
-    $udp.Connect("localhost", 69)
-    $udp.Send([byte[]]@(0, 1, 0), 3)  # TFTP RRQ packet
-    $tftpRunning = $true
-    $udp.Close()
-} catch {
-    # TFTP server might not respond to empty packet, that's ok
-    $tftpRunning = $true  # Assume it's running if we got this far
+# Проверяем что TFTP сервер действительно слушает UDP:69.
+# Важно: bind() на Any здесь ненадежен, если сервер привязан к конкретному IP.
+$udp69 = Get-NetUDPEndpoint -LocalPort 69 -ErrorAction SilentlyContinue
+if (-not $udp69) {
+    Write-Host "TFTP сервер: не обнаружен на UDP 69, запускаю фоновый сервер..." -ForegroundColor Yellow
+    & (Join-Path $PSScriptRoot "start_tftp_server_bg.ps1")
+    Start-Sleep -Seconds 2
+    $udp69 = Get-NetUDPEndpoint -LocalPort 69 -ErrorAction SilentlyContinue
 }
 
-if (-not $tftpRunning) {
-    Write-Warning "TFTP сервер не обнаружен! Запустите: .\ps_tftp_server.ps1"
+if (-not $udp69) {
+    Write-Host "TFTP сервер не запустился. Запусти вручную: .\start_tftp_server_bg.ps1" -ForegroundColor Red
     exit 1
 }
 
@@ -70,33 +72,88 @@ Write-Host "TFTP сервер: АКТИВЕН" -ForegroundColor Green
 Write-Host ""
 
 # Открываем COM порт
-Write-Host "[*] Открываю $PortName на $BaudRate baud..." -ForegroundColor Yellow
+Write-Host "`[*] Открываю $PortName на $BaudRate baud..." -ForegroundColor Yellow
 $serial = $null
 try {
     $serial = New-Object System.IO.Ports.SerialPort($PortName, $BaudRate, [System.IO.Ports.Parity]::None, 8, [System.IO.Ports.StopBits]::One)
     $serial.ReadTimeout = 500
     $serial.WriteTimeout = 1000
     $serial.Open()
-    Write-Host "[+] Порт открыт" -ForegroundColor Green
+    Write-Host "`[+] Порт открыт" -ForegroundColor Green
 } catch {
     Write-Error "Не удалось открыть $PortName : $_"
     exit 1
 }
 
+function Send-UbootCommand {
+    param(
+        $SerialPort,
+        [string] $cmd,
+        [int] $waitMs = 800
+    )
+    Write-Host "`[>] $cmd" -ForegroundColor Cyan
+    $SerialPort.DiscardInBuffer()
+    $SerialPort.Write($cmd + "`r")
+    $response = ""
+    $readStart = Get-Date
+    while (((Get-Date) - $readStart).TotalMilliseconds -lt $waitMs) {
+        try {
+            $ch = [char]$SerialPort.ReadChar()
+            $response += $ch
+            if ($response -match '=>\s*$') { break }
+        } catch { break }
+    }
+}
+
+
 try {
     Write-Host ""
-    Write-Host "[*] ПЕРЕЗАГРУЗИТЕ ПЛАТУ (power cycle)..." -ForegroundColor Yellow
-    Write-Host "[*] Ожидаю U-Boot prompt..." -ForegroundColor Yellow
+    Write-Host "`[*] Проверяю состояние платы (ядро или U-Boot)..." -ForegroundColor Yellow
     Write-Host ""
-    
+
+    # Step 1: read 3 seconds of UART output (probe)
     $buffer = ""
+    $probeEnd = (Get-Date).AddSeconds(3)
+    while ((Get-Date) -lt $probeEnd) {
+        try {
+            $ch = [char]$serial.ReadChar()
+            $buffer += $ch
+            Write-Host -NoNewline $ch
+        } catch { Start-Sleep -Milliseconds 5 }
+    }
+
+    # If kernel interactive prompt detected, send soft reboot
+    if ($buffer -match '> \s*$' -or $buffer -match '[>]\s*$') {
+        Write-Host "" 
+        Write-Host "`[*] Обнаружено работающее ядро (> prompt). Отправляю команду reboot r..." -ForegroundColor Yellow
+        Start-Sleep -Milliseconds 200
+        $serial.DiscardInBuffer()
+        $serial.Write("r`r")
+        Start-Sleep -Milliseconds 500
+        Write-Host "`[*] Reboot отправлен. Ожидаю U-Boot..." -ForegroundColor Yellow
+        Write-Host ""
+    } else {
+        Write-Host ""
+        Write-Host "`[*] ПЕРЕЗАГРУЗИТЕ ПЛАТУ (power cycle) если U-Boot не появится через 10 сек..." -ForegroundColor Yellow
+        Write-Host ""
+    }
+
     $promptReceived = $false
     $timeout = 120
     $start = Get-Date
-    $lastCtrlC = Get-Date
-    
-    # Ждем U-Boot prompt с прерыванием PXE
+    $lastBreak = Get-Date
+    $buffer = ""
+
+    # Ждем U-Boot prompt и АГРЕССИВНО срываем autoboot/PXE.
     while (((Get-Date) - $start).TotalSeconds -lt $timeout) {
+        if (((Get-Date) - $lastBreak).TotalMilliseconds -gt 120) {
+            try {
+                $serial.Write(" ")
+                $serial.Write("`r")
+                $serial.Write([char]3)  # Ctrl+C
+            } catch {}
+            $lastBreak = Get-Date
+        }
         try {
             $char = $serial.ReadChar()
             $ch = [char]$char
@@ -104,19 +161,29 @@ try {
             Write-Host -NoNewline $ch
             
             # Ищем признаки PXE загрузки
-            if ($buffer -match "BOOTP|DHCP|TFTP|pxelinux|Loading:|Retrieving") {
-                if (((Get-Date) - $lastCtrlC).TotalMilliseconds -gt 200) {
-                    $serial.Write([char]3)  # Ctrl+C
-                    $lastCtrlC = Get-Date
-                }
+            if ($buffer -match "BOOTP|DHCP|TFTP|pxelinux|Loading:|Retrieving|Hit any key to stop autoboot") {
+                try { $serial.Write([char]3) } catch {}
             }
             
-            # Ищем U-Boot prompt
-            if ($buffer -match "=>" -and $buffer.Length -gt 100) {
+            # If kernel still running, retry reboot
+            if ($buffer -match '> \s*$' -and $buffer.Length -lt 200) {
+                try { $serial.Write("r`r") } catch {}
+            }
+
+            # Детектируем DRAM init fail (только специфичная строка DDR init failure)
+            # Do not use Read-Host here (blocks autoboot interception).
+            if ($buffer -match "some channel init fail") {
                 Write-Host ""
-                Write-Host "[+] U-Boot prompt получен!" -ForegroundColor Green
+                Write-Host "`[!] DDR init fail detected - power cycle board NOW!" -ForegroundColor Red -BackgroundColor DarkRed
+                $buffer = ""
+                $start = Get-Date  # сбросить таймаут, ждём пока юзер передёрнет питание
+            }
+
+            # Ищем U-Boot prompt
+            if ($buffer -match '=>\s*$') {
+                Write-Host ""
+                Write-Host "`[+] U-Boot prompt получен!" -ForegroundColor Green
                 $promptReceived = $true
-                Start-Sleep -Milliseconds 500
                 break
             }
             
@@ -133,46 +200,36 @@ try {
         Write-Error "Не удалось получить U-Boot prompt за $timeout секунд"
         exit 1
     }
-    
+
+    # Сбрасываем буфер (остатки PXE + Ctrl+C ответы)
+    Start-Sleep -Milliseconds 200
+    $serial.DiscardInBuffer()
+
     # Отправляем команды настройки сети с ПРАВИЛЬНЫМ IP
-    function Send-UbootCommand {
-        param([string]$cmd, [int]$waitMs = 500)
-        Write-Host "[>] $cmd" -ForegroundColor Cyan
-        $serial.WriteLine($cmd)
-        Start-Sleep -Milliseconds $waitMs
-        
-        # Читаем ответ
-        $response = ""
-        $readStart = Get-Date
-        while (((Get-Date) - $readStart).TotalMilliseconds -lt 1000) {
-            try {
-                $response += [char]$serial.ReadChar()
-            } catch { break }
-        }
-        if ($response) { Write-Host $response -ForegroundColor Gray }
-        return $response
-    }
-    
     Write-Host ""
-    Write-Host "[*] Настройка сети с IP $localIP..." -ForegroundColor Yellow
+    Write-Host "`[*] Настройка сети с IP $localIP..." -ForegroundColor Yellow
     
-    Send-UbootCommand "setenv ipaddr 192.168.1.10" 100
-    Send-UbootCommand "setenv serverip $localIP" 100
-    Send-UbootCommand "setenv bootfile $KernelFile" 100
-    
+    Send-UbootCommand $serial "setenv ipaddr 192.168.1.10"
+    Send-UbootCommand $serial "setenv serverip $localIP"
+    Send-UbootCommand $serial "setenv bootfile $KernelFile"
+
+    # NOTE: BL31 RAM override removed: overwriting 0x40000 destroys BL31 runtime
+    # data (cpuson_flags, cpuson_entry_point) in the same DRAM region.
+
     # Загружаем ядро
     Write-Host ""
-    Write-Host "[*] Загрузка ядра через TFTP..." -ForegroundColor Yellow
+    Write-Host "`[*] Загрузка ядра через TFTP..." -ForegroundColor Yellow
     Write-Host "    Это может занять 10-30 секунд..." -ForegroundColor Gray
     Write-Host ""
     
-    $serial.WriteLine("tftp 0x02080000 $KernelFile")
+    $serial.Write("tftp 0x02080000 $KernelFile`r")
     Start-Sleep -Milliseconds 100
     
     # Ждем завершения TFTP передачи
     $tftpTimeout = 60
     $tftpStart = Get-Date
     $tftpComplete = $false
+    $tftpFailed = $false
     $tftpBuffer = ""
     
     while (((Get-Date) - $tftpStart).TotalSeconds -lt $tftpTimeout) {
@@ -181,20 +238,29 @@ try {
             $tftpBuffer += $ch
             Write-Host -NoNewline $ch
             
-            # Ищем признаки успешной загрузки или ошибки
-            if ($tftpBuffer -match "Bytes transferred|Loading:.*done|=> ") {
-                if ($tftpBuffer -match "Bytes transferred") {
-                    Write-Host ""
-                    Write-Host "[+] TFTP загрузка успешна!" -ForegroundColor Green
-                    $tftpComplete = $true
-                    break
-                }
+            # Успешная загрузка
+            if ($tftpBuffer -match "Bytes transferred") {
+                Write-Host ""
+                Write-Host "`[+] TFTP загрузка успешна!" -ForegroundColor Green
+                $tftpComplete = $true
+                break
             }
             
-            if ($tftpBuffer -match "Retry count exceeded|ERROR|TIMEOUT|not found") {
+            # Ошибка передачи
+            if ($tftpBuffer -match "Retry count exceeded") {
                 Write-Host ""
-                Write-Error "TFTP ошибка: $_"
-                exit 1
+                Write-Host "`[!] TFTP FAILED: Retry count exceeded" -ForegroundColor Red
+                Write-Host "    Проверьте что ps_tftp_server.ps1 запущен как Administrator" -ForegroundColor Yellow
+                $tftpFailed = $true
+                break
+            }
+            
+            if ($tftpBuffer -match "Could not initialize PHY|TIMEOUT") {
+                Write-Host ""
+                Write-Host "`[!] TFTP FAILED: Ethernet PHY error" -ForegroundColor Red
+                Write-Host "    Проверьте Ethernet кабель NanoPi M4" -ForegroundColor Yellow
+                $tftpFailed = $true
+                break
             }
             
             if ($tftpBuffer.Length -gt 3000) {
@@ -205,39 +271,45 @@ try {
         }
     }
     
-    if (-not $tftpComplete) {
+    if ($tftpFailed) {
         Write-Host ""
-        Write-Warning "TFTP загрузка не подтверждена, но продолжаем..."
+        Write-Host "`[!] Деплой прерван: TFTP загрузка не удалась" -ForegroundColor Red
+        exit 1
     }
     
+    if (-not $tftpComplete) {
+        Write-Host ""
+        Write-Host "`[!] Деплой прерван: TFTP таймаут $($tftpTimeout) секунд" -ForegroundColor Red
+        exit 1
+    }
+    
+    # Disable caches before kernel launch (matches booti cleanup_before_linux)
+    Write-Host ""
+    Write-Host "`[*] Сброс кэшей (dcache/icache off)..." -ForegroundColor Yellow
+    Send-UbootCommand $serial "dcache off" 1500
+    Send-UbootCommand $serial "icache off" 1500
+
     # Запускаем ядро
     Write-Host ""
-    Write-Host "[*] Запуск ядра..." -ForegroundColor Yellow
-    $serial.WriteLine("go 0x02080000")
+    Write-Host "`[*] Запуск ядра..." -ForegroundColor Yellow
+    $serial.Write("go 0x02080000`r")
     
-    # Мониторим вывод ядра
+    # Kernel UART monitor + interactive stdin (restored after file parse fix)
     Write-Host ""
     Write-Host "========================================" -ForegroundColor Green
-    Write-Host "  Ядро запущено! Ожидаем маяки..." -ForegroundColor Green
+    Write-Host "  Kernel running; UART mirror + console" -ForegroundColor Green
     Write-Host "========================================" -ForegroundColor Green
     Write-Host ""
-    Write-Host "Ожидаем: [BEACON] A, B, C, D, E и BEAT сообщения" -ForegroundColor Cyan
-    Write-Host "Нажмите Ctrl+C для выхода" -ForegroundColor Gray
-    Write-Host ""
-    
+
     $kernelOutput = ""
-    
     while ($true) {
         try {
             $ch = [char]$serial.ReadChar()
             Write-Host -NoNewline $ch
             $kernelOutput += $ch
-            
-            # Проверяем успешную загрузку
-            if ($kernelOutput -match "Operational|H-Exo Omni-Core") {
+            if ($kernelOutput -match 'Operational|H-Exo Omni-Core') {
                 Write-Host ""
-                Write-Host ""
-                Write-Host "[+] ЯДРО УСПЕШНО ЗАГРУЖЕНО!" -ForegroundColor Green -BackgroundColor Black
+                Write-Host "`[+] KERNEL BOOT OK" -ForegroundColor Green -BackgroundColor Black
                 Write-Host ""
                 break
             }
@@ -245,62 +317,39 @@ try {
             Start-Sleep -Milliseconds 10
         }
     }
-    
-    # Продолжаем интерактивный режим
-    Write-Host ""
-    Write-Host "========================================" -ForegroundColor Green
-    Write-Host "  ИНТЕРАКТИВНЫЙ РЕЖИМ" -ForegroundColor Green
-    Write-Host "========================================" -ForegroundColor Green
-    Write-Host "Отправьте команды в ядро:" -ForegroundColor Cyan
-    Write-Host "  '2' - Запустить Heartbeat тест" -ForegroundColor White
-    Write-Host "  'C' - Включить Chaos mode (внутри heartbeat)" -ForegroundColor White
-    Write-Host "  'q' - Echo mode" -ForegroundColor White
-    Write-Host "  Ctrl+C здесь или в терминале - выход" -ForegroundColor Gray
-    Write-Host ""
-    
-    # Читаем вывод ядра и позволяем отправлять команды
-    Write-Host "`n[ВВОД АКТИВЕН] Нажмите '2', 'C' или 'q' для управления ядром" -ForegroundColor Magenta
-    Write-Host "[Ctrl+C в PowerShell или Ctrl+Break] - выход`n" -ForegroundColor Gray
-    
+
+    Write-Host "[INPUT] keys sent to board; Ctrl+C exits (closes port in finally)" -ForegroundColor Magenta
     while ($serial.IsOpen) {
         try {
-            # Читаем из порта с таймаутом
             if ($serial.BytesToRead -gt 0) {
-                $ch = [char]$serial.ReadChar()
-                Write-Host -NoNewline $ch
+                Write-Host -NoNewline ([char]$serial.ReadChar())
             }
-            
-            # Проверяем ввод без блокировки и без эха
             if ([Console]::KeyAvailable) {
-                $key = [Console]::ReadKey($true)  # $true = intercept (no echo)
-                $keyChar = $key.KeyChar
-                
-                if ($key.Key -eq "C" -and $key.Modifiers -eq "Control") {
-                    Write-Host "`n[!] Прерывание Ctrl+C" -ForegroundColor Yellow
+                $key = [Console]::ReadKey($true)
+                $c = $key.KeyChar
+                if ($key.Key -eq [ConsoleKey]::C -and $key.Modifiers -band [ConsoleModifiers]::Control) {
+                    Write-Host "`n`[!] Ctrl+C" -ForegroundColor Yellow
                     break
                 }
-                
-                if ($keyChar) {
-                    $serial.Write($keyChar)
-                    Write-Host "`n[>] Отправлено: '$keyChar'" -ForegroundColor Green
+                if ($c) {
+                    $serial.Write($c)
+                    Write-Host "`n`[>] sent: $c" -ForegroundColor Green
                 }
             }
-            
             Start-Sleep -Milliseconds 10
         } catch {
             Start-Sleep -Milliseconds 10
         }
     }
-    
 } finally {
     if ($serial -and $serial.IsOpen) {
         $serial.Close()
         Write-Host ""
-        Write-Host "[!] Порт закрыт" -ForegroundColor Yellow
+        Write-Host "`[!] Port closed" -ForegroundColor Yellow
     }
 }
 
 Write-Host ""
 Write-Host "========================================" -ForegroundColor Cyan
-Write-Host "  Развертывание завершено" -ForegroundColor Cyan
+Write-Host "  Deploy finished." -ForegroundColor Cyan
 Write-Host "========================================" -ForegroundColor Cyan

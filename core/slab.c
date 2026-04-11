@@ -34,6 +34,16 @@ static inline void clear_bit(int bit) {
     slab_bitmap[bit / 8] &= ~(1 << (bit % 8));
 }
 
+static u32 slab_count_used_blocks(void) {
+    u32 used = 0;
+    for (u32 i = 0; i < SLAB_MAX_BLOCKS; i++) {
+        if (is_bit_set((int)i)) {
+            used++;
+        }
+    }
+    return used;
+}
+
 void slab_init(void) {
     for (int i = 0; i < sizeof(slab_bitmap); i++) {
         slab_bitmap[i] = 0;
@@ -64,13 +74,22 @@ void kfree(void* ptr) {
 }
 
 void slab_dump_stats(uart_t* uart) {
-    int used = 0;
-    for (int i = 0; i < SLAB_MAX_BLOCKS; i++) {
-        if (is_bit_set(i)) used++;
-    }
+    u32 used = slab_count_used_blocks();
     uart_puts(uart, "[SLAB] Usage: ");
     uart_put_hex(uart, used);
     uart_puts(uart, "/");
     uart_put_hex(uart, SLAB_MAX_BLOCKS);
     uart_puts(uart, " blocks\r\n");
+}
+
+u32 slab_get_used_blocks(void) {
+    return slab_count_used_blocks();
+}
+
+u32 slab_get_total_blocks(void) {
+    return SLAB_MAX_BLOCKS;
+}
+
+u32 slab_get_usage_percent(void) {
+    return (slab_count_used_blocks() * 100u) / SLAB_MAX_BLOCKS;
 }

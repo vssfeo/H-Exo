@@ -89,4 +89,5 @@ void chaos_memory_thrash(u32 size_kb) {
             buffer[idx] = (u8)(i + kb);
         }
     }
+    (void)buffer[0];
 }

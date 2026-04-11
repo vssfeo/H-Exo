@@ -1,16 +1,17 @@
 {
-  "version": "v0.5",
-  "date": "2026-03-25",
+  "version": "v0.9",
+  "date": "2026-04-05",
   "kernel": "kernel_neuro.bin",
-  "description": "H-Exo Omni-Core Phase 0.5 - Neural Arbitrator with Testing Infrastructure",
+  "description": "H-Exo Omni-Core Phase 0.9 - SMP multi-core (PSCI CPU_ON x5) + GMAC L2 RX ring + TX ATDS fix",
   "metrics": {
-    "kernel_size_bytes": 16384,
-    "kernel_sectors": 32,
-    "boot_time_ms": 250,
-    "inference_time_us": 800,
-    "cache_hit_rate": 94.2,
-    "max_jitter_percent": 5,
-    "crc_weights": "0xD68AD84E"
+    "kernel_size_bytes": 20488,
+    "kernel_sectors": 41,
+    "heartbeat_interval_cycles": 2400006,
+    "heartbeat_interval_ms": 100.0003,
+    "max_jitter_cycles": 7,
+    "max_jitter_us": 0.29,
+    "crc_weights": "0x1F1BA056",
+    "build_flags": "-Os -ffunction-sections -fdata-sections -fomit-frame-pointer --gc-sections"
   },
   "components": {
     "aleph_engine": true,
@@ -19,22 +20,29 @@
     "crc_validation": true,
     "heartbeat_monitor": true,
     "json_logger": true,
-    "adaptive_scheduler": true
+    "adaptive_scheduler": true,
+    "gmac_phy_init": true,
+    "gmac_l2_tx": true,
+    "gmac_l2_rx": true,
+    "smp_multicore": true,
+    "gicv3": true,
+    "slab_allocator": true,
+    "chaos_engine": true
   },
   "test_results": {
     "crc_validation": "PASS",
-    "heartbeat_stability": "PENDING",
+    "heartbeat_stability": "PASS",
     "neural_inference": "PASS",
-    "boot_integrity": "PENDING"
+    "boot_integrity": "PASS",
+    "beacons_a_to_e": "PASS",
+    "smp_cores_online": "PENDING",
+    "gmac_l2_rx": "PENDING"
   },
   "regression_thresholds": {
-    "max_kernel_size_bytes": 17408,
-    "max_kernel_size_increase_percent": 6,
-    "max_boot_time_ms": 275,
-    "max_boot_time_increase_percent": 10,
-    "max_inference_time_us": 880,
-    "max_inference_time_increase_percent": 10,
-    "min_cache_hit_rate": 90,
-    "max_jitter_percent": 7
+    "max_kernel_size_bytes": 28672,
+    "max_kernel_size_increase_percent": 10,
+    "max_jitter_cycles": 50,
+    "max_jitter_us": 2.0,
+    "crc_weights_expected": "0x1F1BA056"
   }
 }

@@ -1,0 +1,9 @@
+The directory third_party/ is not in this Git repository (multiple GB of TF-A,
+U-Boot, rkbin, etc.). Clone or symlink vendor trees locally.
+
+Minimum for RK3399 bring-up work in this repo:
+- trusted-firmware-a (e.g. tag v2.14.x) under third_party/trusted-firmware-a-v2.14
+- Optional: apply patches/trusted-firmware-a-v2.14-rk3399-skip-m0.patch for
+  Windows or toolchain setups without arm-none-eabi-gcc (SKIP_M0_BUILD=1).
+
+See docs/rk3399/source-map.md for file paths inside those trees.

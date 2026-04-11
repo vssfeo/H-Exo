@@ -36,7 +36,15 @@
 #define GICR_ICENABLER0 (GICR_SGI_OFFSET + 0x0180)
 #define GICR_IPRIORITYR0 (GICR_SGI_OFFSET + 0x0400)
 
+// GMAC DMA interrupt: GIC SPI 24 → INTID 56
+#define GMAC_GIC_INTID  56u
+
+void     gicv3_prewake_redistributors(void);
 result_t gicv3_init(void);
 void gicv3_enable_irq(u32 irq);
+void gicv3_route_irq(u32 irq, u64 affinity);  // set GICD_IROUTER
+void gicv3_set_priority(u32 irq, u8 prio);    // set GICD_IPRIORITYR
+u32  gicv3_ack_irq(void);                       // read ICC_IAR1_EL1
+void gicv3_eoi_irq(u32 intid);                 // write ICC_EOIR1_EL1
 
 #endif // HEXO_HAL_GICV3_H
