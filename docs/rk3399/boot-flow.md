@@ -66,7 +66,7 @@ Before changing or flashing boot components, check:
 Чтобы получить **тот же формат**, что ожидает Rockchip SPL, собирайте контейнер на Linux через **`trust_merger`** из `rkbin`, а не через самодельный Windows-упаковщик.
 
 1. В репозитории: **Actions → «RK3399 BL31 + trust.img» → Run workflow** (по умолчанию тег TF-A `v2.14.0`).
-2. Скачайте артефакт (zip): внутри `trust.img`, `bl31.elf`, `SHA256SUMS`, `README_FLASH.txt`. Сборка **release** с **низким `LOG_LEVEL`** (`PMUSRAM_RSIZE` для BL31 на RK3399 всего **8 KiB**; `LOG_LEVEL=40` и assertions дают переполнение `.pmusram` при линковке). В CI: `RK3399_BAUDRATE=1500000` как в `rk3399_def.h`.
+2. Скачайте артефакт (zip): внутри `trust.img`, `bl31.elf`, `SHA256SUMS`, `README_FLASH.txt`. В CI к TF-A применяется патч `patches/tf-a-v2.14-rk3399-pmusram-rsize-16k.patch`: в апстриме `PMUSRAM_RSIZE` задан **8 KiB**, линковка BL31 с текущими M0-блобами даёт переполнение ~4 KiB; **16 KiB** остаётся внутри окна `PMUSRAM_SIZE` (64 KiB). Локальная сборка TF-A — тот же патч. Параметры сборки: `LOG_LEVEL=20`, `RK3399_BAUDRATE=1500000`.
 3. Положите `trust.img` в `C:\tftpboot\` (или укажите путь) и прошейте только trust, например PowerShell 7:
 
    `.\flash_bootloader_uboot.ps1 -TrustOnly -ForceWrite -TrustFile C:\tftpboot\trust.img`

@@ -1,0 +1,18 @@
+Upstream TF-A v2.14.x for RK3399 links BL31 .pmusram into PMUSRAM_RSIZE (8 KiB).
+With current M0 blobs + AArch64 glue, GNU ld overflows by ~3.9 KiB on Ubuntu
+aarch64-linux-gnu-11. Expand the reserved BL31 PMU SRAM budget to 16 KiB; total
+PMU SRAM window remains SIZE_K(64).
+
+Apply from TF-A tree root: patch -p1 < path/to/this/file
+
+--- a/plat/rockchip/rk3399/include/shared/addressmap_shared.h
++++ b/plat/rockchip/rk3399/include/shared/addressmap_shared.h
+@@ -64,7 +64,7 @@
+ #define PMUGRF_SIZE		SIZE_K(64)
+ #define SGRF_SIZE		SIZE_K(64)
+ #define PMUSRAM_SIZE		SIZE_K(64)
+-#define PMUSRAM_RSIZE		SIZE_K(8)
++#define PMUSRAM_RSIZE		SIZE_K(16)
+ #define PWM_SIZE		SIZE_K(64)
+ #define CIC_SIZE		SIZE_K(4)
+ #define DCF_SIZE		SIZE_K(4)

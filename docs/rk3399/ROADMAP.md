@@ -341,3 +341,4 @@ The following telemetry is permanently wired and survives across SMP failures:
 | 2026-04 | `daifset` and `SCTLR.I` tried and confirmed insufficient |
 | **2026-04-08** | **MMU enable in trampoline → A53 cores 1,2,3 ONLINE, all in C-worker** |
 | 2026-04-11 | GitHub Action **RK3399 BL31 + trust.img**: TF-A v2.14 BL31 + rkbin `trust_merger` artifact (replace Windows packer) |
+| 2026-04-11 | TF-A RK3399: **PMUSRAM_RSIZE 8→16 KiB** in CI (upstream link overflow ~3.9 KiB; patch file in `patches/`) |

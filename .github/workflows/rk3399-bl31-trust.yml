@@ -13,6 +13,7 @@ on:
     branches: [master, main]
     paths:
       - ".github/workflows/rk3399-bl31-trust.yml"
+      - "patches/tf-a-v2.14-rk3399-pmusram-rsize-16k.patch"
 
 permissions:
   contents: read
@@ -49,8 +50,14 @@ jobs:
             https://github.com/TrustedFirmware-A/trusted-firmware-a.git \
             "${{ runner.temp }}/tfa"
 
-      # RK3399 BL31 linker region PMUSRAM_RSIZE is only 8 KiB (addressmap_shared.h).
-      # High LOG_LEVEL / assertions inflate .pmusram and fail link (~4 KiB overflow).
+      # Same change as patches/tf-a-v2.14-rk3399-pmusram-rsize-16k.patch (sed avoids tab/CRLF issues).
+      - name: Enlarge PMUSRAM_RSIZE for BL31 link (8 KiB -> 16 KiB)
+        run: |
+          F="${{ runner.temp }}/tfa/plat/rockchip/rk3399/include/shared/addressmap_shared.h"
+          grep -n PMUSRAM_RSIZE "$F"
+          sed -i '/PMUSRAM_RSIZE/s/SIZE_K(8)/SIZE_K(16)/' "$F"
+          grep -n PMUSRAM_RSIZE "$F"
+
       - name: Build BL31 (RK3399, M0 via arm-none-eabi)
         working-directory: ${{ runner.temp }}/tfa
         run: |

@@ -5,6 +5,8 @@ Minimum for RK3399 bring-up work in this repo:
 - trusted-firmware-a (e.g. tag v2.14.x) under third_party/trusted-firmware-a-v2.14
 - Optional: apply patches/trusted-firmware-a-v2.14-rk3399-skip-m0.patch for
   Windows or toolchain setups without arm-none-eabi-gcc (SKIP_M0_BUILD=1).
+For Ubuntu-style aarch64-linux-gnu links, also apply
+  patches/tf-a-v2.14-rk3399-pmusram-rsize-16k.patch (BL31 PMUSRAM budget).
 
 See docs/rk3399/source-map.md for file paths inside those trees.
 
