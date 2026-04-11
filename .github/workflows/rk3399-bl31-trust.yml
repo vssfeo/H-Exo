@@ -83,12 +83,29 @@ jobs:
           ls -la "$ELF"
 
       # Stock rkbin trust_merger caps each BL3x PT_LOAD at 512 KiB; TF-A v2.14 BL31 exceeds that.
+      # Build host tool from rockchip-linux u-boot (needs USE_HOSTCC + stub watchdog.h for lib/sha256.c).
       - name: Build trust_merger (2 MiB PT_LOAD cap)
         run: |
-          git clone --depth 1 https://github.com/rockchip-toybrick/u-boot.git "${{ runner.temp }}/ub-tb"
-          cd "${{ runner.temp }}/ub-tb/tools/rockchip"
-          sed -i 's/BL3X_FILESIZE_MAX (512 \* 1024)/BL3X_FILESIZE_MAX (2048 * 1024)/' trust_merger.c
-          gcc -O2 -Wall -o "${{ runner.temp }}/trust_merger" trust_merger.c sha2.c
+          set -e
+          git clone --depth 1 -b next-dev https://github.com/rockchip-linux/u-boot.git "${{ runner.temp }}/ub-src"
+          UB="${{ runner.temp }}/ub-src"
+          sed -i 's/BL3X_FILESIZE_MAX (512 \* 1024)/BL3X_FILESIZE_MAX (2048 * 1024)/' "$UB/tools/rockchip/trust_merger.c"
+          mkdir -p "${{ runner.temp }}/hoststub"
+          printf '%s\n' \
+            '/* host stub for u-boot lib/sha256.c */' \
+            '#ifndef WATCHDOG_H' \
+            '#define WATCHDOG_H' \
+            '#define WATCHDOG_RESET(x) do { } while (0)' \
+            '#endif' \
+            > "${{ runner.temp }}/hoststub/watchdog.h"
+          gcc -O2 -Wall -DUSE_HOSTCC \
+            -I"${{ runner.temp }}/hoststub" \
+            -I"$UB/include" \
+            -I"$UB" \
+            -o "${{ runner.temp }}/trust_merger" \
+            "$UB/tools/rockchip/trust_merger.c" \
+            "$UB/tools/rockchip/sha2.c" \
+            "$UB/lib/sha256.c"
 
       - name: Clone rkbin and merge trust.img
         run: |
