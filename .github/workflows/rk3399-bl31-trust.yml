@@ -99,6 +99,7 @@ jobs:
             '#endif' \
             > "${{ runner.temp }}/hoststub/watchdog.h"
           gcc -O2 -Wall -DUSE_HOSTCC \
+            -include stdint.h \
             -I"${{ runner.temp }}/hoststub" \
             -I"$UB/include" \
             -I"$UB" \
