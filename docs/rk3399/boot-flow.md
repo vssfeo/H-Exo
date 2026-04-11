@@ -66,7 +66,7 @@ Before changing or flashing boot components, check:
 Чтобы получить **тот же формат**, что ожидает Rockchip SPL, собирайте контейнер на Linux через **`trust_merger`** из `rkbin`, а не через самодельный Windows-упаковщик.
 
 1. В репозитории: **Actions → «RK3399 BL31 + trust.img» → Run workflow** (по умолчанию тег TF-A `v2.14.0`).
-2. Скачайте артефакт (zip): внутри `trust.img`, `bl31.elf`, `SHA256SUMS`, `README_FLASH.txt`. Сборка **release** (`DEBUG=0`): вариант `DEBUG=1` для RK3399 не линкуется из‑за переполнения региона **PMUSRAM** в скрипте линковки BL31.
+2. Скачайте артефакт (zip): внутри `trust.img`, `bl31.elf`, `SHA256SUMS`, `README_FLASH.txt`. Сборка **release** с **низким `LOG_LEVEL`** (`PMUSRAM_RSIZE` для BL31 на RK3399 всего **8 KiB**; `LOG_LEVEL=40` и assertions дают переполнение `.pmusram` при линковке). В CI: `RK3399_BAUDRATE=1500000` как в `rk3399_def.h`.
 3. Положите `trust.img` в `C:\tftpboot\` (или укажите путь) и прошейте только trust, например PowerShell 7:
 
    `.\flash_bootloader_uboot.ps1 -TrustOnly -ForceWrite -TrustFile C:\tftpboot\trust.img`

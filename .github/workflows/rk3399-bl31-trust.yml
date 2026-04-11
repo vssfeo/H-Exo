@@ -49,8 +49,8 @@ jobs:
             https://github.com/TrustedFirmware-A/trusted-firmware-a.git \
             "${{ runner.temp }}/tfa"
 
-      # DEBUG=1 overflows RK3399 PMUSRAM in the linker script (~4 KiB over). Use release
-      # BL31 for a flashable image; UART still works at RK3399_BAUDRATE.
+      # RK3399 BL31 linker region PMUSRAM_RSIZE is only 8 KiB (addressmap_shared.h).
+      # High LOG_LEVEL / assertions inflate .pmusram and fail link (~4 KiB overflow).
       - name: Build BL31 (RK3399, M0 via arm-none-eabi)
         working-directory: ${{ runner.temp }}/tfa
         run: |
@@ -58,9 +58,9 @@ jobs:
             CROSS_COMPILE=aarch64-linux-gnu- \
             PLAT=rk3399 \
             DEBUG=0 \
-            LOG_LEVEL=40 \
-            ENABLE_ASSERTIONS=1 \
-            RK3399_BAUDRATE=115200 \
+            LOG_LEVEL=20 \
+            ENABLE_ASSERTIONS=0 \
+            RK3399_BAUDRATE=1500000 \
             bl31
 
       - name: Locate bl31.elf
@@ -98,7 +98,7 @@ jobs:
             echo "BL32: rkbin bin/rk33/rk3399_bl32_v2.12.bin (from RK3399TRUST.ini)"
             echo ""
             echo "Files:"
-            echo "  bl31.elf  - EL3 firmware (release; DEBUG=1 does not fit PMUSRAM on RK3399)"
+            echo "  bl31.elf  - EL3 release; LOG_LEVEL<=20 (PMUSRAM_RSIZE=8KiB on RK3399)"
             echo "  trust.img - Rockchip BL3X container for SPL (trust_merger output)"
             echo ""
             echo "Flash (Windows, PowerShell 7), trust slot only:"
