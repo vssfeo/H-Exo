@@ -14,7 +14,8 @@ OUT_DIR="${2:-${ROOT_DIR}/artifacts/rk3399-trust}"
 BUILD_FLAVOR="${3:-default}"
 
 if [[ -z "${BL31_SRC}" ]]; then
-  echo "usage: $0 /path/to/bl31.elf [output-dir]" >&2
+  echo "usage: $0 /path/to/bl31.elf [output-dir] [build_flavor]" >&2
+  echo "  build_flavor: default | bl31_only (no BL32; uses patches/rktrust/RK3399TRUST-BL31ONLY.ini)" >&2
   exit 1
 fi
 
@@ -39,9 +40,15 @@ trap cleanup EXIT
 cp -a "${RKBIN_DIR}/." "${TMP_DIR}/"
 cp -f "${BL31_SRC}" "${TMP_DIR}/bin/rk33/rk3399_bl31_v1.36.elf"
 
+INI="RKTRUST/RK3399TRUST.ini"
+if [[ "${BUILD_FLAVOR}" == "bl31_only" ]] || [[ "${BUILD_FLAVOR}" == "armbian_sd" ]]; then
+  cp -f "${ROOT_DIR}/patches/rktrust/RK3399TRUST-BL31ONLY.ini" "${TMP_DIR}/RKTRUST/RK3399TRUST-BL31ONLY.ini"
+  INI="RKTRUST/RK3399TRUST-BL31ONLY.ini"
+fi
+
 pushd "${TMP_DIR}" >/dev/null
 chmod +x tools/trust_merger
-./tools/trust_merger RKTRUST/RK3399TRUST.ini
+./tools/trust_merger "$INI"
 popd >/dev/null
 
 if [[ ! -f "${TMP_DIR}/trust.img" ]]; then

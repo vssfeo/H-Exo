@@ -3,6 +3,8 @@ param(
     [int]$BaudRate = 1500000,
     [string]$TftpServerIp = "",
     [string]$BoardIp = "192.168.1.10",
+    # U-Boot index from "mmc list" for the medium you actually boot from (SD vs eMMC differ by board).
+    # If only SD works, use the line that shows (SD) — often 1 on NanoPi M4, but always confirm in U-Boot.
     [int]$MmcDev = 1,
     [string]$IdbFile = "idbloader.img",
     [string]$ItbFile = "u-boot.itb",
@@ -10,8 +12,9 @@ param(
     # Override LBA for u-boot.itb (hex string, e.g. "0x2000").
     # LibreELEC/Armbian SPL scans 0x2000 first for FIT; standard Rockchip is 0x4000.
     [string]$ItbLba = "",
-    # Override LBA for trust.img/BL31 (hex string, e.g. "0x4000").
-    # Boot log shows "Trust Addr:0x4000" on LibreELEC/Armbian boards.
+    # mmc write LBA for trust.img (hex). SPL often prints "Trust Addr:0x4000" but that is SPL-relative;
+    # on NanoPi M4 / Armbian (FwPartOffset 0x2000) the matching U-Boot LBA is usually 0x6000 (default).
+    # See recover_sdcard.ps1 comments. Override only if your layout differs.
     [string]$TrustLba = "",
     [switch]$ForceWrite,
     [switch]$OnlyUbootItb,
@@ -82,6 +85,8 @@ Write-Host "Port: $PortName @ $BaudRate"        -ForegroundColor Cyan
 Write-Host "TFTP server IP: $TftpServerIp"      -ForegroundColor Cyan
 Write-Host "Board IP: $BoardIp"                 -ForegroundColor Cyan
 Write-Host "MMC device: $MmcDev"                -ForegroundColor Cyan
+Write-Host "  Boot medium: use the same mmc index you boot from. In U-Boot: mmc list → e.g. (SD) = your card." -ForegroundColor DarkYellow
+Write-Host "  SPL errors on eMMC (voltage select) are normal if the board only uses SD; they do not block SD boot." -ForegroundColor DarkGray
 Write-Host "Files: $IdbFile, $ItbFile, $TrustFile" -ForegroundColor Cyan
 if ($idbInfo)   { Write-Host ("  {0}: {1} bytes, format={2}, sectors=0x{3:X}" -f $IdbFile,   $idbInfo.Length,   $idbInfo.Format,   $idbInfo.SectorCount)   -ForegroundColor DarkCyan }
 if ($itbInfo)   { Write-Host ("  {0}: {1} bytes, format={2}, sectors=0x{3:X}" -f $ItbFile,   $itbInfo.Length,   $itbInfo.Format,   $itbInfo.SectorCount)   -ForegroundColor DarkCyan }
@@ -138,6 +143,24 @@ if ($ItbLba) {
 if ($TrustLba) {
     $trustWriteLba = [Convert]::ToInt32($TrustLba, 16)
     Write-Host ("[*] LBA override: trust.img will be written at LBA 0x{0:X}" -f $trustWriteLba) -ForegroundColor Cyan
+}
+
+if ($TrustOnly -and $trustInfo) {
+    Write-Host ""
+    if ($trustInfo.Length -gt 8MB) {
+        Write-Host "WARNING: Very large trust images usually include BL32/OP-TEE and often break Armbian SPL:" -ForegroundColor Red
+        Write-Host "  SPL may DMA-timeout or fail LoadTrustBL when probing BL32. See docs/rk3399/firmware-handoff-debug.md" -ForegroundColor Red
+        Write-Host "  Prefer trust with BL31-only (e.g. trust-armbian-no-optee.img) for this board unless you know you need OP-TEE." -ForegroundColor Yellow
+        Write-Host ""
+    }
+    Write-Host "TFTP: board loads $TrustFile from TFTP root (e.g. C:\tftpboot\$TrustFile)." -ForegroundColor Yellow
+    Write-Host "  If you see 'Retry count exceeded' / lines of 'T': server not reachable or firewall blocked UDP." -ForegroundColor Yellow
+    Write-Host "  Windows: allow inbound UDP 69, or allow your TFTP app on the Private profile; ping can fail while TFTP still works." -ForegroundColor Yellow
+    if ($trustInfo.Length -gt 4MB) {
+        Write-Host ("  Large image ({0} bytes) — transfer can take a minute; keep TFTP server running." -f $trustInfo.Length) -ForegroundColor DarkYellow
+    }
+    Write-Host ("  Trust mmc write LBA: 0x{0:X} (override with -TrustLba if needed)." -f $trustWriteLba) -ForegroundColor DarkCyan
+    Write-Host ""
 }
 
 $serial = New-Object System.IO.Ports.SerialPort($PortName, $BaudRate,
@@ -271,6 +294,9 @@ try {
     Send-Uboot "setenv serverip $TftpServerIp"
     Send-Uboot "mmc list"
     Send-Uboot "mmc dev $MmcDev"
+    Send-Uboot "mmc info" -TimeoutSec 15
+    Write-Host "[*] Verify 'mmc info' capacity matches your boot microSD. If not, abort (Ctrl+C) and use -MmcDev 0 or 1." -ForegroundColor Yellow
+    Write-Host "    On many NanoPi M4 builds the SD slot is mmc 0; eMMC (if dead) may still appear as mmc 1 — do not flash the wrong index." -ForegroundColor DarkYellow
 
     if (-not $SkipPing) {
         $soft = -not $RequirePing

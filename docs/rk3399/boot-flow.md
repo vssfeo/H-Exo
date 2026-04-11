@@ -65,13 +65,11 @@ Before changing or flashing boot components, check:
 
 Чтобы получить **тот же формат**, что ожидает Rockchip SPL, собирайте контейнер на Linux через **`trust_merger`** из `rkbin`, а не через самодельный Windows-упаковщик.
 
-1. В репозитории: **Actions → «RK3399 BL31 + trust.img» → Run workflow** (по умолчанию тег TF-A `v2.14.0`).
-2. Скачайте артефакт (zip): внутри `trust.img`, `bl31.elf`, `SHA256SUMS`, `README_FLASH.txt`. В CI к TF-A применяется патч `patches/tf-a-v2.14-rk3399-pmusram-rsize-16k.patch`: в апстриме `PMUSRAM_RSIZE` задан **8 KiB**, линковка BL31 с текущими M0-блобами даёт переполнение ~4 KiB; **16 KiB** остаётся внутри окна `PMUSRAM_SIZE` (64 KiB). Локальная сборка TF-A — тот же патч. Параметры сборки: `LOG_LEVEL=20`, `RK3399_BAUDRATE=1500000`.
-3. Положите `trust.img` в `C:\tftpboot\` (или укажите путь) и прошейте только trust, например PowerShell 7:
+1. **Actions → «RK3399 BL31 + trust.img» → Run workflow**. По умолчанию **trust_profile = `bl31_only`**: контейнер **только BL31** (без OP-TEE BL32), как у рабочего Armbian на SD — см. `docs/rk3399/firmware-handoff-debug.md`. Профиль **`full_bl32_optee`** — старый rkbin с BL32 (большой образ, часто ломает SPL/SD).
+2. Артефакт: `…-v2.14.0-bl31_only.zip` — `trust.img`, `bl31.elf`, `SHA256SUMS`, `README_FLASH.txt`. Патч TF-A: `patches/tf-a-v2.14-rk3399-pmusram-rsize-16k.patch` (`PMUSRAM_RSIZE` 16 KiB). Сборка: `LOG_LEVEL=20`, `RK3399_BAUDRATE=1500000`.
+3. Запись trust: **UART+TFTP** — `.\flash_bootloader_uboot.ps1 -TrustOnly -ForceWrite -TrustFile … -MmcDev <N>` (N = твоя SD в `mmc list`). **Кардридер с ПК (Admin):** `.\tools\write_rk3399_trust_to_sd.ps1 -TrustPath .\trust.img -DiskNumber <N>` — сырой LBA `0x6000`.
 
-   `.\flash_bootloader_uboot.ps1 -TrustOnly -ForceWrite -TrustFile C:\tftpboot\trust.img`
-
-Локально на Linux/WSL: скрипт `build_rk3399_trust_with_bl31.sh /path/to/bl31.elf` использует бинарник из rkbin; если появится `elf_file … too large`, нужен `trust_merger`, собранный с большим `BL3X_FILESIZE_MAX` (см. шаг в `.github/workflows/rk3399-bl31-trust.yml`).
+Локально на Linux/WSL: `build_rk3399_trust_with_bl31.sh /path/to/bl31.elf outdir bl31_only` подставляет `patches/rktrust/RK3399TRUST-BL31ONLY.ini`; для крупного BL31 нужен свой `trust_merger` с увеличенным `BL3X_FILESIZE_MAX` (как в CI).
 
 Имя файла `rk3399_bl31_v1.36.elf` в `RK3399TRUST.ini` — **устаревшее имя слота в rkbin**; подставляется ваш собранный `bl31.elf`, версия TF-A задаётся тегом сборки.
 

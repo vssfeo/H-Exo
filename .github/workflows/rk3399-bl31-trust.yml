@@ -1,5 +1,4 @@
-# Reproducible RK3399 trust.img: TF-A BL31 (v2.x) + rkbin trust_merger (BL32 from rkbin).
-# Produces bit-compatible layout with Rockchip tooling (not the Windows reimplementation).
+# TF-A BL31 (v2.x) + rkbin trust_merger. Default: BL31-only (no OP-TEE) for Armbian SPL / NanoPi M4 SD.
 name: RK3399 BL31 + trust.img
 
 on:
@@ -9,12 +8,21 @@ on:
         description: TrustedFirmware-A git tag (e.g. v2.14.0)
         required: true
         default: v2.14.0
+      trust_profile:
+        description: bl31_only = no BL32 (Armbian SD). full_bl32_optee = stock rkbin OP-TEE (large).
+        required: true
+        default: bl31_only
+        type: choice
+        options:
+          - bl31_only
+          - full_bl32_optee
   push:
     branches: [master, main]
     paths:
       - ".github/workflows/rk3399-bl31-trust.yml"
       - "patches/tf-a-v2.14-rk3399-pmusram-rsize-16k.patch"
       - "patches/u-boot-trust_merger-skip-zero-ptload.patch"
+      - "patches/rktrust/**"
 
 permissions:
   contents: read
@@ -36,6 +44,13 @@ jobs:
           T="${{ github.event.inputs.tfa_tag }}"
           if [ -z "$T" ]; then T="v2.14.0"; fi
           echo "tag=$T" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve trust profile
+        id: prof
+        run: |
+          P="${{ github.event.inputs.trust_profile }}"
+          if [ -z "$P" ]; then P="bl31_only"; fi
+          echo "profile=$P" >> "$GITHUB_OUTPUT"
 
       - name: Install toolchains
         run: |
@@ -88,13 +103,20 @@ jobs:
       - name: Build trust_merger (2 MiB PT_LOAD cap)
         run: |
           set -e
+          PROFILE="${{ steps.prof.outputs.profile }}"
           git clone --depth 1 -b next-dev https://github.com/rockchip-linux/u-boot.git "${{ runner.temp }}/ub-src"
           UB="${{ runner.temp }}/ub-src"
           git -C "$UB" apply "${{ github.workspace }}/patches/u-boot-trust_merger-skip-zero-ptload.patch"
           sed -i 's/BL3X_FILESIZE_MAX (512 \* 1024)/BL3X_FILESIZE_MAX (2048 * 1024)/' "$UB/tools/rockchip/trust_merger.c"
-          # Default was 2 MiB; RK3399 BL31 (TF-A v2.x) + BL32 (OP-TEE) exceeds that.
-          sed -i 's/g_trust_max_size = 2 \* 1024 \* 1024/g_trust_max_size = 8 * 1024 * 1024/' \
-            "$UB/tools/rockchip/trust_merger.c"
+          if [ "$PROFILE" = "full_bl32_optee" ]; then
+            sed -i 's/g_trust_max_size = 2 \* 1024 \* 1024/g_trust_max_size = 8 * 1024 * 1024/' \
+              "$UB/tools/rockchip/trust_merger.c"
+          else
+            sed -i 's/g_trust_max_size = 2 \* 1024 \* 1024/g_trust_max_size = 4 * 1024 * 1024/' \
+              "$UB/tools/rockchip/trust_merger.c"
+            sed -i 's/static uint32_t g_trust_max_num = 2;/static uint32_t g_trust_max_num = 1;/' \
+              "$UB/tools/rockchip/trust_merger.c"
+          fi
           sed -i 's/(ulong)path/(uintptr_t)path/g; s/(ulong)gOpts\.outPath/(uintptr_t)gOpts.outPath/g' \
             "$UB/tools/rockchip/trust_merger.c"
           sed -i '/#include <linux\/compiler.h>/d' "$UB/lib/sha256.c"
@@ -127,11 +149,19 @@ jobs:
 
       - name: Clone rkbin and merge trust.img
         run: |
+          set -e
+          PROFILE="${{ steps.prof.outputs.profile }}"
           git clone --depth 1 https://github.com/rockchip-linux/rkbin.git "${{ runner.temp }}/rkbin"
           mkdir -p "${{ runner.temp }}/rkbin/bin/rk33"
           cp "${{ steps.bl31.outputs.path }}" "${{ runner.temp }}/rkbin/bin/rk33/rk3399_bl31_v1.36.elf"
           cd "${{ runner.temp }}/rkbin"
-          "${{ runner.temp }}/trust_merger" --verbose RKTRUST/RK3399TRUST.ini
+          if [ "$PROFILE" = "full_bl32_optee" ]; then
+            "${{ runner.temp }}/trust_merger" --verbose RKTRUST/RK3399TRUST.ini
+          else
+            cp "${{ github.workspace }}/patches/rktrust/RK3399TRUST-BL31ONLY.ini" \
+              RKTRUST/RK3399TRUST-BL31ONLY.ini
+            "${{ runner.temp }}/trust_merger" --verbose RKTRUST/RK3399TRUST-BL31ONLY.ini
+          fi
           test -s trust.img
           ls -la trust.img
 
@@ -143,22 +173,30 @@ jobs:
           ( cd "${{ github.workspace }}/artifacts" && sha256sum bl31.elf trust.img > SHA256SUMS )
           {
             echo "TF-A tag: ${{ steps.tfa.outputs.tag }}"
+            echo "Trust profile: ${{ steps.prof.outputs.profile }}"
             echo "Built (UTC): $(date -u -Iseconds)"
-            echo "BL32: rkbin bin/rk33/rk3399_bl32_v2.12.bin (from RK3399TRUST.ini)"
             echo ""
             echo "Files:"
             echo "  bl31.elf  - EL3 release; LOG_LEVEL<=20 (PMUSRAM_RSIZE=16KiB for TF-A v2.x link)"
-            echo "  trust.img - Rockchip BL3X container for SPL (trust_merger output)"
+            echo "  trust.img - Rockchip BL3X container (trust_merger output)"
             echo ""
-            echo "Flash (Windows, PowerShell 7), trust slot only:"
-            echo "  .\\flash_bootloader_uboot.ps1 -TrustOnly -ForceWrite -TrustFile C:\\tftpboot\\trust.img"
+            if [ "${{ steps.prof.outputs.profile }}" = "bl31_only" ]; then
+              echo "bl31_only: no BL32/OP-TEE in container — intended for Armbian SPL on NanoPi M4 SD."
+              echo "docs/rk3399/firmware-handoff-debug.md"
+            else
+              echo "full_bl32_optee: includes rkbin OP-TEE BL32 — may break Armbian SD / SMP handoff."
+            fi
             echo ""
-            echo "UART: SPL should load trust without LoadTrustBL error / SDC_RequestIDMA timeout."
+            echo "Flash UART (PowerShell 7):"
+            echo "  .\\flash_bootloader_uboot.ps1 -TrustOnly -ForceWrite -TrustFile C:\\tftpboot\\trust.img -MmcDev <N>"
+            echo "PC card reader (Admin):"
+            echo "  .\\tools\\write_rk3399_trust_to_sd.ps1 -TrustPath .\\trust.img -DiskNumber <N>"
+            echo ""
             echo "docs/rk3399/boot-flow.md"
           } > "${{ github.workspace }}/artifacts/README_FLASH.txt"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: rk3399-trust-tfa-${{ steps.tfa.outputs.tag }}
+          name: rk3399-trust-tfa-${{ steps.tfa.outputs.tag }}-${{ steps.prof.outputs.profile }}
           path: artifacts/
           if-no-files-found: error
