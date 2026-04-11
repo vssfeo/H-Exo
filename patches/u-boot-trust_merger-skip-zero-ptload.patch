@@ -1,0 +1,22 @@
+diff --git a/tools/rockchip/trust_merger.c b/tools/rockchip/trust_merger.c
+index 99350b7..8408168 100644
+--- a/tools/rockchip/trust_merger.c
++++ b/tools/rockchip/trust_merger.c
+@@ -438,6 +438,8 @@ bool filter_elf(uint32_t index, uint8_t *pMeta, uint32_t *pMetaNum,
+ 			pElfProgram64 = (Elf64_Phdr *)(file_buffer + pElfHeader64->e_phoff +
+ 			                               i * pElfHeader64->e_phentsize);
+ 			if (pElfProgram64->p_type == 1) { /* PT_LOAD */
++				if (!pElfProgram64->p_filesz)
++					continue;
+ 				pEntry->id = gOpts.bl3x[index].id;
+ 				strcpy(pEntry->path, gOpts.bl3x[index].path);
+ 				pEntry->size = (uint32_t) pElfProgram64->p_filesz;
+@@ -461,6 +463,8 @@ bool filter_elf(uint32_t index, uint8_t *pMeta, uint32_t *pMetaNum,
+ 			pElfProgram32 = (Elf32_Phdr *)(file_buffer + pElfHeader32->e_phoff +
+ 			                               i * pElfHeader32->e_phentsize);
+ 			if (pElfProgram32->p_type == 1) { /* PT_LOAD */
++				if (!pElfProgram32->p_filesz)
++					continue;
+ 				pEntry->id = gOpts.bl3x[index].id;
+ 				strcpy(pEntry->path, gOpts.bl3x[index].path);
+ 				pEntry->size = pElfProgram32->p_filesz;

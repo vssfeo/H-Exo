@@ -14,6 +14,7 @@ on:
     paths:
       - ".github/workflows/rk3399-bl31-trust.yml"
       - "patches/tf-a-v2.14-rk3399-pmusram-rsize-16k.patch"
+      - "patches/u-boot-trust_merger-skip-zero-ptload.patch"
 
 permissions:
   contents: read
@@ -89,6 +90,7 @@ jobs:
           set -e
           git clone --depth 1 -b next-dev https://github.com/rockchip-linux/u-boot.git "${{ runner.temp }}/ub-src"
           UB="${{ runner.temp }}/ub-src"
+          git -C "$UB" apply "${{ github.workspace }}/patches/u-boot-trust_merger-skip-zero-ptload.patch"
           sed -i 's/BL3X_FILESIZE_MAX (512 \* 1024)/BL3X_FILESIZE_MAX (2048 * 1024)/' "$UB/tools/rockchip/trust_merger.c"
           # Default was 2 MiB; RK3399 BL31 (TF-A v2.x) + BL32 (OP-TEE) exceeds that.
           sed -i 's/g_trust_max_size = 2 \* 1024 \* 1024/g_trust_max_size = 8 * 1024 * 1024/' \
