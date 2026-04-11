@@ -1,0 +1,113 @@
+# Reproducible RK3399 trust.img: TF-A BL31 (v2.x) + rkbin trust_merger (BL32 from rkbin).
+# Produces bit-compatible layout with Rockchip tooling (not the Windows reimplementation).
+name: RK3399 BL31 + trust.img
+
+on:
+  workflow_dispatch:
+    inputs:
+      tfa_tag:
+        description: TrustedFirmware-A git tag (e.g. v2.14.0)
+        required: true
+        default: v2.14.0
+  push:
+    branches: [master, main]
+    paths:
+      - ".github/workflows/rk3399-bl31-trust.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rk3399-bl31-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bl31-trust:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve TF-A tag
+        id: tfa
+        run: |
+          T="${{ github.event.inputs.tfa_tag }}"
+          if [ -z "$T" ]; then T="v2.14.0"; fi
+          echo "tag=$T" >> "$GITHUB_OUTPUT"
+
+      - name: Install toolchains
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            make git python3 device-tree-compiler bc \
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
+            gcc-arm-none-eabi binutils-arm-none-eabi
+
+      - name: Clone Trusted Firmware-A
+        run: |
+          git clone --depth 1 --branch "${{ steps.tfa.outputs.tag }}" \
+            https://github.com/TrustedFirmware-A/trusted-firmware-a.git \
+            "${{ runner.temp }}/tfa"
+
+      - name: Build BL31 (RK3399, M0 via arm-none-eabi)
+        working-directory: ${{ runner.temp }}/tfa
+        run: |
+          make -j"$(nproc)" \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            PLAT=rk3399 \
+            DEBUG=1 \
+            LOG_LEVEL=40 \
+            ENABLE_ASSERTIONS=1 \
+            RK3399_BAUDRATE=115200 \
+            bl31
+
+      - name: Locate bl31.elf
+        id: bl31
+        run: |
+          ELF=$(find "${{ runner.temp }}/tfa/build" -path '*/bl31/bl31.elf' -type f | head -1)
+          if [ -z "$ELF" ] || [ ! -f "$ELF" ]; then
+            echo "::error::bl31.elf not found under build/"
+            find "${{ runner.temp }}/tfa/build" -type f -name '*.elf' 2>/dev/null | head -30 || true
+            exit 1
+          fi
+          echo "path=$ELF" >> "$GITHUB_OUTPUT"
+          ls -la "$ELF"
+
+      - name: Clone rkbin and run trust_merger
+        run: |
+          git clone --depth 1 https://github.com/rockchip-linux/rkbin.git "${{ runner.temp }}/rkbin"
+          mkdir -p "${{ runner.temp }}/rkbin/bin/rk33"
+          cp "${{ steps.bl31.outputs.path }}" "${{ runner.temp }}/rkbin/bin/rk33/rk3399_bl31_v1.36.elf"
+          cd "${{ runner.temp }}/rkbin"
+          chmod +x tools/trust_merger
+          ./tools/trust_merger RKTRUST/RK3399TRUST.ini
+          test -s trust.img
+          ls -la trust.img
+
+      - name: Package artifacts
+        run: |
+          mkdir -p "${{ github.workspace }}/artifacts"
+          cp "${{ steps.bl31.outputs.path }}" "${{ github.workspace }}/artifacts/bl31.elf"
+          cp "${{ runner.temp }}/rkbin/trust.img" "${{ github.workspace }}/artifacts/trust.img"
+          ( cd "${{ github.workspace }}/artifacts" && sha256sum bl31.elf trust.img > SHA256SUMS )
+          {
+            echo "TF-A tag: ${{ steps.tfa.outputs.tag }}"
+            echo "Built (UTC): $(date -u -Iseconds)"
+            echo "BL32: rkbin bin/rk33/rk3399_bl32_v2.12.bin (from RK3399TRUST.ini)"
+            echo ""
+            echo "Files:"
+            echo "  bl31.elf  - EL3 firmware (debug build)"
+            echo "  trust.img - Rockchip BL3X container for SPL (trust_merger output)"
+            echo ""
+            echo "Flash (Windows, PowerShell 7), trust slot only:"
+            echo "  .\\flash_bootloader_uboot.ps1 -TrustOnly -ForceWrite -TrustFile C:\\tftpboot\\trust.img"
+            echo ""
+            echo "UART: SPL should load trust without LoadTrustBL error / SDC_RequestIDMA timeout."
+            echo "docs/rk3399/boot-flow.md"
+          } > "${{ github.workspace }}/artifacts/README_FLASH.txt"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rk3399-trust-tfa-${{ steps.tfa.outputs.tag }}
+          path: artifacts/
+          if-no-files-found: error

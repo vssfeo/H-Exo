@@ -7,3 +7,6 @@ Minimum for RK3399 bring-up work in this repo:
   Windows or toolchain setups without arm-none-eabi-gcc (SKIP_M0_BUILD=1).
 
 See docs/rk3399/source-map.md for file paths inside those trees.
+
+Ready-made trust.img + bl31.elf (TF-A v2.14 + trust_merger): GitHub Actions
+workflow "RK3399 BL31 + trust.img" in this repo (see docs/rk3399/boot-flow.md).

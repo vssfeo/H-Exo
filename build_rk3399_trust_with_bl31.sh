@@ -2,7 +2,10 @@
 set -euo pipefail
 
 # Build a legacy RK3399 trust.img (BL3X slot) using rkbin and a supplied BL31.
-# Intended to run on Linux / VDS where rkbin ELF tools are executable.
+# Intended to run on Linux / WSL / VDS where tools/trust_merger is executable.
+#
+# Same layout as GitHub Actions workflow: .github/workflows/rk3399-bl31-trust.yml
+# (download the artifact if you do not have rkbin locally).
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RKBIN_DIR="${ROOT_DIR}/third_party/rkbin"

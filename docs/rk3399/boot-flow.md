@@ -61,6 +61,20 @@ Before changing or flashing boot components, check:
 - whether the chain is legacy split or mainline packed
 - whether BL31 is in `trust.img` or inside `u-boot.itb`
 
+## CI: готовый `trust.img` с BL31 v2.14 (TF-A)
+
+Чтобы получить **тот же формат**, что ожидает Rockchip SPL, собирайте контейнер на Linux через **`trust_merger`** из `rkbin`, а не через самодельный Windows-упаковщик.
+
+1. В репозитории: **Actions → «RK3399 BL31 + trust.img» → Run workflow** (по умолчанию тег TF-A `v2.14.0`).
+2. Скачайте артефакт (zip): внутри `trust.img`, `bl31.elf`, `SHA256SUMS`, `README_FLASH.txt`.
+3. Положите `trust.img` в `C:\tftpboot\` (или укажите путь) и прошейте только trust, например PowerShell 7:
+
+   `.\flash_bootloader_uboot.ps1 -TrustOnly -ForceWrite -TrustFile C:\tftpboot\trust.img`
+
+Локально на Linux/WSL тот же путь: скрипт `build_rk3399_trust_with_bl31.sh /path/to/bl31.elf`.
+
+Имя файла `rk3399_bl31_v1.36.elf` в `RK3399TRUST.ini` — **устаревшее имя слота в rkbin**; подставляется ваш собранный `bl31.elf`, версия TF-A задаётся тегом сборки.
+
 ## Local Authority Files
 
 - `third_party/trusted-firmware-a/docs/plat/rockchip.rst`
