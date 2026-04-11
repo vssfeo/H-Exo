@@ -90,7 +90,7 @@ jobs:
           git clone --depth 1 -b next-dev https://github.com/rockchip-linux/u-boot.git "${{ runner.temp }}/ub-src"
           UB="${{ runner.temp }}/ub-src"
           sed -i 's/BL3X_FILESIZE_MAX (512 \* 1024)/BL3X_FILESIZE_MAX (2048 * 1024)/' "$UB/tools/rockchip/trust_merger.c"
-          mkdir -p "${{ runner.temp }}/hoststub"
+          mkdir -p "${{ runner.temp }}/hoststub/linux"
           printf '%s\n' \
             '/* host stub for u-boot lib/sha256.c */' \
             '#ifndef WATCHDOG_H' \
@@ -98,6 +98,14 @@ jobs:
             '#define WATCHDOG_RESET(x) do { } while (0)' \
             '#endif' \
             > "${{ runner.temp }}/hoststub/watchdog.h"
+          printf '%s\n' \
+            '#ifndef __LINUX_COMPILER_H' \
+            '#define __LINUX_COMPILER_H' \
+            '#ifndef __ASSEMBLY__' \
+            '#define __weak' \
+            '#endif' \
+            '#endif' \
+            > "${{ runner.temp }}/hoststub/linux/compiler.h"
           gcc -O2 -Wall -DUSE_HOSTCC \
             -include stdint.h \
             -I"${{ runner.temp }}/hoststub" \
