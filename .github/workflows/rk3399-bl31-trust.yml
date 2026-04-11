@@ -99,15 +99,24 @@ jobs:
             '#define WATCHDOG_RESET(x) do { } while (0)' \
             '#endif' \
             > "${{ runner.temp }}/hoststub/watchdog.h"
-          gcc -O2 -Wall -DUSE_HOSTCC \
-            -include stdint.h \
+          # sha2.c must not see u-boot/include: <stdlib.h> resolves to u-boot and pulls malloc.h (CONFIG_IS_ENABLED).
+          gcc -O2 -Wall -DUSE_HOSTCC -c -o "${{ runner.temp }}/sha2.o" \
+            -I"$UB/tools/rockchip" \
+            "$UB/tools/rockchip/sha2.c"
+          gcc -O2 -Wall -DUSE_HOSTCC -include stdint.h -c -o "${{ runner.temp }}/trust_merger.o" \
             -I"${{ runner.temp }}/hoststub" \
             -I"$UB/include" \
             -I"$UB" \
-            -o "${{ runner.temp }}/trust_merger" \
-            "$UB/tools/rockchip/trust_merger.c" \
-            "$UB/tools/rockchip/sha2.c" \
+            "$UB/tools/rockchip/trust_merger.c"
+          gcc -O2 -Wall -DUSE_HOSTCC -c -o "${{ runner.temp }}/sha256.o" \
+            -I"${{ runner.temp }}/hoststub" \
+            -I"$UB/include" \
+            -I"$UB" \
             "$UB/lib/sha256.c"
+          gcc -O2 -o "${{ runner.temp }}/trust_merger" \
+            "${{ runner.temp }}/trust_merger.o" \
+            "${{ runner.temp }}/sha2.o" \
+            "${{ runner.temp }}/sha256.o"
 
       - name: Clone rkbin and merge trust.img
         run: |
@@ -131,7 +140,7 @@ jobs:
             echo "BL32: rkbin bin/rk33/rk3399_bl32_v2.12.bin (from RK3399TRUST.ini)"
             echo ""
             echo "Files:"
-            echo "  bl31.elf  - EL3 release; LOG_LEVEL<=20 (PMUSRAM_RSIZE=8KiB on RK3399)"
+            echo "  bl31.elf  - EL3 release; LOG_LEVEL<=20 (PMUSRAM_RSIZE=16KiB for TF-A v2.x link)"
             echo "  trust.img - Rockchip BL3X container for SPL (trust_merger output)"
             echo ""
             echo "Flash (Windows, PowerShell 7), trust slot only:"
