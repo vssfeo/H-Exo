@@ -71,7 +71,7 @@ Before changing or flashing boot components, check:
 
    `.\flash_bootloader_uboot.ps1 -TrustOnly -ForceWrite -TrustFile C:\tftpboot\trust.img`
 
-Локально на Linux/WSL тот же путь: скрипт `build_rk3399_trust_with_bl31.sh /path/to/bl31.elf`.
+Локально на Linux/WSL: скрипт `build_rk3399_trust_with_bl31.sh /path/to/bl31.elf` использует бинарник из rkbin; если появится `elf_file … too large`, нужен `trust_merger`, собранный с большим `BL3X_FILESIZE_MAX` (см. шаг в `.github/workflows/rk3399-bl31-trust.yml`).
 
 Имя файла `rk3399_bl31_v1.36.elf` в `RK3399TRUST.ini` — **устаревшее имя слота в rkbin**; подставляется ваш собранный `bl31.elf`, версия TF-A задаётся тегом сборки.
 

@@ -40,7 +40,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            make git python3 device-tree-compiler bc \
+            make git python3 device-tree-compiler bc gcc libc6-dev \
             gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
             gcc-arm-none-eabi binutils-arm-none-eabi
 
@@ -82,14 +82,21 @@ jobs:
           echo "path=$ELF" >> "$GITHUB_OUTPUT"
           ls -la "$ELF"
 
-      - name: Clone rkbin and run trust_merger
+      # Stock rkbin trust_merger caps each BL3x PT_LOAD at 512 KiB; TF-A v2.14 BL31 exceeds that.
+      - name: Build trust_merger (2 MiB PT_LOAD cap)
+        run: |
+          git clone --depth 1 https://github.com/rockchip-toybrick/u-boot.git "${{ runner.temp }}/ub-tb"
+          cd "${{ runner.temp }}/ub-tb/tools/rockchip"
+          sed -i 's/BL3X_FILESIZE_MAX (512 \* 1024)/BL3X_FILESIZE_MAX (2048 * 1024)/' trust_merger.c
+          gcc -O2 -Wall -o "${{ runner.temp }}/trust_merger" trust_merger.c sha2.c
+
+      - name: Clone rkbin and merge trust.img
         run: |
           git clone --depth 1 https://github.com/rockchip-linux/rkbin.git "${{ runner.temp }}/rkbin"
           mkdir -p "${{ runner.temp }}/rkbin/bin/rk33"
           cp "${{ steps.bl31.outputs.path }}" "${{ runner.temp }}/rkbin/bin/rk33/rk3399_bl31_v1.36.elf"
           cd "${{ runner.temp }}/rkbin"
-          chmod +x tools/trust_merger
-          ./tools/trust_merger RKTRUST/RK3399TRUST.ini
+          "${{ runner.temp }}/trust_merger" RKTRUST/RK3399TRUST.ini
           test -s trust.img
           ls -la trust.img
 
