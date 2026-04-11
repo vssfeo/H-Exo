@@ -106,7 +106,7 @@ jobs:
           gcc -O2 -Wall -DUSE_HOSTCC -c -o "${{ runner.temp }}/sha2.o" \
             -I"$UB/tools/rockchip" \
             "$UB/tools/rockchip/sha2.c"
-          gcc -O2 -Wall -DUSE_HOSTCC -c -o "${{ runner.temp }}/trust_merger.o" \
+          gcc -O2 -Wall -DUSE_HOSTCC -include stdint.h -c -o "${{ runner.temp }}/trust_merger.o" \
             -I"$UB/tools/rockchip" \
             -I"${{ runner.temp }}/hoststub" \
             -idirafter "$UB/include" \
