@@ -90,6 +90,8 @@ jobs:
           git clone --depth 1 -b next-dev https://github.com/rockchip-linux/u-boot.git "${{ runner.temp }}/ub-src"
           UB="${{ runner.temp }}/ub-src"
           sed -i 's/BL3X_FILESIZE_MAX (512 \* 1024)/BL3X_FILESIZE_MAX (2048 * 1024)/' "$UB/tools/rockchip/trust_merger.c"
+          sed -i 's/(ulong)path/(uintptr_t)path/g; s/(ulong)gOpts\.outPath/(uintptr_t)gOpts.outPath/g' \
+            "$UB/tools/rockchip/trust_merger.c"
           sed -i '/#include <linux\/compiler.h>/d' "$UB/lib/sha256.c"
           mkdir -p "${{ runner.temp }}/hoststub"
           printf '%s\n' \
@@ -99,19 +101,19 @@ jobs:
             '#define WATCHDOG_RESET(x) do { } while (0)' \
             '#endif' \
             > "${{ runner.temp }}/hoststub/watchdog.h"
-          # sha2.c must not see u-boot/include: <stdlib.h> resolves to u-boot and pulls malloc.h (CONFIG_IS_ENABLED).
+          # Use -idirafter for u-boot/include so <stdlib.h>/<stdio.h> are glibc; angle-bracket u-boot/* still resolves.
+          # sha2.c: only tools/rockchip (no u-boot/include).
           gcc -O2 -Wall -DUSE_HOSTCC -c -o "${{ runner.temp }}/sha2.o" \
             -I"$UB/tools/rockchip" \
             "$UB/tools/rockchip/sha2.c"
-          gcc -O2 -Wall -DUSE_HOSTCC -include stdint.h -c -o "${{ runner.temp }}/trust_merger.o" \
+          gcc -O2 -Wall -DUSE_HOSTCC -c -o "${{ runner.temp }}/trust_merger.o" \
+            -I"$UB/tools/rockchip" \
             -I"${{ runner.temp }}/hoststub" \
-            -I"$UB/include" \
-            -I"$UB" \
+            -idirafter "$UB/include" \
             "$UB/tools/rockchip/trust_merger.c"
-          gcc -O2 -Wall -DUSE_HOSTCC -c -o "${{ runner.temp }}/sha256.o" \
+          gcc -O2 -Wall -DUSE_HOSTCC -include stdint.h -c -o "${{ runner.temp }}/sha256.o" \
             -I"${{ runner.temp }}/hoststub" \
-            -I"$UB/include" \
-            -I"$UB" \
+            -idirafter "$UB/include" \
             "$UB/lib/sha256.c"
           gcc -O2 -o "${{ runner.temp }}/trust_merger" \
             "${{ runner.temp }}/trust_merger.o" \
