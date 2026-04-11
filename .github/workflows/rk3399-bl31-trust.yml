@@ -90,6 +90,9 @@ jobs:
           git clone --depth 1 -b next-dev https://github.com/rockchip-linux/u-boot.git "${{ runner.temp }}/ub-src"
           UB="${{ runner.temp }}/ub-src"
           sed -i 's/BL3X_FILESIZE_MAX (512 \* 1024)/BL3X_FILESIZE_MAX (2048 * 1024)/' "$UB/tools/rockchip/trust_merger.c"
+          # Default was 2 MiB; RK3399 BL31 (TF-A v2.x) + BL32 (OP-TEE) exceeds that.
+          sed -i 's/g_trust_max_size = 2 \* 1024 \* 1024/g_trust_max_size = 8 * 1024 * 1024/' \
+            "$UB/tools/rockchip/trust_merger.c"
           sed -i 's/(ulong)path/(uintptr_t)path/g; s/(ulong)gOpts\.outPath/(uintptr_t)gOpts.outPath/g' \
             "$UB/tools/rockchip/trust_merger.c"
           sed -i '/#include <linux\/compiler.h>/d' "$UB/lib/sha256.c"
@@ -126,7 +129,7 @@ jobs:
           mkdir -p "${{ runner.temp }}/rkbin/bin/rk33"
           cp "${{ steps.bl31.outputs.path }}" "${{ runner.temp }}/rkbin/bin/rk33/rk3399_bl31_v1.36.elf"
           cd "${{ runner.temp }}/rkbin"
-          "${{ runner.temp }}/trust_merger" RKTRUST/RK3399TRUST.ini
+          "${{ runner.temp }}/trust_merger" --verbose RKTRUST/RK3399TRUST.ini
           test -s trust.img
           ls -la trust.img
 
