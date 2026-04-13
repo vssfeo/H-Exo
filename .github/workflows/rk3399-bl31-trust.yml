@@ -102,11 +102,15 @@ jobs:
           echo "path=$ELF" >> "$GITHUB_OUTPUT"
           ls -la "$ELF"
 
-      - name: Export BL31 binary image (objcopy)
+      - name: Locate BL31 binary image
         id: bl31bin
         run: |
-          BIN="${{ runner.temp }}/bl31.bin"
-          aarch64-linux-gnu-objcopy -O binary "${{ steps.bl31.outputs.path }}" "$BIN"
+          BIN=$(find "${{ runner.temp }}/tfa/build" -path '*/bl31/bl31.bin' -type f | head -1)
+          if [ -z "$BIN" ] || [ ! -f "$BIN" ]; then
+            echo "::error::bl31.bin not found under build/ (TF-A did not emit binary image)"
+            find "${{ runner.temp }}/tfa/build" -type f -name 'bl31*' 2>/dev/null | head -50 || true
+            exit 1
+          fi
           test -s "$BIN"
           echo "path=$BIN" >> "$GITHUB_OUTPUT"
           ls -la "$BIN"
