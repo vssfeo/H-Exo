@@ -49,12 +49,18 @@ function Get-LocalIpArmbianStyle {
 }
 
 function Resolve-TrustPath {
-    foreach ($c in @(
-            (Join-Path 'C:\tftpboot' $TrustFile),
-            (Join-Path $repoRoot $TrustFile),
-            (Join-Path $repoRoot 'trust-bl31only-v2.14.img'),
-            $TrustFile
-        )) {
+    $candidates = @()
+    if ([System.IO.Path]::IsPathRooted($TrustFile)) {
+        $candidates += $TrustFile
+    }
+    else {
+        $candidates += (Join-Path 'C:\tftpboot' $TrustFile)
+        $candidates += (Join-Path $repoRoot $TrustFile)
+    }
+    $candidates += (Join-Path $repoRoot 'trust-bl31only-v2.14.img')
+    $candidates += $TrustFile
+
+    foreach ($c in $candidates) {
         if (Test-Path -LiteralPath $c) { return (Resolve-Path -LiteralPath $c).Path }
     }
     throw "Не найден trust: $TrustFile (положи в C:\tftpboot или корень репо)."
