@@ -2,6 +2,9 @@
 name: RK3399 BL31 + trust.img
 
 on:
+  # Ночная/недельная сборка на серверах GitHub — без твоего ПК и без UART (артефакт trust.img в Actions).
+  schedule:
+    - cron: "0 6 * * 1"
   workflow_dispatch:
     inputs:
       tfa_tag:
@@ -9,12 +12,13 @@ on:
         required: true
         default: v2.14.0
       trust_profile:
-        description: bl31_only = no BL32 (Armbian SD). full_bl32_optee = stock rkbin OP-TEE (large).
+        description: bl31_only = ELF PT_LOAD components. bl31_only_bin = single BL31.bin component (SPL CheckImage experiment). full_bl32_optee = stock rkbin OP-TEE.
         required: true
         default: bl31_only
         type: choice
         options:
           - bl31_only
+          - bl31_only_bin
           - full_bl32_optee
   push:
     branches: [master, main]
@@ -98,6 +102,15 @@ jobs:
           echo "path=$ELF" >> "$GITHUB_OUTPUT"
           ls -la "$ELF"
 
+      - name: Export BL31 binary image (objcopy)
+        id: bl31bin
+        run: |
+          BIN="${{ runner.temp }}/bl31.bin"
+          aarch64-linux-gnu-objcopy -O binary "${{ steps.bl31.outputs.path }}" "$BIN"
+          test -s "$BIN"
+          echo "path=$BIN" >> "$GITHUB_OUTPUT"
+          ls -la "$BIN"
+
       # Stock rkbin trust_merger caps each BL3x PT_LOAD at 512 KiB; TF-A v2.14 BL31 exceeds that.
       # Build host tool from rockchip-linux u-boot (needs USE_HOSTCC + stub watchdog.h for lib/sha256.c).
       - name: Build trust_merger (2 MiB PT_LOAD cap)
@@ -154,9 +167,14 @@ jobs:
           git clone --depth 1 https://github.com/rockchip-linux/rkbin.git "${{ runner.temp }}/rkbin"
           mkdir -p "${{ runner.temp }}/rkbin/bin/rk33"
           cp "${{ steps.bl31.outputs.path }}" "${{ runner.temp }}/rkbin/bin/rk33/rk3399_bl31_v1.36.elf"
+          cp "${{ steps.bl31bin.outputs.path }}" "${{ runner.temp }}/rkbin/bin/rk33/rk3399_bl31_v1.36.bin"
           cd "${{ runner.temp }}/rkbin"
           if [ "$PROFILE" = "full_bl32_optee" ]; then
             "${{ runner.temp }}/trust_merger" --verbose RKTRUST/RK3399TRUST.ini
+          elif [ "$PROFILE" = "bl31_only_bin" ]; then
+            cp "${{ github.workspace }}/patches/rktrust/RK3399TRUST-BL31ONLY-BIN.ini" \
+              RKTRUST/RK3399TRUST-BL31ONLY-BIN.ini
+            "${{ runner.temp }}/trust_merger" --verbose RKTRUST/RK3399TRUST-BL31ONLY-BIN.ini
           else
             cp "${{ github.workspace }}/patches/rktrust/RK3399TRUST-BL31ONLY.ini" \
               RKTRUST/RK3399TRUST-BL31ONLY.ini
@@ -169,8 +187,9 @@ jobs:
         run: |
           mkdir -p "${{ github.workspace }}/artifacts"
           cp "${{ steps.bl31.outputs.path }}" "${{ github.workspace }}/artifacts/bl31.elf"
+          cp "${{ steps.bl31bin.outputs.path }}" "${{ github.workspace }}/artifacts/bl31.bin"
           cp "${{ runner.temp }}/rkbin/trust.img" "${{ github.workspace }}/artifacts/trust.img"
-          ( cd "${{ github.workspace }}/artifacts" && sha256sum bl31.elf trust.img > SHA256SUMS )
+          ( cd "${{ github.workspace }}/artifacts" && sha256sum bl31.elf bl31.bin trust.img > SHA256SUMS )
           {
             echo "TF-A tag: ${{ steps.tfa.outputs.tag }}"
             echo "Trust profile: ${{ steps.prof.outputs.profile }}"
@@ -178,11 +197,15 @@ jobs:
             echo ""
             echo "Files:"
             echo "  bl31.elf  - EL3 release; LOG_LEVEL<=20 (PMUSRAM_RSIZE=16KiB for TF-A v2.x link)"
+            echo "  bl31.bin  - objcopy -O binary of bl31.elf"
             echo "  trust.img - Rockchip BL3X container (trust_merger output)"
             echo ""
             if [ "${{ steps.prof.outputs.profile }}" = "bl31_only" ]; then
               echo "bl31_only: no BL32/OP-TEE in container — intended for Armbian SPL on NanoPi M4 SD."
               echo "docs/rk3399/firmware-handoff-debug.md"
+            elif [ "${{ steps.prof.outputs.profile }}" = "bl31_only_bin" ]; then
+              echo "bl31_only_bin: BL31 as single .bin component (experiment for SPL CheckImage compatibility)."
+              echo "docs/rk3399/spl-trust-checkimage.md"
             else
               echo "full_bl32_optee: includes rkbin OP-TEE BL32 — may break Armbian SD / SMP handoff."
             fi

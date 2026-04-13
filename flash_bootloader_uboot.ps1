@@ -80,6 +80,12 @@ if ($idbLocal)   { $idbInfo   = Get-FlashImageInfo $idbLocal   }
 if ($itbLocal)   { $itbInfo   = Get-FlashImageInfo $itbLocal   }
 if ($trustLocal) { $trustInfo = Get-FlashImageInfo $trustLocal }
 
+# U-Boot tftp expects the filename as on the server root (e.g. trust.img), not a Windows path —
+# passing C:\tftpboot\trust.img becomes garbage like tftpboottrust.img on the wire.
+$tftpIdbName   = if ($idbLocal)   { [System.IO.Path]::GetFileName($idbLocal) }   else { [System.IO.Path]::GetFileName($IdbFile) }
+$tftpItbName   = if ($itbLocal)   { [System.IO.Path]::GetFileName($itbLocal) }   else { [System.IO.Path]::GetFileName($ItbFile) }
+$tftpTrustName = if ($trustLocal) { [System.IO.Path]::GetFileName($trustLocal) } else { [System.IO.Path]::GetFileName($TrustFile) }
+
 Write-Host "=== U-Boot Bootloader Flasher ===" -ForegroundColor Cyan
 Write-Host "Port: $PortName @ $BaudRate"        -ForegroundColor Cyan
 Write-Host "TFTP server IP: $TftpServerIp"      -ForegroundColor Cyan
@@ -92,7 +98,9 @@ if ($idbInfo)   { Write-Host ("  {0}: {1} bytes, format={2}, sectors=0x{3:X}" -f
 if ($itbInfo)   { Write-Host ("  {0}: {1} bytes, format={2}, sectors=0x{3:X}" -f $ItbFile,   $itbInfo.Length,   $itbInfo.Format,   $itbInfo.SectorCount)   -ForegroundColor DarkCyan }
 if ($trustInfo) { Write-Host ("  {0}: {1} bytes, format={2}, sectors=0x{3:X}" -f $TrustFile, $trustInfo.Length, $trustInfo.Format, $trustInfo.SectorCount) -ForegroundColor DarkCyan }
 
-$flashModeStr = if ($OnlyUbootItb) { "ONLY u-boot.itb (safe)" } else { "idbloader + u-boot.itb" }
+$flashModeStr = if ($TrustOnly) { "SKIP idbloader + u-boot.itb (trust slot only)" }
+elseif ($OnlyUbootItb) { "ONLY u-boot.itb (safe)" }
+else { "idbloader + u-boot.itb" }
 Write-Host ("Flash mode: " + $flashModeStr) -ForegroundColor Cyan
 if ($TrustOnly) { Write-Host "Trust mode: ONLY trust (BL3X slot)" -ForegroundColor Cyan }
 $writeStr = if ($ForceWrite) { "WRITE (dangerous)" } else { "DRY-RUN (no mmc write)" }
@@ -153,7 +161,7 @@ if ($TrustOnly -and $trustInfo) {
         Write-Host "  Prefer trust with BL31-only (e.g. trust-armbian-no-optee.img) for this board unless you know you need OP-TEE." -ForegroundColor Yellow
         Write-Host ""
     }
-    Write-Host "TFTP: board loads $TrustFile from TFTP root (e.g. C:\tftpboot\$TrustFile)." -ForegroundColor Yellow
+    Write-Host "TFTP: board loads '$tftpTrustName' from server root (on PC: C:\tftpboot\$tftpTrustName)." -ForegroundColor Yellow
     Write-Host "  If you see 'Retry count exceeded' / lines of 'T': server not reachable or firewall blocked UDP." -ForegroundColor Yellow
     Write-Host "  Windows: allow inbound UDP 69, or allow your TFTP app on the Private profile; ping can fail while TFTP still works." -ForegroundColor Yellow
     if ($trustInfo.Length -gt 4MB) {
@@ -217,11 +225,23 @@ function Send-Uboot {
         Write-Host "[!] PHY timeout on TFTP attempt $attempt — will retry..." -ForegroundColor Yellow
         continue
     }
-    if (-not $skipGeneralThrow -and $combined -match "Card did not respond to voltage select|Could not initialize PHY|Retry count exceeded|DMA reset timeout|TFTP error|ERROR|Bad device specification|No block device|Filename not found|Access violation") {
+    # Do not match "DMA reset timeout" here: old BSP U-Boot (e.g. 2017.09) often hits GMAC DMA before TFTP; handle below.
+    if (-not $skipGeneralThrow -and $combined -match "Card did not respond to voltage select|Could not initialize PHY|Retry count exceeded|TFTP error|ERROR|Bad device specification|No block device|Filename not found|Access violation") {
         throw "Command failed: $Cmd"
     }
     if ($Cmd -like "tftp *") {
         if ($combined -notmatch "(?i)Bytes transferred\s*=\s*[0-9]+") {
+            if ($combined -match "DMA reset timeout") {
+                throw @"
+TFTP never started: Ethernet/GMAC reports 'DMA reset timeout' (PHY or driver issue in this U-Boot build).
+
+Bypass network: put the SD card in a PC USB reader, Administrator PowerShell:
+  .\tools\write_rk3399_trust_to_sd.ps1 -TrustPath (Resolve-Path .\trust.img) -DiskNumber <N>
+Use Get-Disk to pick N for the microSD only.
+
+Or boot a newer U-Boot (e.g. Armbian 2022.x) where eth + TFTP works, then re-run this script.
+"@
+            }
             throw "TFTP did not confirm transfer (no 'Bytes transferred'): $Cmd"
         }
     }
@@ -304,17 +324,17 @@ try {
     }
 
     if (-not $OnlyUbootItb -and -not $TrustOnly) {
-        Send-Uboot "tftp 0x02000000 $IdbFile" -TimeoutSec 300
+        Send-Uboot "tftp 0x02000000 $tftpIdbName" -TimeoutSec 300
     } else {
         Write-Host ""
         Write-Host "[*] Skipping idbloader.img load" -ForegroundColor Yellow
     }
 
     if ($TrustOnly) {
-        Send-Uboot "tftp 0x04000000 $TrustFile" -TimeoutSec 300
+        Send-Uboot "tftp 0x04000000 $tftpTrustName" -TimeoutSec 300
         # Verify loaded file: try sha256sum (newer U-Boot), fallback to md5sum, fallback to crc32
         $sha256local = [System.Security.Cryptography.SHA256]::Create()
-        $localBytes  = [System.IO.File]::ReadAllBytes((Resolve-FlashFile $TrustFile))
+        $localBytes  = [System.IO.File]::ReadAllBytes($trustLocal)
         $localSHA    = ($sha256local.ComputeHash($localBytes) | ForEach-Object { $_.ToString("x2") }) -join ""
         $fileSize    = $localBytes.Length
         $verified    = $false
@@ -351,7 +371,7 @@ try {
             Write-Host "       Local SHA256: $localSHA" -ForegroundColor Yellow
         }
     } else {
-        Send-Uboot "tftp 0x04000000 $ItbFile" -TimeoutSec 300
+        Send-Uboot "tftp 0x04000000 $tftpItbName" -TimeoutSec 300
     }
 
     if ($ForceWrite) {
@@ -375,7 +395,7 @@ try {
 
     $tail = ""
     try { while ($serial.BytesToRead -gt 0) { $tail += [char]$serial.ReadChar() } } catch {}
-    if ($tail -match "Card did not respond to voltage select|Could not initialize PHY|Retry count exceeded|DMA reset timeout|ERROR") {
+    if ($tail -match "Card did not respond to voltage select|Could not initialize PHY|Retry count exceeded|ERROR") {
         throw "Flash commands failed. Check MMC device and TFTP network."
     }
 

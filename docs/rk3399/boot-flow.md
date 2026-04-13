@@ -65,11 +65,11 @@ Before changing or flashing boot components, check:
 
 Чтобы получить **тот же формат**, что ожидает Rockchip SPL, собирайте контейнер на Linux через **`trust_merger`** из `rkbin`, а не через самодельный Windows-упаковщик.
 
-1. **Actions → «RK3399 BL31 + trust.img» → Run workflow**. По умолчанию **trust_profile = `bl31_only`**: контейнер **только BL31** (без OP-TEE BL32), как у рабочего Armbian на SD — см. `docs/rk3399/firmware-handoff-debug.md`. Профиль **`full_bl32_optee`** — старый rkbin с BL32 (большой образ, часто ломает SPL/SD).
+1. **Actions → «RK3399 BL31 + trust.img» → Run workflow**. По умолчанию **trust_profile = `bl31_only`**: контейнер **только BL31** (без OP-TEE BL32), как у рабочего Armbian на SD — см. `docs/rk3399/firmware-handoff-debug.md`. Профиль **`bl31_only_bin`** — эксперимент: BL31 сначала конвертируется в raw `.bin`, затем упаковывается как один компонент (для старого SPL/Boot1 с `CheckImage Fail` на multi-PT_LOAD ELF). Профиль **`full_bl32_optee`** — старый rkbin с BL32 (большой образ, часто ломает SPL/SD).
 2. Артефакт: `…-v2.14.0-bl31_only.zip` — `trust.img`, `bl31.elf`, `SHA256SUMS`, `README_FLASH.txt`. Патч TF-A: `patches/tf-a-v2.14-rk3399-pmusram-rsize-16k.patch` (`PMUSRAM_RSIZE` 16 KiB). Сборка: `LOG_LEVEL=20`, `RK3399_BAUDRATE=1500000`.
 3. Запись trust: **UART+TFTP** — `.\flash_bootloader_uboot.ps1 -TrustOnly -ForceWrite -TrustFile … -MmcDev <N>` (N = твоя SD в `mmc list`). **Кардридер с ПК (Admin):** `.\tools\write_rk3399_trust_to_sd.ps1 -TrustPath .\trust.img -DiskNumber <N>` — сырой LBA `0x6000`.
 
-Локально на Linux/WSL: `build_rk3399_trust_with_bl31.sh /path/to/bl31.elf outdir bl31_only` подставляет `patches/rktrust/RK3399TRUST-BL31ONLY.ini`; для крупного BL31 нужен свой `trust_merger` с увеличенным `BL3X_FILESIZE_MAX` (как в CI).
+Локально на Linux/WSL: `build_rk3399_trust_with_bl31.sh /path/to/bl31.elf outdir bl31_only` подставляет `patches/rktrust/RK3399TRUST-BL31ONLY.ini`; `... bl31_only_bin` использует `RK3399TRUST-BL31ONLY-BIN.ini` (нужен `aarch64-linux-gnu-objcopy`). Для крупного BL31 нужен свой `trust_merger` с увеличенным `BL3X_FILESIZE_MAX` (как в CI).
 
 Имя файла `rk3399_bl31_v1.36.elf` в `RK3399TRUST.ini` — **устаревшее имя слота в rkbin**; подставляется ваш собранный `bl31.elf`, версия TF-A задаётся тегом сборки.
 

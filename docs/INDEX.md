@@ -7,6 +7,7 @@ Use this as the first stop when debugging bring-up.
 ### Boot flow
 
 - file: `docs/rk3399/boot-flow.md`
+- file: `docs/rk3399/spl-trust-checkimage.md` — SPL `CheckImage Fail`, TF-A trust vs vendor BL31 fallback
 - tags: `bootrom`, `tpl`, `spl`, `bl31`, `bl33`, `u-boot`, `trust.img`, `idbloader`, `u-boot.itb`, `offsets`, `flash`
 
 ### Board and memory

@@ -15,7 +15,7 @@ BUILD_FLAVOR="${3:-default}"
 
 if [[ -z "${BL31_SRC}" ]]; then
   echo "usage: $0 /path/to/bl31.elf [output-dir] [build_flavor]" >&2
-  echo "  build_flavor: default | bl31_only (no BL32; uses patches/rktrust/RK3399TRUST-BL31ONLY.ini)" >&2
+  echo "  build_flavor: default | bl31_only | bl31_only_bin (single raw BL31 component)" >&2
   exit 1
 fi
 
@@ -39,11 +39,21 @@ trap cleanup EXIT
 
 cp -a "${RKBIN_DIR}/." "${TMP_DIR}/"
 cp -f "${BL31_SRC}" "${TMP_DIR}/bin/rk33/rk3399_bl31_v1.36.elf"
+if command -v aarch64-linux-gnu-objcopy >/dev/null 2>&1; then
+  aarch64-linux-gnu-objcopy -O binary "${BL31_SRC}" "${TMP_DIR}/bin/rk33/rk3399_bl31_v1.36.bin"
+fi
 
 INI="RKTRUST/RK3399TRUST.ini"
 if [[ "${BUILD_FLAVOR}" == "bl31_only" ]] || [[ "${BUILD_FLAVOR}" == "armbian_sd" ]]; then
   cp -f "${ROOT_DIR}/patches/rktrust/RK3399TRUST-BL31ONLY.ini" "${TMP_DIR}/RKTRUST/RK3399TRUST-BL31ONLY.ini"
   INI="RKTRUST/RK3399TRUST-BL31ONLY.ini"
+elif [[ "${BUILD_FLAVOR}" == "bl31_only_bin" ]]; then
+  if [[ ! -f "${TMP_DIR}/bin/rk33/rk3399_bl31_v1.36.bin" ]]; then
+    echo "aarch64-linux-gnu-objcopy not found (or failed) and BL31 .bin missing; install binutils-aarch64-linux-gnu." >&2
+    exit 1
+  fi
+  cp -f "${ROOT_DIR}/patches/rktrust/RK3399TRUST-BL31ONLY-BIN.ini" "${TMP_DIR}/RKTRUST/RK3399TRUST-BL31ONLY-BIN.ini"
+  INI="RKTRUST/RK3399TRUST-BL31ONLY-BIN.ini"
 fi
 
 pushd "${TMP_DIR}" >/dev/null
@@ -58,9 +68,17 @@ fi
 
 cp -f "${TMP_DIR}/trust.img" "${OUT_DIR}/trust.img"
 cp -f "${TMP_DIR}/bin/rk33/rk3399_bl31_v1.36.elf" "${OUT_DIR}/bl31.elf"
+if [[ -f "${TMP_DIR}/bin/rk33/rk3399_bl31_v1.36.bin" ]]; then
+  cp -f "${TMP_DIR}/bin/rk33/rk3399_bl31_v1.36.bin" "${OUT_DIR}/bl31.bin"
+fi
 printf '%s\n' "${BUILD_FLAVOR}" > "${OUT_DIR}/build-flavor.txt"
 
 echo "Generated:"
-ls -lh "${OUT_DIR}/trust.img" "${OUT_DIR}/bl31.elf"
-sha256sum "${OUT_DIR}/trust.img" "${OUT_DIR}/bl31.elf"
+if [[ -f "${OUT_DIR}/bl31.bin" ]]; then
+  ls -lh "${OUT_DIR}/trust.img" "${OUT_DIR}/bl31.elf" "${OUT_DIR}/bl31.bin"
+  sha256sum "${OUT_DIR}/trust.img" "${OUT_DIR}/bl31.elf" "${OUT_DIR}/bl31.bin"
+else
+  ls -lh "${OUT_DIR}/trust.img" "${OUT_DIR}/bl31.elf"
+  sha256sum "${OUT_DIR}/trust.img" "${OUT_DIR}/bl31.elf"
+fi
 echo "Flavor: ${BUILD_FLAVOR}"

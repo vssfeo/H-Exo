@@ -6,6 +6,9 @@
 *.map
 *.hex
 
+# SD boot slot backups (trust / raw dumps)
+boot-backups/
+
 # Backup files
 *.bak
 *.tmp
