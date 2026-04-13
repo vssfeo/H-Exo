@@ -102,15 +102,25 @@ jobs:
           echo "path=$ELF" >> "$GITHUB_OUTPUT"
           ls -la "$ELF"
 
-      - name: Locate BL31 binary image
+      - name: Export BL31 binary image (first PT_LOAD)
         id: bl31bin
         run: |
-          BIN=$(find "${{ runner.temp }}/tfa/build" -path '*/bl31/bl31.bin' -type f | head -1)
-          if [ -z "$BIN" ] || [ ! -f "$BIN" ]; then
-            echo "::error::bl31.bin not found under build/ (TF-A did not emit binary image)"
-            find "${{ runner.temp }}/tfa/build" -type f -name 'bl31*' 2>/dev/null | head -50 || true
+          ELF="${{ steps.bl31.outputs.path }}"
+          BIN="${{ runner.temp }}/bl31.bin"
+          LOAD_LINE=$(aarch64-linux-gnu-readelf -lW "$ELF" | awk '$1=="LOAD"{print; exit}')
+          if [ -z "$LOAD_LINE" ]; then
+            echo "::error::No PT_LOAD segment found in $ELF"
             exit 1
           fi
+          OFF_HEX=$(echo "$LOAD_LINE" | awk '{print $2}')
+          FILESZ_HEX=$(echo "$LOAD_LINE" | awk '{print $5}')
+          OFF=$((OFF_HEX))
+          FILESZ=$((FILESZ_HEX))
+          if [ "$FILESZ" -le 0 ]; then
+            echo "::error::Invalid first PT_LOAD FileSiz=$FILESZ_HEX"
+            exit 1
+          fi
+          dd if="$ELF" of="$BIN" bs=1 skip="$OFF" count="$FILESZ" status=none
           test -s "$BIN"
           echo "path=$BIN" >> "$GITHUB_OUTPUT"
           ls -la "$BIN"
