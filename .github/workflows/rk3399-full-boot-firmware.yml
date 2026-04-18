@@ -77,6 +77,7 @@ jobs:
             make git python3 device-tree-compiler bc gcc libc6-dev \
             gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
             gcc-arm-none-eabi binutils-arm-none-eabi \
+            libgnutls28-dev \
             bison flex swig python3-dev python3-setuptools \
             python3-pyelftools
 
@@ -113,17 +114,21 @@ jobs:
 
       # ── rkbin (DDR blob) ────────────────────────────────────────
       - name: Clone rkbin for DDR blob
+        id: rkbin
         run: |
           git clone --depth 1 https://github.com/rockchip-linux/rkbin.git "${{ runner.temp }}/rkbin"
           DDR_MHZ="${{ steps.opts.outputs.ddr_mhz }}"
-          DDR_BIN="${{ runner.temp }}/rkbin/bin/rk33/rk3399_ddr_${DDR_MHZ}MHz_v1.30.bin"
-          if [ ! -f "$DDR_BIN" ]; then
-            echo "Available DDR blobs:"
-            ls "${{ runner.temp }}/rkbin/bin/rk33/" | grep ddr || true
-            echo "::error::DDR blob not found: $DDR_BIN"
+          # Try exact name first, then fallback to any matching ddr blob
+          DDR_BIN=$(find "${{ runner.temp }}/rkbin/bin/rk33" \
+            -name "rk3399_ddr_${DDR_MHZ}MHz_*.bin" -type f | head -1)
+          if [ -z "$DDR_BIN" ]; then
+            echo "Available RK3399 DDR blobs:"
+            ls "${{ runner.temp }}/rkbin/bin/rk33/" | grep 'rk3399_ddr' || true
+            echo "::error::No DDR blob matching rk3399_ddr_${DDR_MHz}MHz_*.bin"
             exit 1
           fi
           echo "DDR blob: $DDR_BIN ($(stat -c%s "$DDR_BIN") bytes)"
+          echo "ddr_bin=$DDR_BIN" >> "$GITHUB_OUTPUT"
 
       # ── U-Boot (SPL+TPL) ───────────────────────────────────────
       - name: Clone U-Boot
@@ -135,8 +140,7 @@ jobs:
       - name: Build U-Boot with SPL+TPL for NanoPi M4
         working-directory: ${{ runner.temp }}/u-boot
         run: |
-          DDR_MHZ="${{ steps.opts.outputs.ddr_mhz }}"
-          DDR_BIN="${{ runner.temp }}/rkbin/bin/rk33/rk3399_ddr_${DDR_MHZ}MHz_v1.30.bin"
+          DDR_BIN="${{ steps.rkbin.outputs.ddr_bin }}"
 
           make nanopi-m4-rk3399_defconfig
           make -j"$(nproc)" \
@@ -164,8 +168,8 @@ jobs:
 
           # Also copy the DDR blob used for reference
           DDR_MHZ="${{ steps.opts.outputs.ddr_mhz }}"
-          cp "${{ runner.temp }}/rkbin/bin/rk33/rk3399_ddr_${DDR_MHZ}MHz_v1.30.bin" \
-            "${{ github.workspace }}/artifacts/"
+          cp "${{ steps.rkbin.outputs.ddr_bin }}" \
+            "${{ github.workspace }}/artifacts/rk3399_ddr_${DDR_MHZ}MHz.bin"
 
           ( cd "${{ github.workspace }}/artifacts" && sha256sum * > SHA256SUMS )
 
