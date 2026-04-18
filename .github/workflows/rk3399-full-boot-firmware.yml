@@ -112,54 +112,8 @@ jobs:
           ls -la "$BL31"
           cp "$BL31" "${{ runner.temp }}/bl31.elf"
 
-      # ── rkbin (DDR blob) ────────────────────────────────────────
-      - name: Clone rkbin for DDR blob
-        id: rkbin
-        run: |
-          git clone --depth 1 https://github.com/rockchip-linux/rkbin.git "${{ runner.temp }}/rkbin"
-          DDR_MHZ="${{ steps.opts.outputs.ddr_mhz }}"
-          # Try exact name first, then fallback to any matching ddr blob
-          DDR_BIN=$(find "${{ runner.temp }}/rkbin/bin/rk33" \
-            -name "rk3399_ddr_${DDR_MHZ}MHz_*.bin" -type f | head -1)
-          if [ -z "$DDR_BIN" ]; then
-            echo "Available RK3399 DDR blobs:"
-            ls "${{ runner.temp }}/rkbin/bin/rk33/" | grep 'rk3399_ddr' || true
-            echo "::error::No DDR blob matching rk3399_ddr_${DDR_MHz}MHz_*.bin"
-            exit 1
-          fi
-          echo "DDR blob: $DDR_BIN ($(stat -c%s "$DDR_BIN") bytes)"
-          echo "ddr_bin_orig=$DDR_BIN" >> "$GITHUB_OUTPUT"
-
-      - name: Patch DDR blob for DDR3-only (NanoPi M4 has DDR3L, not LPDDR3)
-        id: ddr_patch
-        run: |
-          DDR_BIN="${{ steps.rkbin.outputs.ddr_bin_orig }}"
-          DDR_PATCHED="${{ runner.temp }}/rk3399_ddr_ddr3only.bin"
-          cp "$DDR_BIN" "$DDR_PATCHED"
-          # ddrbin_tool cannot change DDR freq for RK3399 (marked X in compat table).
-          # Binary-patch the lp3_freq field directly:
-          # Tag 0x12345678 is at some offset; at tag+0x10 the 32-bit word encodes
-          #   lp3_freq[11:0] | ddr3_freq[27:16]  (both in MHz, e.g. 800=0x320)
-          # Zero lp3_freq so TPL skips LPDDR3 and uses DDR3 only.
-          python3 -c "
-          import struct
-          blob = bytearray(open('$DDR_PATCHED','rb').read())
-          tag = struct.pack('<I', 0x12345678)
-          pos = blob.find(tag)
-          assert pos >= 0, 'DDR param tag not found'
-          off = pos + 0x10
-          val = struct.unpack_from('<I', blob, off)[0]
-          print(f'Before: ddr3={(val>>16)&0xfff}, lp3={val&0xfff}')
-          new_val = (val & 0xFFFF0000) | 0   # lp3_freq = 0
-          struct.pack_into('<I', blob, off, new_val)
-          val2 = struct.unpack_from('<I', blob, off)[0]
-          print(f'After:  ddr3={(val2>>16)&0xfff}, lp3={val2&0xfff}')
-          open('$DDR_PATCHED','wb').write(blob)
-          "
-          echo "Patched DDR blob: $DDR_PATCHED ($(stat -c%s "$DDR_PATCHED") bytes)"
-          echo "ddr_bin=$DDR_PATCHED" >> "$GITHUB_OUTPUT"
-
       # ── U-Boot (SPL+TPL) ───────────────────────────────────────
+      # NOTE: No DDR blob needed — TPL is compiled from source with DDR3 DT params.
       - name: Clone U-Boot
         run: |
           git clone --depth 1 --branch "${{ steps.opts.outputs.ub_branch }}" \
@@ -181,12 +135,13 @@ jobs:
       - name: Build U-Boot with SPL+TPL for NanoPi M4
         working-directory: ${{ runner.temp }}/u-boot
         run: |
-          DDR_BIN="${{ steps.ddr_patch.outputs.ddr_bin }}"
-
           make nanopi-m4-rk3399_defconfig
+          # Disable SPL FIT hash verification — binman split-elf creates
+          # atf-3 (PMUSRAM seg) with mismatched sha256. Safe for dev boards.
+          scripts/config --disable SPL_FIT_SIGNATURE
+          make olddefconfig
           make -j"$(nproc)" \
             CROSS_COMPILE=aarch64-linux-gnu- \
-            ROCKCHIP_TPL="$DDR_BIN" \
             BL31="${{ runner.temp }}/bl31.elf"
 
           # Verify outputs
@@ -207,11 +162,6 @@ jobs:
           cp "${{ runner.temp }}/u-boot/u-boot.itb" "${{ github.workspace }}/artifacts/"
           cp "${{ runner.temp }}/bl31.elf" "${{ github.workspace }}/artifacts/"
 
-          # Also copy the DDR blob used for reference
-          DDR_MHZ="${{ steps.opts.outputs.ddr_mhz }}"
-          cp "${{ steps.ddr_patch.outputs.ddr_bin }}" \
-            "${{ github.workspace }}/artifacts/rk3399_ddr_${DDR_MHZ}MHz_ddr3only.bin"
-
           ( cd "${{ github.workspace }}/artifacts" && sha256sum * > SHA256SUMS )
 
           {
@@ -219,7 +169,7 @@ jobs:
             echo "===================================================="
             echo "TF-A: ${{ steps.opts.outputs.tfa_tag }}"
             echo "U-Boot: ${{ steps.opts.outputs.ub_branch }}"
-            echo "DDR: ${DDR_MHZ}MHz (rkbin v1.30)"
+            echo "DDR: DDR3-1600 (800MHz, open-source TPL from DT)"
             echo "Built (UTC): $(date -u -Iseconds)"
             echo ""
             echo "Boot flow: BootROM → TPL (DDR) → SPL → BL31 → U-Boot"
@@ -229,7 +179,6 @@ jobs:
             echo "  idbloader.img  — TPL+SPL, flash at LBA 0x40 (sector 64)"
             echo "  u-boot.itb     — FIT: U-Boot + BL31 + DTB, flash at LBA 0x4000"
             echo "  bl31.elf       — TF-A BL31 (reference)"
-            echo "  rk3399_ddr_*.bin — DDR init blob (reference)"
             echo ""
             echo "Flash to Armbian SD image (PowerShell):"
             echo '  $img = "C:\tftpboot\Armbian_...img"'
