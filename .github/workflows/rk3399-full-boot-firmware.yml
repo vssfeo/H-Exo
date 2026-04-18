@@ -1,0 +1,194 @@
+# Full boot firmware for RK3399 NanoPi M4 — SPL+TPL flow (NO miniloader).
+# BootROM → TPL (DDR init) → SPL → BL31 → U-Boot proper.
+# All latest versions: U-Boot 2026.04, TF-A v2.14, rkbin DDR v1.30.
+#
+# Output artifacts:
+#   idbloader.img  — TPL+SPL, flash at LBA 0x40 (sector 64)
+#   u-boot.itb     — FIT: U-Boot + BL31 + DTB, flash at LBA 0x4000
+#   boot-firmware.img — Armbian image with boot firmware replaced
+name: RK3399 Full Boot Firmware (SPL+TPL)
+
+on:
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+    inputs:
+      tfa_tag:
+        description: TrustedFirmware-A git tag
+        required: true
+        default: v2.14.0
+      uboot_repo:
+        description: U-Boot git repo
+        required: true
+        default: https://github.com/u-boot/u-boot.git
+      uboot_branch:
+        description: U-Boot branch or tag
+        required: true
+        default: v2026.04
+      ddr_mhz:
+        description: DDR frequency (666/800/933)
+        required: true
+        default: "800"
+        type: choice
+        options:
+          - "666"
+          - "800"
+          - "933"
+  push:
+    branches: [master, main]
+    paths:
+      - ".github/workflows/rk3399-full-boot-firmware.yml"
+      - "patches/tf-a-v2.14-rk3399-pmusram-rsize-16k.patch"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rk3399-full-boot-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve inputs
+        id: opts
+        run: |
+          TFA="${{ github.event.inputs.tfa_tag }}"
+          [ -z "$TFA" ] && TFA="v2.14.0"
+          UB_REPO="${{ github.event.inputs.uboot_repo }}"
+          [ -z "$UB_REPO" ] && UB_REPO="https://github.com/u-boot/u-boot.git"
+          UB_BRANCH="${{ github.event.inputs.uboot_branch }}"
+          [ -z "$UB_BRANCH" ] && UB_BRANCH="v2026.04"
+          DDR="${{ github.event.inputs.ddr_mhz }}"
+          [ -z "$DDR" ] && DDR="800"
+          echo "tfa_tag=$TFA" >> "$GITHUB_OUTPUT"
+          echo "ub_repo=$UB_REPO" >> "$GITHUB_OUTPUT"
+          echo "ub_branch=$UB_BRANCH" >> "$GITHUB_OUTPUT"
+          echo "ddr_mhz=$DDR" >> "$GITHUB_OUTPUT"
+
+      - name: Install toolchains
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            make git python3 device-tree-compiler bc gcc libc6-dev \
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
+            bison flex swig python3-dev python3-setuptools \
+            python3-pyelftools
+
+      # ── TF-A BL31 ──────────────────────────────────────────────
+      - name: Clone Trusted Firmware-A
+        run: |
+          git clone --depth 1 --branch "${{ steps.opts.outputs.tfa_tag }}" \
+            https://github.com/TrustedFirmware-A/trusted-firmware-a.git \
+            "${{ runner.temp }}/tfa"
+
+      - name: Enlarge PMUSRAM_RSIZE for BL31 link (8 KiB -> 16 KiB)
+        run: |
+          F="${{ runner.temp }}/tfa/plat/rockchip/rk3399/include/shared/addressmap_shared.h"
+          grep -n PMUSRAM_RSIZE "$F"
+          sed -i '/PMUSRAM_RSIZE/s/SIZE_K(8)/SIZE_K(16)/' "$F"
+          grep -n PMUSRAM_RSIZE "$F"
+
+      - name: Build BL31
+        working-directory: ${{ runner.temp }}/tfa
+        run: |
+          make -j"$(nproc)" \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            PLAT=rk3399 \
+            DEBUG=0 \
+            LOG_LEVEL=20 \
+            ENABLE_ASSERTIONS=0 \
+            RK3399_BAUDRATE=1500000 \
+            bl31
+          BL31=$(find build -path '*/bl31/bl31.elf' -type f | head -1)
+          test -s "$BL31"
+          echo "BL31=$BL31" >> "$GITHUB_ENV"
+          ls -la "$BL31"
+          cp "$BL31" "${{ runner.temp }}/bl31.elf"
+
+      # ── U-Boot (SPL+TPL) ───────────────────────────────────────
+      - name: Clone U-Boot
+        run: |
+          git clone --depth 1 --branch "${{ steps.opts.outputs.ub_branch }}" \
+            "${{ steps.opts.outputs.ub_repo }}" \
+            "${{ runner.temp }}/u-boot"
+
+      - name: Build U-Boot with SPL+TPL for NanoPi M4
+        working-directory: ${{ runner.temp }}/u-boot
+        run: |
+          DDR_MHZ="${{ steps.opts.outputs.ddr_mhz }}"
+          DDR_BIN="${{ github.workspace }}/third_party/rkbin/bin/rk33/rk3399_ddr_${DDR_MHZ}MHz_v1.30.bin"
+          if [ ! -f "$DDR_BIN" ]; then
+            echo "::error::DDR blob not found: $DDR_BIN"
+            exit 1
+          fi
+
+          make nanopi-m4-rk3399_defconfig
+          make -j"$(nproc)" \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            ROCKCHIP_TPL="$DDR_BIN" \
+            BL31="${{ runner.temp }}/bl31.elf"
+
+          # Verify outputs
+          for f in idbloader.img u-boot.itb; do
+            if [ ! -s "$f" ]; then
+              echo "::error::$f not produced"
+              find . -name "$f" -o -name "u-boot-rockchip*" 2>/dev/null | head -10
+              exit 1
+            fi
+            ls -la "$f"
+          done
+
+      # ── Package artifacts ───────────────────────────────────────
+      - name: Package artifacts
+        run: |
+          mkdir -p "${{ github.workspace }}/artifacts"
+          cp "${{ runner.temp }}/u-boot/idbloader.img" "${{ github.workspace }}/artifacts/"
+          cp "${{ runner.temp }}/u-boot/u-boot.itb" "${{ github.workspace }}/artifacts/"
+          cp "${{ runner.temp }}/bl31.elf" "${{ github.workspace }}/artifacts/"
+
+          # Also copy the DDR blob used for reference
+          DDR_MHZ="${{ steps.opts.outputs.ddr_mhz }}"
+          cp "${{ github.workspace }}/third_party/rkbin/bin/rk33/rk3399_ddr_${DDR_MHZ}MHz_v1.30.bin" \
+            "${{ github.workspace }}/artifacts/"
+
+          ( cd "${{ github.workspace }}/artifacts" && sha256sum * > SHA256SUMS )
+
+          {
+            echo "RK3399 NanoPi M4 — Full Boot Firmware (SPL+TPL flow)"
+            echo "===================================================="
+            echo "TF-A: ${{ steps.opts.outputs.tfa_tag }}"
+            echo "U-Boot: ${{ steps.opts.outputs.ub_branch }}"
+            echo "DDR: ${DDR_MHZ}MHz (rkbin v1.30)"
+            echo "Built (UTC): $(date -u -Iseconds)"
+            echo ""
+            echo "Boot flow: BootROM → TPL (DDR) → SPL → BL31 → U-Boot"
+            echo "NO miniloader/Boot1 — pure mainline SPL+TPL"
+            echo ""
+            echo "Files:"
+            echo "  idbloader.img  — TPL+SPL, flash at LBA 0x40 (sector 64)"
+            echo "  u-boot.itb     — FIT: U-Boot + BL31 + DTB, flash at LBA 0x4000"
+            echo "  bl31.elf       — TF-A BL31 (reference)"
+            echo "  rk3399_ddr_*.bin — DDR init blob (reference)"
+            echo ""
+            echo "Flash to Armbian SD image (PowerShell):"
+            echo '  $img = "C:\tftpboot\Armbian_...img"'
+            echo '  $s = [IO.File]::Open($img, "Open", "Write", "None")'
+            echo '  $idb = [IO.File]::ReadAllBytes("idbloader.img")'
+            echo '  $itb = [IO.File]::ReadAllBytes("u-boot.itb")'
+            echo '  $s.Seek(0x40*512, 0) | Out-Null; $s.Write($idb, 0, $idb.Length)'
+            echo '  $s.Seek(0x4000*512, 0) | Out-Null; $s.Write($itb, 0, $itb.Length)'
+            echo '  $s.Flush(); $s.Dispose()'
+            echo ""
+            echo "Or use patch_etcher_image.ps1 with -IdbLoader and -UBootItb params"
+          } > "${{ github.workspace }}/artifacts/README_FLASH.txt"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rk3399-full-boot-${{ steps.opts.outputs.tfa_tag }}-ub${{ steps.opts.outputs.ub_branch }}-ddr${{ steps.opts.outputs.ddr_mhz }}
+          path: artifacts/
+          if-no-files-found: error
