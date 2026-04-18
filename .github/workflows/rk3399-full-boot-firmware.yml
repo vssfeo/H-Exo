@@ -96,8 +96,10 @@ jobs:
       - name: Build BL31
         working-directory: ${{ runner.temp }}/tfa
         run: |
+          # arm-none-eabi is installed but TF-A needs explicit CROSS_COMPILE for M0
           make -j"$(nproc)" \
             CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_32=arm-none-eabi- \
             PLAT=rk3399 \
             DEBUG=0 \
             LOG_LEVEL=20 \
@@ -110,6 +112,20 @@ jobs:
           ls -la "$BL31"
           cp "$BL31" "${{ runner.temp }}/bl31.elf"
 
+      # ── rkbin (DDR blob) ────────────────────────────────────────
+      - name: Clone rkbin for DDR blob
+        run: |
+          git clone --depth 1 https://github.com/rockchip-linux/rkbin.git "${{ runner.temp }}/rkbin"
+          DDR_MHZ="${{ steps.opts.outputs.ddr_mhz }}"
+          DDR_BIN="${{ runner.temp }}/rkbin/bin/rk33/rk3399_ddr_${DDR_MHZ}MHz_v1.30.bin"
+          if [ ! -f "$DDR_BIN" ]; then
+            echo "Available DDR blobs:"
+            ls "${{ runner.temp }}/rkbin/bin/rk33/" | grep ddr || true
+            echo "::error::DDR blob not found: $DDR_BIN"
+            exit 1
+          fi
+          echo "DDR blob: $DDR_BIN ($(stat -c%s "$DDR_BIN") bytes)"
+
       # ── U-Boot (SPL+TPL) ───────────────────────────────────────
       - name: Clone U-Boot
         run: |
@@ -121,11 +137,7 @@ jobs:
         working-directory: ${{ runner.temp }}/u-boot
         run: |
           DDR_MHZ="${{ steps.opts.outputs.ddr_mhz }}"
-          DDR_BIN="${{ github.workspace }}/third_party/rkbin/bin/rk33/rk3399_ddr_${DDR_MHZ}MHz_v1.30.bin"
-          if [ ! -f "$DDR_BIN" ]; then
-            echo "::error::DDR blob not found: $DDR_BIN"
-            exit 1
-          fi
+          DDR_BIN="${{ runner.temp }}/rkbin/bin/rk33/rk3399_ddr_${DDR_MHZ}MHz_v1.30.bin"
 
           make nanopi-m4-rk3399_defconfig
           make -j"$(nproc)" \
@@ -153,7 +165,7 @@ jobs:
 
           # Also copy the DDR blob used for reference
           DDR_MHZ="${{ steps.opts.outputs.ddr_mhz }}"
-          cp "${{ github.workspace }}/third_party/rkbin/bin/rk33/rk3399_ddr_${DDR_MHZ}MHz_v1.30.bin" \
+          cp "${{ runner.temp }}/rkbin/bin/rk33/rk3399_ddr_${DDR_MHZ}MHz_v1.30.bin" \
             "${{ github.workspace }}/artifacts/"
 
           ( cd "${{ github.workspace }}/artifacts" && sha256sum * > SHA256SUMS )
