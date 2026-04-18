@@ -128,7 +128,20 @@ jobs:
             exit 1
           fi
           echo "DDR blob: $DDR_BIN ($(stat -c%s "$DDR_BIN") bytes)"
-          echo "ddr_bin=$DDR_BIN" >> "$GITHUB_OUTPUT"
+          echo "ddr_bin_orig=$DDR_BIN" >> "$GITHUB_OUTPUT"
+
+      - name: Patch DDR blob for DDR3-only (NanoPi M4 has DDR3L, not LPDDR3)
+        id: ddr_patch
+        run: |
+          DDR_BIN="${{ steps.rkbin.outputs.ddr_bin_orig }}"
+          DDR_PATCHED="${{ runner.temp }}/rk3399_ddr_ddr3only.bin"
+          cp "$DDR_BIN" "$DDR_PATCHED"
+          PF="${{ runner.temp }}/ddr3_only_param.txt"
+          printf 'start tag=0x12345678\nddr2_freq=0\nlp2_freq=0\nddr3_freq=800\nlp3_freq=0\nddr4_freq=0\nlp4_freq=0\nlp4x_freq=0\nlp5_freq=0\nuart id=2\nuart iomux=3\nuart baudrate=1500000\n' > "$PF"
+          cd "${{ runner.temp }}/rkbin"
+          python3 tools/ddrbin_tool.py rk3399 "$PF" "$DDR_PATCHED"
+          echo "Patched DDR blob: $DDR_PATCHED ($(stat -c%s "$DDR_PATCHED") bytes)"
+          echo "ddr_bin=$DDR_PATCHED" >> "$GITHUB_OUTPUT"
 
       # ── U-Boot (SPL+TPL) ───────────────────────────────────────
       - name: Clone U-Boot
@@ -140,7 +153,7 @@ jobs:
       - name: Build U-Boot with SPL+TPL for NanoPi M4
         working-directory: ${{ runner.temp }}/u-boot
         run: |
-          DDR_BIN="${{ steps.rkbin.outputs.ddr_bin }}"
+          DDR_BIN="${{ steps.ddr_patch.outputs.ddr_bin }}"
 
           make nanopi-m4-rk3399_defconfig
           make -j"$(nproc)" \
@@ -168,8 +181,8 @@ jobs:
 
           # Also copy the DDR blob used for reference
           DDR_MHZ="${{ steps.opts.outputs.ddr_mhz }}"
-          cp "${{ steps.rkbin.outputs.ddr_bin }}" \
-            "${{ github.workspace }}/artifacts/rk3399_ddr_${DDR_MHZ}MHz.bin"
+          cp "${{ steps.ddr_patch.outputs.ddr_bin }}" \
+            "${{ github.workspace }}/artifacts/rk3399_ddr_${DDR_MHZ}MHz_ddr3only.bin"
 
           ( cd "${{ github.workspace }}/artifacts" && sha256sum * > SHA256SUMS )
 
