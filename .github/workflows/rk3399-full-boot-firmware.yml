@@ -136,10 +136,26 @@ jobs:
           DDR_BIN="${{ steps.rkbin.outputs.ddr_bin_orig }}"
           DDR_PATCHED="${{ runner.temp }}/rk3399_ddr_ddr3only.bin"
           cp "$DDR_BIN" "$DDR_PATCHED"
-          PF="${{ runner.temp }}/ddr3_only_param.txt"
-          printf 'start tag=0x12345678\nddr2_freq=0\nlp2_freq=0\nddr3_freq=800\nlp3_freq=0\nddr4_freq=0\nlp4_freq=0\nlp4x_freq=0\nlp5_freq=0\nuart id=2\nuart iomux=3\nuart baudrate=1500000\n' > "$PF"
-          cd "${{ runner.temp }}/rkbin"
-          python3 tools/ddrbin_tool.py rk3399 "$PF" "$DDR_PATCHED"
+          # ddrbin_tool cannot change DDR freq for RK3399 (marked X in compat table).
+          # Binary-patch the lp3_freq field directly:
+          # Tag 0x12345678 is at some offset; at tag+0x10 the 32-bit word encodes
+          #   lp3_freq[11:0] | ddr3_freq[27:16]  (both in MHz, e.g. 800=0x320)
+          # Zero lp3_freq so TPL skips LPDDR3 and uses DDR3 only.
+          python3 -c "
+          import struct
+          blob = bytearray(open('$DDR_PATCHED','rb').read())
+          tag = struct.pack('<I', 0x12345678)
+          pos = blob.find(tag)
+          assert pos >= 0, 'DDR param tag not found'
+          off = pos + 0x10
+          val = struct.unpack_from('<I', blob, off)[0]
+          print(f'Before: ddr3={(val>>16)&0xfff}, lp3={val&0xfff}')
+          new_val = (val & 0xFFFF0000) | 0   # lp3_freq = 0
+          struct.pack_into('<I', blob, off, new_val)
+          val2 = struct.unpack_from('<I', blob, off)[0]
+          print(f'After:  ddr3={(val2>>16)&0xfff}, lp3={val2&0xfff}')
+          open('$DDR_PATCHED','wb').write(blob)
+          "
           echo "Patched DDR blob: $DDR_PATCHED ($(stat -c%s "$DDR_PATCHED") bytes)"
           echo "ddr_bin=$DDR_PATCHED" >> "$GITHUB_OUTPUT"
 
