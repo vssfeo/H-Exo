@@ -95,6 +95,16 @@ jobs:
           sed -i '/PMUSRAM_RSIZE/s/SIZE_K(8)/SIZE_K(16)/' "$F"
           grep -n PMUSRAM_RSIZE "$F"
 
+      # Keep CPU debug power domain alive so PMCCNTR_EL0 / PMU event counters
+      # tick when read from non-secure EL2/EL1. See patch header for details.
+      - name: Apply PMU keep-debug-powered patch
+        working-directory: ${{ runner.temp }}/tfa
+        run: |
+          git apply --verbose \
+            "${{ github.workspace }}/patches/trusted-firmware-a-v2.14-rk3399-pmu-keep-debug-powered.patch"
+          # Sanity grep that the bits ended up in the source.
+          grep -n DBG_NOPWERDWN_L0_EN plat/rockchip/rk3399/drivers/pmu/pmu.c
+
       - name: Build BL31
         working-directory: ${{ runner.temp }}/tfa
         run: |

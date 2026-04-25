@@ -1,0 +1,58 @@
+Keep CPU debug logic powered so PMCCNTR_EL0 / PMU event counters tick.
+
+Background
+==========
+On RK3399 the PMU (Performance Monitoring Unit) and the cycle counter
+PMCCNTR_EL0 live inside the per-core *debug* power domain. After cold
+boot bits DBG_NOPWERDWN_L*_EN / DBG_NO_PWERDWN_B*_EN in PMU_SFT_CON
+(offset 0x24) are 0, which lets the chip-level PMU controller gate the
+debug logic together with the core whenever BL31 manages CPU power.
+Result: from non-secure EL2/EL1 the cycle counter reads back the value
+written to it, but never increments.
+
+Symptoms (without this patch, on H-Exo bare-metal kernel @ EL2):
+    [PMU] DBGAUTHSTATUS=0x000000FF (NSNID=3)        ; debug authorised
+    [PMU] DIAG2 CurEL=0x8 sentinel_rb=0xDEADBEEFCAFE0000
+    [PMU] DIAG  PMCR=0x41033041 CNTENSET=0x8000003E cyc_delta=0x0
+    PMU_PWRDN_ST after=0x00 (CHANGED from 0x3E)     ; BL31 powered the
+                                                     ; debug domain off
+
+Fix
+===
+In plat_rockchip_pmu_init() (executed once during BL31 cold boot)
+explicitly set DBG_NOPWERDWN_L0..L3_EN and DBG_NO_PWERDWN_B0..B1_EN
+in PMU_SFT_CON. This tells the chip-level PMU to keep CPU debug
+logic clocked even when the core power domain is being managed,
+which is exactly what we want for non-invasive performance counting
+from the OS side. PSCI core-on/off behaviour is unaffected: cores
+themselves are still gated normally; only the debug subsystem
+(containing PMCCNTR / event counters) stays powered.
+
+Apply from TF-A root (tag v2.14.x), path:
+plat/rockchip/rk3399/drivers/pmu/pmu.c
+
+--- a/plat/rockchip/rk3399/drivers/pmu/pmu.c
++++ b/plat/rockchip/rk3399/drivers/pmu/pmu.c
+@@ -1620,6 +1620,21 @@ void plat_rockchip_pmu_init(void)
+ 
+ 	init_pmu_counts();
+ 
++	/*
++	 * Keep per-core debug power domain alive so that PMCCNTR_EL0 and
++	 * the PMU event counters keep ticking when non-secure software
++	 * (EL2/EL1) reads them. Without this, the PMU registers are
++	 * read/writeable but their input clock is gated together with
++	 * the core power domain, freezing the cycle counter at whatever
++	 * value it last held. Bits live in PMU_SFT_CON (offset 0x24).
++	 */
++	mmio_setbits_32(PMU_BASE + PMU_SFT_CON,
++			BIT(DBG_NOPWERDWN_L0_EN) |
++			BIT(DBG_NOPWERDWN_L1_EN) |
++			BIT(DBG_NOPWERDWN_L2_EN) |
++			BIT(DBG_NOPWERDWN_L3_EN) |
++			BIT(DBG_NO_PWERDWN_B0_EN) |
++			BIT(DBG_NO_PWERDWN_B1_EN));
++
+ 	nonboot_cpus_off();
+ 
+ 	INFO("%s(%d): pd status %x\n", __func__, __LINE__,
