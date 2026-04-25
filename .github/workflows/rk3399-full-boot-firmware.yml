@@ -96,14 +96,48 @@ jobs:
           grep -n PMUSRAM_RSIZE "$F"
 
       # Keep CPU debug power domain alive so PMCCNTR_EL0 / PMU event counters
-      # tick when read from non-secure EL2/EL1. See patch header for details.
-      - name: Apply PMU keep-debug-powered patch
+      # tick when read from non-secure EL2/EL1. Without this, BL31 power-mgmt
+      # gates CPU debug logic together with the core, freezing PMCCNTR even
+      # when PMCR.E=1 and CNTENSET[31]=1. Set DBG_NOPWERDWN_L0..L3_EN +
+      # DBG_NO_PWERDWN_B0..B1_EN bits in PMU_SFT_CON during BL31 init.
+      # Use awk insertion (instead of git-apply) to avoid patch-format issues.
+      - name: Patch plat_rockchip_pmu_init to keep debug domain powered
         working-directory: ${{ runner.temp }}/tfa
         run: |
-          git apply --verbose \
-            "${{ github.workspace }}/patches/trusted-firmware-a-v2.14-rk3399-pmu-keep-debug-powered.patch"
-          # Sanity grep that the bits ended up in the source.
-          grep -n DBG_NOPWERDWN_L0_EN plat/rockchip/rk3399/drivers/pmu/pmu.c
+          F="plat/rockchip/rk3399/drivers/pmu/pmu.c"
+          test -f "$F"
+          # Insert mmio_setbits_32 block after init_pmu_counts() call inside
+          # plat_rockchip_pmu_init(). Idempotent: bail if marker already there.
+          if grep -q DBG_NOPWERDWN_L0_EN "$F"; then
+            echo "Already patched."
+          else
+            awk '
+              /^void plat_rockchip_pmu_init/ { in_fn = 1 }
+              { print }
+              in_fn && /init_pmu_counts\(\);/ {
+                print ""
+                print "\t/*"
+                print "\t * H-Exo: Keep per-core debug power domain alive so PMCCNTR_EL0"
+                print "\t * and the PMU event counters keep ticking when non-secure"
+                print "\t * software (EL2/EL1) reads them. Without this, the PMU regs"
+                print "\t * are read/writeable but their input clock is gated together"
+                print "\t * with the core power domain, freezing the cycle counter."
+                print "\t */"
+                print "\tmmio_setbits_32(PMU_BASE + PMU_SFT_CON,"
+                print "\t\t\tBIT(DBG_NOPWERDWN_L0_EN) |"
+                print "\t\t\tBIT(DBG_NOPWERDWN_L1_EN) |"
+                print "\t\t\tBIT(DBG_NOPWERDWN_L2_EN) |"
+                print "\t\t\tBIT(DBG_NOPWERDWN_L3_EN) |"
+                print "\t\t\tBIT(DBG_NO_PWERDWN_B0_EN) |"
+                print "\t\t\tBIT(DBG_NO_PWERDWN_B1_EN));"
+                in_fn = 0
+              }
+            ' "$F" > "$F.new"
+            mv "$F.new" "$F"
+          fi
+          # Verify insertion landed.
+          grep -n DBG_NOPWERDWN_L0_EN "$F"
+          grep -n DBG_NO_PWERDWN_B0_EN "$F"
 
       - name: Build BL31
         working-directory: ${{ runner.temp }}/tfa
