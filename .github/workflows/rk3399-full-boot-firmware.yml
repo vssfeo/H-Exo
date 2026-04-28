@@ -292,6 +292,7 @@ jobs:
           DTSI="$(find . -path '*/rk3399-nanopi4.dtsi' -type f | head -1)"
           test -n "$DTSI"
           export DTSI
+          echo "Patching U-Boot board DTSI: $DTSI"
           python3 - <<'PY'
           import os
           from pathlib import Path
@@ -385,7 +386,7 @@ jobs:
               p.write_text(s.rstrip() + "\\n" + block)
           PY
           grep -n -A4 'rk808@1b' "$DTSI" || echo "WARN: rk808 node not found"
-          grep -n -A4 'syr827@40' "$DTSI"
+          grep -n -A4 'syr827@40' "$DTSI" || echo "WARN: syr827 node not found in selected DTSI"
 
       - name: Add CPU-supply bindings + IO domains to U-Boot DT
         working-directory: ${{ runner.temp }}/u-boot
@@ -393,6 +394,7 @@ jobs:
           DTS="$(find . -path '*/rk3399-nanopi4.dtsi' -type f | head -1)"
           test -n "$DTS"
           export DTS
+          echo "Patching U-Boot CPU supplies DTS: $DTS"
           python3 - <<'PY'
           import os
           from pathlib import Path
