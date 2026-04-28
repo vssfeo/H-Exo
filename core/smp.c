@@ -19,6 +19,20 @@ volatile u64 smp_trace_page[64] __attribute__((aligned(64)));
 static volatile u32 smp_online_count = 1;
 static volatile u32 smp_online_mask = 0x1; // bit i = core i is online
 static volatile u32 smp_secondary_enter_mask = 0; // bit i = core i reached C loop
+// Per-core diagnostic captured AFTER daifclr in smp_secondary_main:
+//   [0] enter_count, [1] DAIF, [2] VBAR_EL2, [3] MPIDR_EL1
+//   [4] HCR_EL2, [5] CurrentEL, [6] ISR_EL1, [7] reserved
+volatile u64 __attribute__((aligned(64))) g_smp_pe_diag[6][8];
+// Per-core idle-loop trace; see smp_secondary_main for layout
+volatile u64 __attribute__((aligned(64))) g_smp_loop_diag[6][4];
+// Per-core SMPEN probe result (Idea #3, see docs/tfa_smpen_diag_patch.md).
+//   0 = SMPEN bit clear (problem!)
+//   1 = SMPEN bit set
+//   0xFFFFFFFF = SMC_UNK (TF-A patch not applied)
+//   other = unexpected
+volatile u64 __attribute__((aligned(64))) g_smpen_diag[6] = {
+    [0 ... 5] = 0xDEADBEEFUL,  // sentinel: probe not run
+};
 // Fixed debug beacon written by secondary_entry in boot.s.
 #define SMP_BEACON_ADDR 0x02000000UL
 
@@ -512,23 +526,11 @@ result_t smp_init(void) {
     uart_puts(&console, "\r\n");
 
     // PMU_PWRDN_ST: check which power domains are on/off before CPU_ON
-    // Bits 0-3 = A53 cores 0-3, bits 4-5 = A72 cores 0-1
-    // Bit 6 = SCU_L (A53 cluster), bit 7 = SCU_B (A72 cluster)
-    // 1 = powered down, 0 = powered up
     volatile u32 *pmu_pwrdn_st = (volatile u32 *)(PMU_BASE + PMU_PWRDN_ST);
     u32 pmu_st_before = *pmu_pwrdn_st;
     uart_puts(&console, "[SMP] PMU_PWRDN_ST before=0x");
     uart_put_hex(&console, (u64)pmu_st_before);
     uart_puts(&console, "\r\n");
-
-    // Clear PMU GRF scratch regs before a new bring-up pass.
-    volatile u32 *pmugrf_os_reg1 = (volatile u32 *)0xFF320304UL;
-    volatile u32 *pmugrf_os_reg2 = (volatile u32 *)0xFF320308UL;
-    volatile u32 *pmugrf_os_reg3 = (volatile u32 *)0xFF32030CUL;
-    *pmugrf_os_reg1 = 0;
-    *pmugrf_os_reg2 = 0;
-    *pmugrf_os_reg3 = 0;
-    asm volatile("dsb sy; isb" ::: "memory");
 
     // --- Relay trampoline at 0x200000 ---
     // We proved 0x200000 works (UART 'X', GRF=0xCC in the trampoline test).
@@ -572,8 +574,6 @@ result_t smp_init(void) {
         if (ret == PSCI_ALREADY_ON) smp_psci_diag[i].flags |= SMP_FLAG_ALREADY_ON;
         uart_puts(&console, "[SMP] CPU_ON core ");
         uart_put_hex(&console, i);
-        uart_puts(&console, " hw_mpidr=0x");
-        uart_put_hex(&console, hwid);
         uart_puts(&console, " ret=");
         uart_put_hex(&console, (u64)(i64)ret);
         uart_puts(&console, "\r\n");
@@ -664,13 +664,34 @@ result_t smp_init(void) {
     smp_log_gicr_waker_decode("pre-cpu_on");
     smp_log_cci_state("pre-cpu_on");
 
-    const u64 a72_probe_entry_pa = (u64)(uintptr_t)secondary_entry_probe;
-    uart_puts(&console, "[SMP][A72] probe entry_pa=0x");
-    uart_put_hex(&console, a72_probe_entry_pa);
-    uart_puts(&console, " via CPU_ON_32 experiment\r\n");
+    // A72 must use the SAME trampoline as A53 (TRAMP_PA = 0x200000).
+    // Without it, A72 wakes with MMU off → non-coherent fetch → SLVERR → secure panic → reset.
+    uart_puts(&console, "[SMP][A72] entry_pa=0x");
+    uart_put_hex(&console, (u64)TRAMP_PA);
+    uart_puts(&console, " via CPU_ON_64 (AArch64)\r\n");
+
+    // --- CRITICAL: cache flush before CPU_ON ---
+    // Clean dcache → push trampoline code + beacons to DRAM so A72
+    // (which starts with caches off) can see them via coherent CCI path.
+    // Invalidate icache → A72 fetches fresh instructions from DRAM/L2.
+    // DSB+ISB → guarantee ordering before SMC.
+    // NOTE: do NOT write CCI or PMU CCI500_CON registers from NS —
+    // they create stuck CHANGE_PENDING that blocks TF-A's secure
+    // cci_enable_snoop_dvm_reqs() during pwr_domain_on_finish.
+    {
+        for (u32 off = 0; off < 0x1000u; off += 64u)
+            asm volatile("dc civac, %0" :: "r"(TRAMP_PA + off) : "memory");
+        for (u32 off = 0; off < 0x1000u; off += 64u)
+            asm volatile("dc civac, %0" :: "r"(0x02081000u + off) : "memory");
+        asm volatile("ic ialluis\n dsb sy\n isb" ::: "memory");
+        uart_puts(&console, "[SMP][A72] cache flush done\r\n");
+    }
+
+    // CPU_ON for A72 cores 4-5
     for (u32 i = 4; i <= 5; i++) {
         u64 hwid = rk3399_psci_mpidr(i);
-        i64 ret = psci_cpu_on32(hwid, a72_probe_entry_pa, (u64)i);
+        i64 ret = psci_cpu_on(hwid, (u64)TRAMP_PA, (u64)i);
+
         smp_psci_diag[i].cpu_on_ret = ret;
         smp_psci_diag[i].t_cpu_on_us = smp_time_us();
         smp_psci_diag[i].flags |= SMP_FLAG_PWR_REQ_SENT;
@@ -678,16 +699,10 @@ result_t smp_init(void) {
         if (ret == PSCI_ALREADY_ON) smp_psci_diag[i].flags |= SMP_FLAG_ALREADY_ON;
         uart_puts(&console, "[SMP] CPU_ON core ");
         uart_put_hex(&console, i);
-        uart_puts(&console, " hw_mpidr=0x");
-        uart_put_hex(&console, hwid);
         uart_puts(&console, " ret=");
         uart_put_hex(&console, (u64)(i64)ret);
         uart_puts(&console, "\r\n");
     }
-    smp_log_a72_snapshot("post-cpu_on", -1, -1);
-    smp_log_a72_hw_sample("post-cpu_on");
-    smp_log_a72_cluster_aff("post-cpu_on");
-    smp_log_gicr_waker_decode("post-cpu_on");
     smp_log_cci_state("post-cpu_on");
 
     // Step 2: Fill A53's L2 (1MB) with NS accesses → evict BL31's dirty secure
@@ -707,10 +722,6 @@ result_t smp_init(void) {
         smp_psci_diag[4].sev_bursts += 2;
         smp_psci_diag[5].sev_bursts += 2;
     }
-    smp_log_a72_snapshot("post-evict", -1, -1);
-    smp_log_a72_hw_sample("post-evict");
-    smp_log_a72_cluster_aff("post-evict");
-    smp_log_gicr_waker_decode("post-evict");
     smp_log_cci_state("post-evict");
 
     // Poll A72 for up to 5 seconds. While polling, periodically re-evict A53 L2
@@ -771,10 +782,6 @@ result_t smp_init(void) {
         }
         poll_rounds_big++;
         if ((poll_rounds_big & 0x1FFFFu) == 0) {
-            smp_log_a72_snapshot("poll", smp_psci_diag[4].aff_after, smp_psci_diag[5].aff_after);
-            smp_log_a72_hw_sample("poll");
-            smp_log_a72_cluster_aff("poll");
-            smp_log_gicr_waker_decode("poll");
             smp_log_cci_state("poll");
         }
         if ((poll_rounds_big & 0x3FFu) == 0) {
@@ -797,10 +804,6 @@ result_t smp_init(void) {
         smp_psci_diag[5].sev_bursts += 2;
         for (u32 y = 0; y < 100; y++) asm volatile("yield");
     }
-    smp_log_a72_snapshot("poll-end", smp_psci_diag[4].aff_after, smp_psci_diag[5].aff_after);
-    smp_log_a72_hw_sample("poll-end");
-    smp_log_a72_cluster_aff("poll-end");
-    smp_log_gicr_waker_decode("poll-end");
     smp_log_cci_state("poll-end");
 
     // Report poll results.
@@ -917,22 +920,124 @@ void smp_secondary_main(u64 core_idx) {
     if (core_idx >= SMP_MAX_CORES) {
         while (1) asm volatile("wfe");
     }
+    // Idea #3 probe: run this before publishing C-entry/ONLINE markers, so
+    // core0 cannot print SMPEN_DIAG before A72 cores had a chance to update it.
+    if (core_idx >= 4 && core_idx < 6) {
+        g_smpen_diag[core_idx] = 0xCAFE0000UL | (u64)core_idx;
+        asm volatile("dc cvac, %0" :: "r"(&g_smpen_diag[core_idx]) : "memory");
+        asm volatile("dsb sy" ::: "memory");
+        
+        register u64 x0 asm("x0") = 0xC2000099UL;
+        register u64 x1 asm("x1") = 0;
+        register u64 x2 asm("x2") = 0;
+        register u64 x3 asm("x3") = 0;
+        asm volatile("smc #0"
+                     : "+r"(x0)
+                     : "r"(x1), "r"(x2), "r"(x3)
+                     : "memory",
+                       "x4", "x5", "x6", "x7", "x8", "x9",
+                       "x10", "x11", "x12", "x13", "x14", "x15",
+                       "x16", "x17");
+        g_smpen_diag[core_idx] = x0;
+        asm volatile("dc cvac, %0" :: "r"(&g_smpen_diag[core_idx]) : "memory");
+        asm volatile("dsb sy" ::: "memory");
+    }
     smp_secondary_enter_mask |= (1u << (u32)core_idx);
     smp_trace_or(SMP_TRACE_C_ENTRY_MASK, 1ull << core_idx);
     smp_trace_or(SMP_TRACE_WQ_MASK, 1ull << core_idx);
     smp_psci_diag[core_idx].flags |= SMP_FLAG_ENTERED_C;
+    
+    // Phase 2: Initialize this core's GICv3 CPU interface for SGI reception
+    gicv3_init_cpu_iface();
+    
+    // Unmask IRQ on secondary cores — required for SGI delivery.
+    // Without this, WFI wakes but IRQ handler never executes.
+    asm volatile("msr daifclr, #2" ::: "memory");
+    asm volatile("isb");
+    // Diagnostic: record DAIF post-unmask + VBAR_EL2 + final MPIDR per core.
+    // Lets us prove from core 0 that this PE actually executed daifclr (DAIF
+    // bit 7 = I, must be 0) and has the right vector table installed.
+    extern volatile u64 gicv3_core_diag[6][8];
+    u64 daif_post, vbar_post, mpidr_post;
+    asm volatile("mrs %0, daif"      : "=r"(daif_post));
+    asm volatile("mrs %0, vbar_el2"  : "=r"(vbar_post));
+    asm volatile("mrs %0, mpidr_el1" : "=r"(mpidr_post));
+    // Encode into slot 0 already used for init_count: keep bumping init_count
+    // via separate atomic-ish add; pack daif/vbar/mpidr into slots 4..6 of a
+    // fresh diag region. Using a small dedicated array to avoid clobbering
+    // the existing GIC snapshot.
+    extern volatile u64 g_smp_pe_diag[6][8];
+    u64 hcr_post, currentel_post, isr_post, sctlr_post;
+    asm volatile("mrs %0, hcr_el2"          : "=r"(hcr_post));
+    asm volatile("mrs %0, CurrentEL"        : "=r"(currentel_post));
+    asm volatile("mrs %0, isr_el1"          : "=r"(isr_post));
+    asm volatile("mrs %0, sctlr_el2"        : "=r"(sctlr_post));
+    if (core_idx < 6) {
+        g_smp_pe_diag[core_idx][0] += 1;
+        g_smp_pe_diag[core_idx][1] = daif_post;
+        g_smp_pe_diag[core_idx][2] = vbar_post;
+        g_smp_pe_diag[core_idx][3] = mpidr_post;
+        g_smp_pe_diag[core_idx][4] = hcr_post;
+        g_smp_pe_diag[core_idx][5] = currentel_post;
+        g_smp_pe_diag[core_idx][6] = isr_post;
+        g_smp_pe_diag[core_idx][7] = sctlr_post;   // M=bit0, C=bit2, I=bit12
+        asm volatile("dc civac, %0" :: "r"(&g_smp_pe_diag[core_idx][0]) : "memory");
+        asm volatile("dsb sy" ::: "memory");
+    }
+    
     asm volatile("dmb ish" ::: "memory");
     asm volatile("dc civac, %0" :: "r"(&smp_secondary_enter_mask) : "memory");
     asm volatile("dc civac, %0" :: "r"(&smp_trace_page[SMP_TRACE_C_ENTRY_MASK]) : "memory");
     asm volatile("dc civac, %0" :: "r"(&smp_trace_page[SMP_TRACE_WQ_MASK]) : "memory");
     asm volatile("dc civac, %0" :: "r"(&smp_psci_diag[core_idx]) : "memory");
-    // Poll work queue slot for dispatched jobs; yield when idle.
+    // Poll work queue slot for dispatched jobs; wfe when idle.
+    // wq_dispatch() sends SEV to wake us when new work arrives.
+    //
+    // Phase 2: Core 4/5 (A72) enter WFI+SGI pipeline idle loop instead of
+    // WFE+workqueue when pipeline is active. SGI wakes them for hidden/output
+    // work; workqueue still works for baseline_runner_a72 dispatches.
+    extern void pipeit_worker_idle_hidden(void);
+    extern void pipeit_worker_idle_output(void);
+    extern volatile u32 g_pipeit_active;
+    
+    // Per-core trace of the smp idle loop:
+    //   [0] iterations executed (incl. WFE wakes)
+    //   [1] times we observed g_pipeit_active==1 at the gate
+    //   [2] times we entered pipeit_worker_idle_* (and returned from it)
+    //   [3] last seen g_pipeit_active value
+    extern volatile u64 g_smp_loop_diag[6][4];
+    
     volatile u64 *counter = &smp_idle_counters[core_idx];
     while (1) {
+        // Inter-cluster coherency workaround: invalidate cached copy of
+        // g_pipeit_active before each read so A72 cluster sees fresh DRAM
+        // value written by core 0. Required because A72 SMPEN cannot be
+        // enabled from EL2 on RK3399, so cluster doesn't snoop A53 writes.
+        asm volatile("dc ivac, %0" :: "r"(&g_pipeit_active) : "memory");
+        asm volatile("dsb sy" ::: "memory");
+        u32 active_now = g_pipeit_active;
+        if (core_idx < 6) {
+            g_smp_loop_diag[core_idx][0] += 1;
+            g_smp_loop_diag[core_idx][3] = (u64)active_now;
+        }
+        // Phase 2: A72 pipeline workers use WFI+SGI instead of WFE+workqueue
+        if (core_idx >= 4 && active_now) {
+            if (core_idx < 6) {
+                g_smp_loop_diag[core_idx][1] += 1;
+                g_smp_loop_diag[core_idx][2] += 1;
+            }
+            if (core_idx == 4) {
+                pipeit_worker_idle_hidden();
+            } else {
+                pipeit_worker_idle_output();
+            }
+            // Pipeline stopped — fall through to workqueue mode
+        }
+        
         wq_worker_poll((u32)core_idx);
         (*counter)++;
         asm volatile("dmb ish" ::: "memory");
-        asm volatile("yield");
+        asm volatile("wfe");  // sleep until SEV from wq_dispatch
     }
 }
 
@@ -967,6 +1072,11 @@ void smp_dump_diagnostics(uart_t *uart) {
     volatile u64 *fb = (volatile u64 *)SMP_BEACON_ADDR;
     // CRITICAL: Invalidate Core 0's stale cache lines before reading DRAM
     // written by secondary cores (which have MMU off → write directly to DRAM).
+    asm volatile("dc ivac, %0" :: "r"(&fb[0]) : "memory");
+    asm volatile("dc ivac, %0" :: "r"(&fb[1]) : "memory");
+    asm volatile("dc ivac, %0" :: "r"(&fb[2]) : "memory");
+    asm volatile("dc ivac, %0" :: "r"(&fb[3]) : "memory");
+    asm volatile("dsb sy" ::: "memory");
     for (u32 i = 0; i < SMP_MAX_CORES; i++) {
         asm volatile("dc civac, %0" :: "r"(&smp_idle_counters[i]) : "memory");
         asm volatile("dc civac, %0" :: "r"(&smp_entry_stage[i]) : "memory");

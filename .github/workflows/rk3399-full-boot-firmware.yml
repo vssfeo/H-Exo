@@ -38,6 +38,8 @@ on:
     branches: [master, main]
     paths:
       - ".github/workflows/rk3399-full-boot-firmware.yml"
+      - "docs/rk3399-full-boot-firmware.yml"
+      - "docs/rk3399-nanopi-m4-boot-firmware.md"
       - "patches/tf-a-v2.14-rk3399-pmusram-rsize-16k.patch"
 
 permissions:
@@ -139,6 +141,113 @@ jobs:
           grep -n DBG_NOPWERDWN_L0_EN "$F"
           grep -n DBG_NO_PWERDWN_B0_EN "$F"
 
+      - name: Patch RK3399 SiP H-Exo diagnostic calls
+        working-directory: ${{ runner.temp }}/tfa
+        run: |
+          cat > /tmp/h_exo_patch_sip.py <<'PY'
+          from pathlib import Path
+          import textwrap
+
+          p = Path("plat/rockchip/rk3399/plat_sip_calls.c")
+          if not p.exists():
+              raise SystemExit(f"missing {p}")
+
+          s = p.read_text()
+          marker = "H_EXO_SIP_FW_INFO"
+          if marker in s:
+              print("H-Exo SiP patch already present")
+              raise SystemExit(0)
+
+          helper = textwrap.dedent(r'''
+
+          #define RK_SIP_SMPEN_GET            U(0x82000099)
+          #define RK_SIP_SMPEN_SET            U(0x8200009A)
+          #define RK_SIP_SMPEN_GET_64         U(0xC2000099)
+          #define RK_SIP_SMPEN_SET_64         U(0xC200009A)
+          #define H_EXO_SIP_FW_INFO           U(0xC20000A0)
+          #define H_EXO_SIP_CPU_DIAG          U(0xC20000A1)
+          #define H_EXO_FW_MAGIC              0x4845584F524B3339ULL
+          #define H_EXO_FW_VERSION            0x0000000000000001ULL
+          #define A72_CPUECTLR_SMP_BIT        (1ULL << 6)
+
+          static uint64_t rk_smpen_get(void)
+          {
+          	uint64_t v;
+          	__asm__ volatile ("mrs %0, S3_1_C15_C2_1" : "=r"(v));
+          	return (v & A72_CPUECTLR_SMP_BIT) ? 1ULL : 0ULL;
+          }
+
+          static uint64_t rk_smpen_set(void)
+          {
+          	uint64_t v;
+          	__asm__ volatile ("mrs %0, S3_1_C15_C2_1" : "=r"(v));
+          	if ((v & A72_CPUECTLR_SMP_BIT) == 0ULL) {
+          		v |= A72_CPUECTLR_SMP_BIT;
+          		__asm__ volatile ("msr S3_1_C15_C2_1, %0\n\tisb" :: "r"(v));
+          	}
+          	return rk_smpen_get();
+          }
+
+          static uint64_t h_exo_read_mpidr(void)
+          {
+          	uint64_t v;
+          	__asm__ volatile ("mrs %0, mpidr_el1" : "=r"(v));
+          	return v;
+          }
+
+          static uint64_t h_exo_read_midr(void)
+          {
+          	uint64_t v;
+          	__asm__ volatile ("mrs %0, midr_el1" : "=r"(v));
+          	return v;
+          }
+
+          static uint64_t h_exo_read_currentel(void)
+          {
+          	uint64_t v;
+          	__asm__ volatile ("mrs %0, CurrentEL" : "=r"(v));
+          	return v;
+          }
+          ''')
+
+          anchor = "uint64_t sip_smc_dram("
+          if anchor in s:
+              s = s.replace(anchor, helper + "\n" + anchor, 1)
+          else:
+              include_pos = s.rfind("#include")
+              if include_pos < 0:
+                  raise SystemExit("cannot find include/helper insertion point")
+              line_end = s.find("\n", include_pos)
+              s = s[:line_end + 1] + helper + s[line_end + 1:]
+
+          cases = textwrap.dedent(r'''
+          	case RK_SIP_SMPEN_GET:
+          	case RK_SIP_SMPEN_GET_64:
+          		SMC_RET1(handle, rk_smpen_get());
+          	case RK_SIP_SMPEN_SET:
+          	case RK_SIP_SMPEN_SET_64:
+          		SMC_RET1(handle, rk_smpen_set());
+          	case H_EXO_SIP_FW_INFO:
+          		SMC_RET2(handle, H_EXO_FW_MAGIC, H_EXO_FW_VERSION);
+          	case H_EXO_SIP_CPU_DIAG:
+          		SMC_RET4(handle, h_exo_read_mpidr(), h_exo_read_midr(),
+          			 h_exo_read_currentel(), rk_smpen_get());
+          ''')
+
+          switch_anchor = "switch (smc_fid) {"
+          if switch_anchor not in s:
+              raise SystemExit("cannot find SiP switch (smc_fid)")
+          s = s.replace(switch_anchor, switch_anchor + cases, 1)
+
+          p.write_text(s)
+          print("H-Exo SiP patch applied")
+          print("---- relevant grep ----")
+          for i, line in enumerate(s.splitlines(), 1):
+              if "RK_SIP_SMPEN" in line or "H_EXO_SIP" in line or "rk_smpen_" in line:
+                  print(f"{i}: {line}")
+          PY
+          python3 /tmp/h_exo_patch_sip.py
+
       - name: Build BL31
         working-directory: ${{ runner.temp }}/tfa
         run: |
@@ -176,6 +285,141 @@ jobs:
           echo "=== After patch ==="
           cat "$DTSI"
 
+      - name: Add SYR827 + RK808 PMIC regulators to U-Boot DT
+        working-directory: ${{ runner.temp }}/u-boot
+        run: |
+          DTSI="arch/arm/dts/rk3399-nanopi4.dtsi"
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("arch/arm/dts/rk3399-nanopi4.dtsi")
+          s = p.read_text()
+          block = '''
+          &i2c0 {
+                  clock-frequency = <400000>;
+                  status = "okay";
+
+                  rk808@1b {
+                          compatible = "rockchip,rk808";
+                          reg = <0x1b>;
+                          #clock-cells = <1>;
+                          clock-output-names = "xin32k", "rk808-clkout2";
+                          interrupt-parent = <&gpio1>;
+                          interrupts = <21 8>;
+                          pinctrl-names = "default";
+                          pinctrl-0 = <&pmic_int_l>;
+                          rockchip,system-power-controller;
+                          wakeup-source;
+
+                          vdd_cpu_l: rk808-dcdc1 {
+                                  regulator-name = "vdd_cpu_l";
+                                  regulator-always-on;
+                                  regulator-boot-on;
+                                  regulator-min-microvolt = <750000>;
+                                  regulator-max-microvolt = <1350000>;
+                          };
+
+                          vcc1v8_dvp: rk808-ldo1 {
+                                  regulator-name = "vcc1v8_dvp";
+                          };
+
+                          vcc3v0_touch: rk808-ldo2 {
+                                  regulator-name = "vcc3v0_touch";
+                          };
+
+                          vcc1v8_pmupll: rk808-ldo3 {
+                                  regulator-name = "vcc1v8_pmupll";
+                          };
+
+                          vcc_sd: rk808-ldo4 {
+                                  regulator-name = "vcc_sd";
+                                  regulator-min-microvolt = <3300000>;
+                                  regulator-max-microvolt = <3300000>;
+                          };
+
+                          vcc5v0_usb: rk808-ldo5 {
+                                  regulator-name = "vcc5v0_usb";
+                          };
+
+                          vcc1v8_codec: rk808-ldo6 {
+                                  regulator-name = "vcc1v8_codec";
+                          };
+
+                          vcc_1v8: rk808-ldo7 {
+                                  regulator-name = "vcc_1v8";
+                          };
+
+                          vcc_3v0: rk808-ldo8 {
+                                  regulator-name = "vcc_3v0";
+                          };
+
+                          vcca_1v8: rk808-dcdc2 {
+                                  regulator-name = "vcca_1v8";
+                          };
+
+                          vcc_sdio: rk808-dcdc3 {
+                                  regulator-name = "vcc_sdio";
+                          };
+
+                          vcc5v0_host: rk808-dcdc4 {
+                                  regulator-name = "vcc5v0_host";
+                          };
+                  };
+
+                  vdd_cpu_b: syr827@40 {
+                          compatible = "silergy,syr827";
+                          reg = <0x40>;
+                          fcs,suspend-voltage-selector = <1>;
+                          regulator-name = "vdd_cpu_b";
+                          regulator-min-microvolt = <712500>;
+                          regulator-max-microvolt = <1500000>;
+                          regulator-always-on;
+                          regulator-boot-on;
+                  };
+          };
+          '''
+          if "silergy,syr827" not in s:
+              p.write_text(s.rstrip() + "\\n" + block)
+          PY
+          grep -n -A4 'rk808@1b' "$DTSI" || echo "WARN: rk808 node not found"
+          grep -n -A4 'syr827@40' "$DTSI"
+
+      - name: Add CPU-supply bindings + IO domains to U-Boot DT
+        working-directory: ${{ runner.temp }}/u-boot
+        run: |
+          DTS="arch/arm/dts/rk3399-nanopi4.dtsi"
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("arch/arm/dts/rk3399-nanopi4.dtsi")
+          s = p.read_text()
+          # CPU-supply bindings — tells U-Boot which regulator feeds each cluster
+          bindings = '''
+          &cpu_b0 { cpu-supply = <&vdd_cpu_b>; };
+          &cpu_b1 { cpu-supply = <&vdd_cpu_b>; };
+          &cpu_l0 { cpu-supply = <&vdd_cpu_l>; };
+          &cpu_l1 { cpu-supply = <&vdd_cpu_l>; };
+          &cpu_l2 { cpu-supply = <&vdd_cpu_l>; };
+          &cpu_l3 { cpu-supply = <&vdd_cpu_l>; };
+          '''
+          if "cpu-supply" not in s:
+              p.write_text(s.rstrip() + "\\n" + bindings)
+
+          # IO domains — required for correct I2C0 voltage levels
+          s = p.read_text()
+          iodom = '''
+          &io_domains {
+                  status = "okay";
+                  bt656-supply = <&vcc1v8_dvp>;
+                  audio-supply = <&vcc1v8_dvp>;
+                  sdmmc-supply = <&vcc_sd>;
+                  gpio1830-supply = <&vcc_3v0>;
+          };
+          '''
+          if "io_domains" not in s:
+              p.write_text(s.rstrip() + "\\n" + iodom)
+          PY
+          grep -n 'cpu-supply' "$DTS" || echo "WARN: cpu-supply not found"
+          grep -n 'io_domains' "$DTS" || echo "WARN: io_domains not found"
+
       - name: Build U-Boot with SPL+TPL for NanoPi M4
         working-directory: ${{ runner.temp }}/u-boot
         run: |
@@ -183,7 +427,39 @@ jobs:
           # Disable SPL FIT hash verification — binman split-elf creates
           # atf-3 (PMUSRAM seg) with mismatched sha256. Safe for dev boards.
           scripts/config --disable SPL_FIT_SIGNATURE
+          # I2C + regulator commands (SYR827 VDD_CPU_B for A72)
+          scripts/config --enable CMD_I2C
+          scripts/config --enable CMD_REGULATOR
+          scripts/config --enable DM_REGULATOR
+          scripts/config --enable DM_PMIC_FAN53555
+          scripts/config --enable DM_REGULATOR_FAN53555
+          # RK808 PMIC driver (VDD_CPU_L for A53 cluster) — already in defconfig
+          # but ensure regulator commands can reach it
+          scripts/config --enable DM_PMIC_RK8XX
+          scripts/config --enable DM_REGULATOR_RK8XX
+          # CMD_CLK — allows setting CPU frequencies from U-Boot before kernel
+          scripts/config --enable CMD_CLK
+          # Deep network/bring-up diagnostics and service functions
+          scripts/config --enable CMD_MII
+          scripts/config --enable CMD_MDIO
+          scripts/config --enable PHY_GIGE
+          scripts/config --enable CMD_PCAP
+          scripts/config --enable NETCONSOLE
+          scripts/config --enable CMD_SNTP
+          scripts/config --enable BOOTP_NTPSERVER
+          scripts/config --enable CMD_TFTPPUT
+          scripts/config --enable CMD_TFTPSRV
+          scripts/config --enable NET_TFTP_VARS
+          scripts/config --set-val TFTP_WINDOWSIZE 16
+          scripts/config --enable CMD_WDT
+          scripts/config --enable CMD_CONFIG
+          # PREBOOT: raise BOTH voltages before kernel starts
+          #   VDD_CPU_B = 1.2V  → A72 stable at 1608 MHz
+          #   VDD_CPU_L = 1.0V  → A53 stable at 1200 MHz (was stuck at 504 MHz)
+          scripts/config --enable USE_PREBOOT
+          scripts/config --set-str PREBOOT 'regulator dev vdd_cpu_b; regulator value 1200000 -f; regulator dev vdd_cpu_l; regulator value 1000000 -f'
           make olddefconfig
+          grep -E 'CONFIG_(CMD_I2C|CMD_REGULATOR|DM_REGULATOR|DM_PMIC_FAN53555|DM_REGULATOR_FAN53555|DM_PMIC_RK8XX|DM_REGULATOR_RK8XX|CMD_CLK|CMD_MII|CMD_MDIO|PHY_GIGE|CMD_PCAP|NETCONSOLE|CMD_SNTP|BOOTP_NTPSERVER|CMD_TFTPPUT|CMD_TFTPSRV|NET_TFTP_VARS|CMD_WDT|CMD_CONFIG|PREBOOT)' .config
           make -j"$(nproc)" \
             CROSS_COMPILE=aarch64-linux-gnu- \
             BL31="${{ runner.temp }}/bl31.elf"
@@ -218,6 +494,18 @@ jobs:
             echo ""
             echo "Boot flow: BootROM → TPL (DDR) → SPL → BL31 → U-Boot"
             echo "NO miniloader/Boot1 — pure mainline SPL+TPL"
+            echo ""
+            echo "PREBOOT (voltage scaling before kernel):"
+            echo "  VDD_CPU_B (SYR827) = 1.2V  → A72 @ 1608 MHz"
+            echo "  VDD_CPU_L (RK808)  = 1.0V  → A53 @ 1200 MHz"
+            echo ""
+            echo "Advanced bring-up features enabled:"
+            echo "  - PHY debug: mii/mdio + PHY_GIGE"
+            echo "  - Network forensics: pcap capture + netconsole"
+            echo "  - Time sync baseline: sntp + DHCP NTP option"
+            echo "  - TFTP advanced: tftpput, tftpsrv, window-size=16"
+            echo "  - Safety/diagnostics: watchdog cmd + config dump"
+            echo "  - PTP note: no dedicated U-Boot PTP command on RK3399 GMAC"
             echo ""
             echo "Files:"
             echo "  idbloader.img  — TPL+SPL, flash at LBA 0x40 (sector 64)"
