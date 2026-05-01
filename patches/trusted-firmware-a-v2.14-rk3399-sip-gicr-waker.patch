@@ -1,0 +1,144 @@
+Add Rockchip SiP diagnostics for RK3399 GICR_WAKER and secure wake retry.
+
+Background
+==========
+On some RK3399 boards, Cortex-A72 redistributors can remain in
+GICR_WAKER.ChildrenAsleep=1 from the non-secure perspective, which blocks
+reliable SGI delivery to cores 4/5. Non-secure retries may fail if ownership
+or sequencing constraints are enforced by EL3/secure firmware.
+
+This patch adds two SiP SMC interfaces in plat_sip_calls.c so EL2/EL1 can:
+  1) read secure-world view of per-core GICR_WAKER, and
+  2) request a secure-side two-phase wake handshake.
+
+New IDs
+=======
+  RK_SIP_GICR_WAKER_GET      0x820000A2
+  RK_SIP_GICR_WAKE_TRY       0x820000A3
+  RK_SIP_GICR_WAKER_GET_64   0xC20000A2
+  RK_SIP_GICR_WAKE_TRY_64    0xC20000A3
+
+Return contract
+===============
+GET:
+  x0 = status (0 ok, 1 bad core)
+  x1 = raw GICR_WAKER
+
+WAKE_TRY:
+  x0 = status flags (bit0 bad core, bit1 timeout, bit2 PS write ignored)
+  x1 = GICR_WAKER before
+  x2 = GICR_WAKER after
+
+Apply from TF-A root (v2.14.x), file:
+  plat/rockchip/rk3399/plat_sip_calls.c
+
+--- a/plat/rockchip/rk3399/plat_sip_calls.c
++++ b/plat/rockchip/rk3399/plat_sip_calls.c
+@@
++#define RK_SIP_GICR_WAKER_GET      U(0x820000A2)
++#define RK_SIP_GICR_WAKE_TRY       U(0x820000A3)
++#define RK_SIP_GICR_WAKER_GET_64   U(0xC20000A2)
++#define RK_SIP_GICR_WAKE_TRY_64    U(0xC20000A3)
++
++#define RK3399_GICR_BASE_PHYS      ULL(0xFEF00000)
++#define RK3399_GICR_STRIDE         ULL(0x20000)
++#define RK3399_GICR_WAKER_OFF      ULL(0x14)
++#define RK3399_CORE_COUNT          U(6)
++#define RK_GICR_WAKER_PS           U(2)   /* bit 1: ProcessorSleep */
++#define RK_GICR_WAKER_CA           U(4)   /* bit 2: ChildrenAsleep */
++
++#define RK_GICR_WAKE_OK            U(0)
++#define RK_GICR_WAKE_ERR_CORE      U(1)
++#define RK_GICR_WAKE_ERR_TIMEOUT   U(2)
++#define RK_GICR_WAKE_ERR_WRITE_IGN U(4)
++
++static uintptr_t rk3399_gicr_waker_addr(uint64_t core)
++{
++	if (core >= RK3399_CORE_COUNT)
++		return (uintptr_t)0;
++
++	return (uintptr_t)(RK3399_GICR_BASE_PHYS +
++			(core * RK3399_GICR_STRIDE) +
++			RK3399_GICR_WAKER_OFF);
++}
++
++static uint32_t rk3399_gicr_waker_read(uint64_t core, uint32_t *status)
++{
++	uintptr_t a = rk3399_gicr_waker_addr(core);
++
++	if (a == 0U) {
++		if (status != NULL)
++			*status = RK_GICR_WAKE_ERR_CORE;
++		return 0U;
++	}
++
++	if (status != NULL)
++		*status = RK_GICR_WAKE_OK;
++	return *((volatile uint32_t *)a);
++}
++
++static uint64_t rk3399_gicr_wake_try(uint64_t core, uint32_t *before,
++					      uint32_t *after)
++{
++	uintptr_t a = rk3399_gicr_waker_addr(core);
++	uint32_t v, vr, st = RK_GICR_WAKE_OK;
++	int i;
++
++	if (a == 0U) {
++		if (before != NULL)
++			*before = 0U;
++		if (after != NULL)
++			*after = 0U;
++		return RK_GICR_WAKE_ERR_CORE;
++	}
++
++	v = *((volatile uint32_t *)a);
++	if (before != NULL)
++		*before = v;
++
++	v |= RK_GICR_WAKER_PS;
++	*((volatile uint32_t *)a) = v;
++	vr = *((volatile uint32_t *)a);
++	if ((vr & RK_GICR_WAKER_PS) == 0U)
++		st |= RK_GICR_WAKE_ERR_WRITE_IGN;
++
++	for (i = 0; i < 10000; i++) {
++		vr = *((volatile uint32_t *)a);
++		if ((vr & RK_GICR_WAKER_CA) != 0U)
++			break;
++	}
++	if (i == 10000)
++		st |= RK_GICR_WAKE_ERR_TIMEOUT;
++
++	v = vr & ~RK_GICR_WAKER_PS;
++	*((volatile uint32_t *)a) = v;
++	vr = *((volatile uint32_t *)a);
++	if ((vr & RK_GICR_WAKER_PS) != 0U)
++		st |= RK_GICR_WAKE_ERR_WRITE_IGN;
++
++	for (i = 0; i < 10000; i++) {
++		vr = *((volatile uint32_t *)a);
++		if ((vr & RK_GICR_WAKER_CA) == 0U)
++			break;
++	}
++	if (i == 10000)
++		st |= RK_GICR_WAKE_ERR_TIMEOUT;
++
++	if (after != NULL)
++		*after = vr;
++	return st;
++}
+@@
++	case RK_SIP_GICR_WAKER_GET:
++	case RK_SIP_GICR_WAKER_GET_64: {
++		uint32_t st;
++		uint32_t w = rk3399_gicr_waker_read(x1, &st);
++		SMC_RET2(handle, st, w);
++	}
++
++	case RK_SIP_GICR_WAKE_TRY:
++	case RK_SIP_GICR_WAKE_TRY_64: {
++		uint32_t b = 0U, a = 0U;
++		uint64_t st = rk3399_gicr_wake_try(x1, &b, &a);
++		SMC_RET3(handle, st, b, a);
++	}
