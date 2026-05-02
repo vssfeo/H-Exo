@@ -421,11 +421,6 @@ jobs:
             ERRATA_A53_855873=1 \
             ERRATA_A53_1530924=1 \
             WARMBOOT_ENABLE_DCACHE_EARLY=1 \
-            ENABLE_PMF=1 \
-            ENABLE_PSCI_STAT=1 \
-            ENABLE_RUNTIME_INSTRUMENTATION=1 \
-            CRASH_REPORTING=1 \
-            HANDLE_EA_EL3_FIRST_NS=1 \
             RK3399_BAUDRATE=1500000 \
             bl31
           BL31=$(find build -path '*/bl31/bl31.elf' -type f | head -1)
