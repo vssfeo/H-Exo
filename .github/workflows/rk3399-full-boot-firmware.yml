@@ -406,6 +406,105 @@ jobs:
           PY
           python3 /tmp/h_exo_patch_gicr_sip.py
 
+      - name: Patch TF-A RK3399 A72 GICR wake in on_finish
+        working-directory: ${{ runner.temp }}/tfa
+        run: |
+          cat > /tmp/h_exo_patch_pmu_a72_gicr.py <<'PY'
+          from pathlib import Path
+          import textwrap
+
+          p = Path("plat/rockchip/rk3399/drivers/pmu/pmu.c")
+          if not p.exists():
+              raise SystemExit(f"missing {p}")
+
+          s = p.read_text()
+          marker = "h_exo_a72_gicr_wake"
+          if marker in s:
+              print("A72 GICR on_finish patch already present")
+              raise SystemExit(0)
+
+          helper = textwrap.dedent(r'''
+
+          #define H_EXO_RK3399_GICR_BASE      U(0xFEF00000)
+          #define H_EXO_RK3399_GICR_STRIDE    U(0x20000)
+          #define H_EXO_RK3399_GICR_WAKER_OFF U(0x14)
+          #define H_EXO_GICR_WAKER_PS         BIT(1)
+          #define H_EXO_GICR_WAKER_CA         BIT(2)
+
+          static void h_exo_a72_gicr_wake(uint32_t cpu_id)
+          {
+          	uintptr_t gicr_waker;
+          	uint32_t v;
+          	int i;
+
+          	if ((cpu_id != 4U) && (cpu_id != 5U)) {
+          		return;
+          	}
+
+          	gicr_waker = H_EXO_RK3399_GICR_BASE +
+          		(cpu_id * H_EXO_RK3399_GICR_STRIDE) +
+          		H_EXO_RK3399_GICR_WAKER_OFF;
+
+          	v = mmio_read_32(gicr_waker);
+          	if ((v & H_EXO_GICR_WAKER_PS) == 0U) {
+          		mmio_write_32(gicr_waker, v | H_EXO_GICR_WAKER_PS);
+          		dsb();
+          		for (i = 0; i < 20000; i++) {
+          			if ((mmio_read_32(gicr_waker) & H_EXO_GICR_WAKER_CA) != 0U) {
+          				break;
+          			}
+          		}
+          	}
+
+          	v = mmio_read_32(gicr_waker);
+          	mmio_write_32(gicr_waker, v & ~H_EXO_GICR_WAKER_PS);
+          	dsb();
+          	for (i = 0; i < 20000; i++) {
+          		if ((mmio_read_32(gicr_waker) & H_EXO_GICR_WAKER_CA) == 0U) {
+          			break;
+          		}
+          	}
+          	isb();
+          }
+          ''')
+
+          anchor = "int rockchip_soc_cores_pwr_dm_on_finish(void)"
+          if anchor not in s:
+              raise SystemExit("cannot find rockchip_soc_cores_pwr_dm_on_finish")
+          s = s.replace(anchor, helper + "\n" + anchor, 1)
+
+          old = textwrap.dedent(r'''
+          int rockchip_soc_cores_pwr_dm_on_finish(void)
+          {
+          	uint32_t cpu_id = plat_my_core_pos();
+
+          	mmio_write_32(PMU_BASE + PMU_CORE_PM_CON(cpu_id),
+          		      CORES_PM_DISABLE);
+          	return PSCI_E_SUCCESS;
+          }
+          ''')
+
+          new = textwrap.dedent(r'''
+          int rockchip_soc_cores_pwr_dm_on_finish(void)
+          {
+          	uint32_t cpu_id = plat_my_core_pos();
+
+          	mmio_write_32(PMU_BASE + PMU_CORE_PM_CON(cpu_id),
+          		      CORES_PM_DISABLE);
+          	h_exo_a72_gicr_wake(cpu_id);
+          	return PSCI_E_SUCCESS;
+          }
+          ''')
+
+          if old not in s:
+              raise SystemExit("on_finish body not matched")
+          s = s.replace(old, new, 1)
+
+          p.write_text(s)
+          print("A72 GICR on_finish patch applied")
+          PY
+          python3 /tmp/h_exo_patch_pmu_a72_gicr.py
+
       - name: Build BL31
         working-directory: ${{ runner.temp }}/tfa
         run: |
