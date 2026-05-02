@@ -625,11 +625,6 @@ jobs:
           scripts/config --set-val TFTP_WINDOWSIZE 16
           scripts/config --enable CMD_WDT
           scripts/config --enable CMD_CONFIG
-          # PREBOOT: raise BOTH voltages before kernel starts
-          #   VDD_CPU_B = 1.2V  → A72 stable at 1608 MHz
-          #   VDD_CPU_L = 1.0V  → A53 stable at 1200 MHz (was stuck at 504 MHz)
-          scripts/config --enable USE_PREBOOT
-          scripts/config --set-str PREBOOT 'regulator dev vdd_cpu_b; regulator value 1200000 -f; regulator dev vdd_cpu_l; regulator value 1000000 -f'
           make olddefconfig
           grep -E 'CONFIG_(CMD_I2C|CMD_REGULATOR|DM_REGULATOR|DM_PMIC_FAN53555|DM_REGULATOR_FAN53555|DM_PMIC_RK8XX|DM_REGULATOR_RK8XX|CMD_CLK|CMD_MII|CMD_MDIO|PHY_GIGE|CMD_PCAP|NETCONSOLE|CMD_SNTP|BOOTP_NTPSERVER|CMD_TFTPPUT|CMD_TFTPSRV|NET_TFTP_VARS|CMD_WDT|CMD_CONFIG|PREBOOT)' .config
           make -j"$(nproc)" \
