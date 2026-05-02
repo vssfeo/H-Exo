@@ -302,26 +302,8 @@ jobs:
           		*before = v;
           	}
 
-          	/* Phase A: force ProcessorSleep=1 and wait for ChildrenAsleep=1 */
-          	v |= RK_GICR_WAKER_PS;
-          	*((volatile uint32_t *)a) = v;
-          	vr = *((volatile uint32_t *)a);
-          	if ((vr & RK_GICR_WAKER_PS) == 0U) {
-          		st |= RK_GICR_WAKE_ERR_WRITE_IGN;
-          	}
-
-          	for (i = 0; i < 10000; i++) {
-          		vr = *((volatile uint32_t *)a);
-          		if ((vr & RK_GICR_WAKER_CA) != 0U) {
-          			break;
-          		}
-          	}
-          	if (i == 10000) {
-          		st |= RK_GICR_WAKE_ERR_TIMEOUT;
-          	}
-
-          	/* Phase B: clear ProcessorSleep and wait for ChildrenAsleep=0 */
-          	v = vr & ~RK_GICR_WAKER_PS;
+            /* Active-PE safe wake: do not force PS=1 on a running CPU. */
+            v &= ~RK_GICR_WAKER_PS;
           	*((volatile uint32_t *)a) = v;
           	vr = *((volatile uint32_t *)a);
           	if ((vr & RK_GICR_WAKER_PS) != 0U) {
@@ -575,16 +557,20 @@ jobs:
           scripts/config --enable DM_REGULATOR_RK8XX
           # CMD_CLK — allows setting CPU frequencies from U-Boot before kernel
           scripts/config --enable CMD_CLK
-          # Deep network/bring-up diagnostics and service functions
+          # Board bring-up essentials: keep TFTP boot path and PHY inspection,
+          # but avoid extra network services/noise in the golden bootloader.
+          scripts/config --enable CMD_NET
+          scripts/config --enable CMD_TFTPBOOT
+          scripts/config --enable CMD_PING
           scripts/config --enable CMD_MII
           scripts/config --enable CMD_MDIO
           scripts/config --enable PHY_GIGE
-          scripts/config --enable CMD_PCAP
-          scripts/config --enable NETCONSOLE
-          scripts/config --enable CMD_SNTP
-          scripts/config --enable BOOTP_NTPSERVER
-          scripts/config --enable CMD_TFTPPUT
-          scripts/config --enable CMD_TFTPSRV
+          scripts/config --disable CMD_PCAP
+          scripts/config --disable NETCONSOLE
+          scripts/config --disable CMD_SNTP
+          scripts/config --disable BOOTP_NTPSERVER
+          scripts/config --disable CMD_TFTPPUT
+          scripts/config --disable CMD_TFTPSRV
           scripts/config --enable NET_TFTP_VARS
           scripts/config --set-val TFTP_WINDOWSIZE 16
           scripts/config --enable CMD_WDT
@@ -595,7 +581,7 @@ jobs:
           scripts/config --enable USE_PREBOOT
           scripts/config --set-str PREBOOT 'regulator dev vdd_cpu_b; regulator value 1200000 -f; regulator dev vdd_cpu_l; regulator value 1000000 -f'
           make olddefconfig
-          grep -E 'CONFIG_(CMD_I2C|CMD_REGULATOR|DM_REGULATOR|DM_PMIC_FAN53555|DM_REGULATOR_FAN53555|DM_PMIC_RK8XX|DM_REGULATOR_RK8XX|CMD_CLK|CMD_MII|CMD_MDIO|PHY_GIGE|CMD_PCAP|NETCONSOLE|CMD_SNTP|BOOTP_NTPSERVER|CMD_TFTPPUT|CMD_TFTPSRV|NET_TFTP_VARS|CMD_WDT|CMD_CONFIG|PREBOOT)' .config
+          grep -E 'CONFIG_(CMD_I2C|CMD_REGULATOR|DM_REGULATOR|DM_PMIC_FAN53555|DM_REGULATOR_FAN53555|DM_PMIC_RK8XX|DM_REGULATOR_RK8XX|CMD_CLK|CMD_NET|CMD_TFTPBOOT|CMD_PING|CMD_MII|CMD_MDIO|PHY_GIGE|CMD_PCAP|NETCONSOLE|CMD_SNTP|BOOTP_NTPSERVER|CMD_TFTPPUT|CMD_TFTPSRV|NET_TFTP_VARS|CMD_WDT|CMD_CONFIG|PREBOOT)' .config
           make -j"$(nproc)" \
             CROSS_COMPILE=aarch64-linux-gnu- \
             BL31="${{ runner.temp }}/bl31.elf"
@@ -635,13 +621,10 @@ jobs:
             echo "  VDD_CPU_B (SYR827) = 1.2V  → A72 @ 1608 MHz"
             echo "  VDD_CPU_L (RK808)  = 1.0V  → A53 @ 1200 MHz"
             echo ""
-            echo "Advanced bring-up features enabled:"
-            echo "  - PHY debug: mii/mdio + PHY_GIGE"
-            echo "  - Network forensics: pcap capture + netconsole"
-            echo "  - Time sync baseline: sntp + DHCP NTP option"
-            echo "  - TFTP advanced: tftpput, tftpsrv, window-size=16"
-            echo "  - Safety/diagnostics: watchdog cmd + config dump"
-            echo "  - PTP note: no dedicated U-Boot PTP command on RK3399 GMAC"
+            echo "Golden bootloader feature policy:"
+            echo "  - Enabled: TFTP boot path, ping, mii/mdio PHY inspection, watchdog cmd, config dump"
+            echo "  - Disabled: netconsole, pcap, SNTP, tftpput/tftpsrv and other background/noisy network services"
+            echo "  - TF-A owns PMU/ADB400/CCI sequencing; H-Exo patch only clears A72 GICR_WAKER.PS after stock on_finish"
             echo ""
             echo "Files:"
             echo "  idbloader.img  — TPL+SPL, flash at LBA 0x40 (sector 64)"

@@ -324,26 +324,8 @@ jobs:
           		*before = v;
           	}
 
-          	/* Phase A: force ProcessorSleep=1 and wait for ChildrenAsleep=1 */
-          	v |= RK_GICR_WAKER_PS;
-          	*((volatile uint32_t *)a) = v;
-          	vr = *((volatile uint32_t *)a);
-          	if ((vr & RK_GICR_WAKER_PS) == 0U) {
-          		st |= RK_GICR_WAKE_ERR_WRITE_IGN;
-          	}
-
-          	for (i = 0; i < 10000; i++) {
-          		vr = *((volatile uint32_t *)a);
-          		if ((vr & RK_GICR_WAKER_CA) != 0U) {
-          			break;
-          		}
-          	}
-          	if (i == 10000) {
-          		st |= RK_GICR_WAKE_ERR_TIMEOUT;
-          	}
-
-          	/* Phase B: clear ProcessorSleep and wait for ChildrenAsleep=0 */
-          	v = vr & ~RK_GICR_WAKER_PS;
+            /* Active-PE safe wake: do not force PS=1 on a running CPU. */
+            v &= ~RK_GICR_WAKER_PS;
           	*((volatile uint32_t *)a) = v;
           	vr = *((volatile uint32_t *)a);
           	if ((vr & RK_GICR_WAKER_PS) != 0U) {
@@ -418,164 +400,51 @@ jobs:
               raise SystemExit(f"missing {p}")
 
           s = p.read_text()
-          marker = "h_exo_a72_gicr_wake"
+          marker = "h_exo_a72_gicr_on_finish"
           if marker in s:
               print("A72 GICR on_finish patch already present")
               raise SystemExit(0)
 
           helper = textwrap.dedent(r'''
 
-          /* H-Exo deterministic A72 bring-up: PMU→CRU→CCI→GIC with per-level diagnostics */
+          /*
+           * H-Exo RK3399 A72 GICR fix.
+           *
+           * Keep TF-A's stock PMU/ADB400/CCI sequencing authoritative. Do not
+           * write PMU/CRU/CCI here: those register layouts and ordering are
+           * SoC/firmware-owned, and non-standard writes can wedge CHANGE_PENDING
+           * or create board-specific side effects. This hook runs after the
+           * stock per-core on_finish has disabled core PM.
+           *
+           * The only operation here is the architectural GICR_WAKER active-PE
+           * wake: clear ProcessorSleep and wait for ChildrenAsleep to drop.
+           */
           #define H_EXO_RK3399_GICR_BASE      U(0xFEF00000)
           #define H_EXO_RK3399_GICR_STRIDE    U(0x20000)
           #define H_EXO_RK3399_GICR_WAKER_OFF U(0x14)
           #define H_EXO_GICR_WAKER_PS         BIT(1)
           #define H_EXO_GICR_WAKER_CA         BIT(2)
 
-          /* PMU power domain registers */
-          #define H_EXO_PMU_BASE              U(0xFF310000)
-          #define H_EXO_PMU_PWRDN_CON         U(0x14)
-          #define H_EXO_PMU_PWRDN_ST          U(0x18)
-          #define H_EXO_PMU_BIG_CLUSTER_BIT   BIT(2)
-
-          /* CRU reset/clock registers (A72 cluster) */
-          #define H_EXO_CRU_BASE              U(0xFF760000)
-          #define H_EXO_CRU_SOFTRST_CON(i)    (U(0x400) + (i) * U(4))
-          #define H_EXO_CRU_GATE_CON(i)       (U(0x300) + (i) * U(4))
-          #define H_EXO_CRU_RST_MASK          (U(0x1) << U(16))
-          #define H_EXO_CRU_CLK_MASK          (U(0x1) << U(16))
-
-          /* CCI-400 registers */
-          #define H_EXO_CCI_BASE              U(0xFFB00000)
-          #define H_EXO_CCI_SIF1_CTRL         U(0x1000)  /* Cluster 1 (A72) slave interface */
-          #define H_EXO_CSI_SNOOP_EN          BIT(0)
-          #define H_EXO_CSI_DVM_EN            BIT(1)
-          #define H_EXO_CCI_STATUS            U(0x000C)
-          #define H_EXO_CSI_PENDING           BIT(0)
-
-          /* Diagnostic telemetry array: [cpu_id][stage] = status */
-          /* Stages: 0=PMU_CON, 1=PMU_ST, 2=CRU_RST, 3=CRU_CLK, 4=CCI_CTRL, 5=CCI_STAT, 6=GICR_PRE, 7=GICR_POST */
-          static volatile uint32_t h_exo_a72_diag[6][8];
-
-          static void h_exo_a72_bringup(uint32_t cpu_id)
+          static void h_exo_a72_gicr_on_finish(uint32_t cpu_id)
           {
           	if ((cpu_id != 4U) && (cpu_id != 5U)) {
           		return;
           	}
 
-          	const uint32_t idx = cpu_id - 4U; /* 0 or 1 for A72 cores */
-
-          	/* ── Stage 1: PMU Power Domain Check ───────────────────────────── */
-          	volatile uint32_t pmu_con = mmio_read_32(H_EXO_PMU_BASE + H_EXO_PMU_PWRDN_CON);
-          	volatile uint32_t pmu_st  = mmio_read_32(H_EXO_PMU_BASE + H_EXO_PMU_PWRDN_ST);
-          	h_exo_a72_diag[idx][0] = pmu_con;
-          	h_exo_a72_diag[idx][1] = pmu_st;
-
-          	/* If big cluster is powered down (bit=1), attempt to power it up */
-          	if ((pmu_con & H_EXO_PMU_BIG_CLUSTER_BIT) != 0U) {
-          		/* Clear the power down bit (write 1 to bit with mask) */
-          		mmio_write_32(H_EXO_PMU_BASE + H_EXO_PMU_PWRDN_CON,
-          			pmu_con & ~H_EXO_PMU_BIG_CLUSTER_BIT);
-          		dsb();
-          		/* Poll for power up (bit clears in status) */
-          		for (volatile int i = 0; i < 100000; i++) {
-          			pmu_st = mmio_read_32(H_EXO_PMU_BASE + H_EXO_PMU_PWRDN_ST);
-          			if ((pmu_st & H_EXO_PMU_BIG_CLUSTER_BIT) == 0U)
-          				break;
-          		}
-          		h_exo_a72_diag[idx][1] = pmu_st;
-          	}
-
-          	/* ── Stage 2: CRU Reset Release ─────────────────────────────────── */
-          	volatile uint32_t cru_rst = mmio_read_32(H_EXO_CRU_BASE + H_EXO_CRU_SOFTRST_CON(12));
-          	h_exo_a72_diag[idx][2] = cru_rst;
-          	/* Release A72 core resets if held (bit 0 for core 4, bit 1 for core 5) */
-          	uint32_t core_rst_mask = (cpu_id == 4U) ? BIT(0) : BIT(1);
-          	if ((cru_rst & core_rst_mask) != 0U) {
-          		/* Write with mask: bit 16+N = mask for bit N */
-          		mmio_write_32(H_EXO_CRU_BASE + H_EXO_CRU_SOFTRST_CON(12),
-          			core_rst_mask | (core_rst_mask << 16));
-          		dsb();
-          		/* Poll for release */
-          		for (volatile int i = 0; i < 100000; i++) {
-          			cru_rst = mmio_read_32(H_EXO_CRU_BASE + H_EXO_CRU_SOFTRST_CON(12));
-          			if ((cru_rst & core_rst_mask) == 0U)
-          				break;
-          		}
-          		h_exo_a72_diag[idx][2] = cru_rst;
-          	}
-
-          	/* ── Stage 3: CRU Clock Enable ────────────────────────────────── */
-          	volatile uint32_t cru_clk = mmio_read_32(H_EXO_CRU_BASE + H_EXO_CRU_GATE_CON(12));
-          	h_exo_a72_diag[idx][3] = cru_clk;
-          	uint32_t core_clk_mask = (cpu_id == 4U) ? BIT(0) : BIT(1);
-          	if ((cru_clk & core_clk_mask) != 0U) {
-          		/* Enable clock: write 0 to bit with mask */
-          		mmio_write_32(H_EXO_CRU_BASE + H_EXO_CRU_GATE_CON(12),
-          			(core_clk_mask << 16));
-          		dsb();
-          		for (volatile int i = 0; i < 100000; i++) {
-          			cru_clk = mmio_read_32(H_EXO_CRU_BASE + H_EXO_CRU_GATE_CON(12));
-          			if ((cru_clk & core_clk_mask) == 0U)
-          				break;
-          		}
-          		h_exo_a72_diag[idx][3] = cru_clk;
-          	}
-
-          	/* ── Stage 4: CCI-400 Snoop/DVM Enable ────────────────────────── */
-          	volatile uint32_t cci_ctrl = mmio_read_32(H_EXO_CCI_BASE + H_EXO_CCI_SIF1_CTRL);
-          	h_exo_a72_diag[idx][4] = cci_ctrl;
-          	/* Enable snoop and DVM if not already enabled */
-          	if ((cci_ctrl & (H_EXO_CSI_SNOOP_EN | H_EXO_CSI_DVM_EN)) !=
-          	    (H_EXO_CSI_SNOOP_EN | H_EXO_CSI_DVM_EN)) {
-          		mmio_write_32(H_EXO_CCI_BASE + H_EXO_CCI_SIF1_CTRL,
-          			cci_ctrl | H_EXO_CSI_SNOOP_EN | H_EXO_CSI_DVM_EN);
-          		dsb();
-          		/* Wait for CHANGE_PENDING to clear */
-          		volatile uint32_t cci_stat;
-          		for (volatile int i = 0; i < 100000; i++) {
-          			cci_stat = mmio_read_32(H_EXO_CCI_BASE + H_EXO_CCI_STATUS);
-          			if ((cci_stat & H_EXO_CSI_PENDING) == 0U)
-          				break;
-          		}
-          		h_exo_a72_diag[idx][5] = mmio_read_32(H_EXO_CCI_BASE + H_EXO_CCI_STATUS);
-          	} else {
-          		h_exo_a72_diag[idx][5] = U(0xDEADBEEF); /* Already enabled, no wait needed */
-          	}
-
-          	/* ── Stage 5: GIC Redistributor Wake Handshake ───────────────── */
           	uintptr_t gicr_waker = H_EXO_RK3399_GICR_BASE +
           		(cpu_id * H_EXO_RK3399_GICR_STRIDE) +
           		H_EXO_RK3399_GICR_WAKER_OFF;
 
-          	volatile uint32_t waker_pre = mmio_read_32(gicr_waker);
-          	h_exo_a72_diag[idx][6] = waker_pre;
-
-          	/* Phase A: Set PS=1, wait for CA=1 (if not already) */
-          	if ((waker_pre & H_EXO_GICR_WAKER_PS) == 0U) {
-          		mmio_write_32(gicr_waker, waker_pre | H_EXO_GICR_WAKER_PS);
-          		dsb();
-          		volatile uint32_t waker_tmp;
-          		for (volatile int i = 0; i < 20000; i++) {
-          			waker_tmp = mmio_read_32(gicr_waker);
-          			if ((waker_tmp & H_EXO_GICR_WAKER_CA) != 0U)
-          				break;
-          		}
-          	}
-
-          	/* Phase B: Clear PS=0, wait for CA=0 */
-          	volatile uint32_t waker_mid = mmio_read_32(gicr_waker);
-          	mmio_write_32(gicr_waker, waker_mid & ~H_EXO_GICR_WAKER_PS);
+            uint32_t waker = mmio_read_32(gicr_waker);
+            mmio_write_32(gicr_waker, waker & ~H_EXO_GICR_WAKER_PS);
           	dsb();
-          	volatile uint32_t waker_post;
-          	for (volatile int i = 0; i < 20000; i++) {
-          		waker_post = mmio_read_32(gicr_waker);
-          		if ((waker_post & H_EXO_GICR_WAKER_CA) == 0U)
-          			break;
-          	}
+            for (volatile int i = 0; i < 100000; i++) {
+                waker = mmio_read_32(gicr_waker);
+                if ((waker & H_EXO_GICR_WAKER_CA) == 0U) {
+                    break;
+                }
+            }
           	isb();
-
-          	h_exo_a72_diag[idx][7] = waker_post;
           }
           ''')
 
@@ -602,7 +471,7 @@ jobs:
 
           	mmio_write_32(PMU_BASE + PMU_CORE_PM_CON(cpu_id),
           		      CORES_PM_DISABLE);
-          	h_exo_a72_bringup(cpu_id);
+            h_exo_a72_gicr_on_finish(cpu_id);
           	return PSCI_E_SUCCESS;
           }
           ''')
@@ -821,22 +690,26 @@ jobs:
           scripts/config --enable DM_REGULATOR_RK8XX
           # CMD_CLK — allows setting CPU frequencies from U-Boot before kernel
           scripts/config --enable CMD_CLK
-          # Deep network/bring-up diagnostics and service functions
+          # Board bring-up essentials: keep TFTP boot path and PHY inspection,
+          # but avoid extra network services/noise in the golden bootloader.
+          scripts/config --enable CMD_NET
+          scripts/config --enable CMD_TFTPBOOT
+          scripts/config --enable CMD_PING
           scripts/config --enable CMD_MII
           scripts/config --enable CMD_MDIO
           scripts/config --enable PHY_GIGE
-          scripts/config --enable CMD_PCAP
-          scripts/config --enable NETCONSOLE
-          scripts/config --enable CMD_SNTP
-          scripts/config --enable BOOTP_NTPSERVER
-          scripts/config --enable CMD_TFTPPUT
-          scripts/config --enable CMD_TFTPSRV
+          scripts/config --disable CMD_PCAP
+          scripts/config --disable NETCONSOLE
+          scripts/config --disable CMD_SNTP
+          scripts/config --disable BOOTP_NTPSERVER
+          scripts/config --disable CMD_TFTPPUT
+          scripts/config --disable CMD_TFTPSRV
           scripts/config --enable NET_TFTP_VARS
           scripts/config --set-val TFTP_WINDOWSIZE 16
           scripts/config --enable CMD_WDT
           scripts/config --enable CMD_CONFIG
           make olddefconfig
-          grep -E 'CONFIG_(CMD_I2C|CMD_REGULATOR|DM_REGULATOR|DM_PMIC_FAN53555|DM_REGULATOR_FAN53555|DM_PMIC_RK8XX|DM_REGULATOR_RK8XX|CMD_CLK|CMD_MII|CMD_MDIO|PHY_GIGE|CMD_PCAP|NETCONSOLE|CMD_SNTP|BOOTP_NTPSERVER|CMD_TFTPPUT|CMD_TFTPSRV|NET_TFTP_VARS|CMD_WDT|CMD_CONFIG|PREBOOT)' .config
+          grep -E 'CONFIG_(CMD_I2C|CMD_REGULATOR|DM_REGULATOR|DM_PMIC_FAN53555|DM_REGULATOR_FAN53555|DM_PMIC_RK8XX|DM_REGULATOR_RK8XX|CMD_CLK|CMD_NET|CMD_TFTPBOOT|CMD_PING|CMD_MII|CMD_MDIO|PHY_GIGE|CMD_PCAP|NETCONSOLE|CMD_SNTP|BOOTP_NTPSERVER|CMD_TFTPPUT|CMD_TFTPSRV|NET_TFTP_VARS|CMD_WDT|CMD_CONFIG|PREBOOT)' .config
           make -j"$(nproc)" \
             CROSS_COMPILE=aarch64-linux-gnu- \
             BL31="${{ runner.temp }}/bl31.elf"
@@ -876,13 +749,10 @@ jobs:
             echo "  VDD_CPU_B (SYR827) = 1.2V  → A72 @ 1608 MHz"
             echo "  VDD_CPU_L (RK808)  = 1.0V  → A53 @ 1200 MHz"
             echo ""
-            echo "Advanced bring-up features enabled:"
-            echo "  - PHY debug: mii/mdio + PHY_GIGE"
-            echo "  - Network forensics: pcap capture + netconsole"
-            echo "  - Time sync baseline: sntp + DHCP NTP option"
-            echo "  - TFTP advanced: tftpput, tftpsrv, window-size=16"
-            echo "  - Safety/diagnostics: watchdog cmd + config dump"
-            echo "  - PTP note: no dedicated U-Boot PTP command on RK3399 GMAC"
+            echo "Golden bootloader feature policy:"
+            echo "  - Enabled: TFTP boot path, ping, mii/mdio PHY inspection, watchdog cmd, config dump"
+            echo "  - Disabled: netconsole, pcap, SNTP, tftpput/tftpsrv and other background/noisy network services"
+            echo "  - TF-A owns PMU/ADB400/CCI sequencing; H-Exo patch only clears A72 GICR_WAKER.PS after stock on_finish"
             echo ""
             echo "Files:"
             echo "  idbloader.img  — TPL+SPL, flash at LBA 0x40 (sector 64)"
