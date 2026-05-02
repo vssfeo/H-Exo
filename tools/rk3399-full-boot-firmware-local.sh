@@ -382,6 +382,56 @@ sed -i '/source directory cannot contain spaces or colons/d' \
 sed -i '/ifneq ($$(findstring :,$$(CURDIR)),)/,/endif/d' \
   "${WORK_DIR}/u-boot/Makefile"
 
+# Git Bash/MinGW on Windows may return short reads in fixdep.
+# Patch fixdep to read dependency files in a loop.
+cat > "${WORK_DIR}/patch_fixdep_read.py" <<'PY'
+from pathlib import Path
+
+p = Path("u-boot/scripts/basic/fixdep.c")
+s = p.read_text()
+old = '''
+	if (read(fd, buf, st.st_size) != st.st_size) {
+		perror("fixdep: read");
+		exit(2);
+	}
+'''
+new = '''
+	ssize_t off = 0;
+	while (off < st.st_size) {
+		ssize_t n = read(fd, buf + off, st.st_size - off);
+		if (n <= 0) {
+			perror("fixdep: read");
+			exit(2);
+		}
+		off += n;
+	}
+'''
+if old in s:
+    s = s.replace(old, new, 1)
+else:
+    raise SystemExit("fixdep read() block not found")
+
+if "fd = open(filename, O_RDONLY);" in s:
+    s = s.replace(
+        "fd = open(filename, O_RDONLY);",
+        "fd = open(filename, O_RDONLY | O_BINARY);",
+        1,
+    )
+
+if "#include <fcntl.h>" in s and "#ifndef O_BINARY" not in s:
+    s = s.replace(
+        "#include <fcntl.h>",
+        "#include <fcntl.h>\n#ifndef O_BINARY\n#define O_BINARY 0\n#endif",
+        1,
+    )
+
+p.write_text(s)
+PY
+(
+  cd "${WORK_DIR}"
+  "${PYTHON_BIN}" "${WORK_DIR}/patch_fixdep_read.py"
+)
+
 (
   cd "${WORK_DIR}/u-boot"
 
