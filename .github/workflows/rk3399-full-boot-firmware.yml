@@ -446,13 +446,14 @@ jobs:
       - name: Add SYR827 + RK808 PMIC regulators to U-Boot DT
         working-directory: ${{ runner.temp }}/u-boot
         run: |
-          DTSI="$(find arch/arm/dts -maxdepth 1 -name 'rk3399-nanopi4*-u-boot.dtsi' | head -1)"
-          [ -z "$DTSI" ] && DTSI="arch/arm/dts/rk3399-nanopi-m4-u-boot.dtsi"
-          export DTSI
+          DTSI="arch/arm/dts/rk3399-nanopi4.dtsi"
+          if [ ! -f "$DTSI" ]; then
+            echo "SKIP: $DTSI not present in this U-Boot tree"
+            exit 0
+          fi
           python3 - <<'PY'
-          import os
           from pathlib import Path
-          p = Path(os.environ["DTSI"])
+          p = Path("arch/arm/dts/rk3399-nanopi4.dtsi")
           s = p.read_text()
           block = '''
           &i2c0 {
@@ -547,13 +548,14 @@ jobs:
       - name: Add CPU-supply bindings + IO domains to U-Boot DT
         working-directory: ${{ runner.temp }}/u-boot
         run: |
-          DTS="$(find arch/arm/dts -maxdepth 1 -name 'rk3399-nanopi4*-u-boot.dtsi' | head -1)"
-          [ -z "$DTS" ] && DTS="arch/arm/dts/rk3399-nanopi-m4-u-boot.dtsi"
-          export DTS
+          DTS="arch/arm/dts/rk3399-nanopi4.dtsi"
+          if [ ! -f "$DTS" ]; then
+            echo "SKIP: $DTS not present in this U-Boot tree"
+            exit 0
+          fi
           python3 - <<'PY'
-          import os
           from pathlib import Path
-          p = Path(os.environ["DTS"])
+          p = Path("arch/arm/dts/rk3399-nanopi4.dtsi")
           s = p.read_text()
           # CPU-supply bindings — tells U-Boot which regulator feeds each cluster
           bindings = '''
