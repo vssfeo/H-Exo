@@ -104,9 +104,31 @@ jobs:
       - name: Apply PMU keep-debug-powered patch
         working-directory: ${{ runner.temp }}/tfa
         run: |
-          git apply --verbose \
-            "${{ github.workspace }}/patches/trusted-firmware-a-v2.14-rk3399-pmu-keep-debug-powered.patch"
-          # Sanity grep that the bits ended up in the source.
+          F="plat/rockchip/rk3399/drivers/pmu/pmu.c"
+          if grep -q DBG_NOPWERDWN_L0_EN "$F"; then
+            echo "PMU debug-power patch already present"
+          else
+            awk '
+              /^void plat_rockchip_pmu_init/ { in_fn = 1 }
+              { print }
+              in_fn && /init_pmu_counts\(\);/ {
+                print ""
+                print "\t/*"
+                print "\t * Keep per-core debug power domain alive so PMCCNTR_EL0"
+                print "\t * and PMU event counters keep ticking for non-secure EL2/EL1 reads."
+                print "\t */"
+                print "\tmmio_setbits_32(PMU_BASE + PMU_SFT_CON,"
+                print "\t\t\tBIT(DBG_NOPWERDWN_L0_EN) |"
+                print "\t\t\tBIT(DBG_NOPWERDWN_L1_EN) |"
+                print "\t\t\tBIT(DBG_NOPWERDWN_L2_EN) |"
+                print "\t\t\tBIT(DBG_NOPWERDWN_L3_EN) |"
+                print "\t\t\tBIT(DBG_NO_PWERDWN_B0_EN) |"
+                print "\t\t\tBIT(DBG_NO_PWERDWN_B1_EN));"
+                in_fn = 0
+              }
+            ' "$F" > "${F}.new"
+            mv "${F}.new" "$F"
+          fi
           grep -n DBG_NOPWERDWN_L0_EN plat/rockchip/rk3399/drivers/pmu/pmu.c
 
       - name: Patch RK3399 SiP H-Exo diagnostic calls
