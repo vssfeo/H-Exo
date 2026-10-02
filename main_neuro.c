@@ -85,13 +85,18 @@ typedef struct {
     u64 mpidr;
     // Clock raise diagnostics: target freq requested vs cru_set_a72_freq_mhz return code.
     i64 clk_set_ret;       // 0 = OK, -1 = lock timeout, -2 = unsupported, -3 = skipped
+    i64 clk_first_ret;     // Return code from first (highest) OPP attempt
     u64 clk_target_mhz;
+    u64 clk_applied_mhz;
+    u64 clk_diag_rk808_id1;
+    u64 clk_diag_i2c_status;
     u64 avg_cycles, min_cycles, max_cycles;
     u64 avg_inst, avg_l1m, avg_l2m, avg_bus, avg_br;
     u64 avg_asimd;         // ASIMD_SPEC: NEON ops speculatively executed (A72)
     u64 avg_ticks, min_ticks, max_ticks, var_ticks;
     u64 avg_ns, elapsed_us;
     u64 ipc_x1000, cpu_mhz;
+    u64 cpu_mhz_actual; // Phase 0.2: PMCCNTR/CNTPCT 1ms window; 0 if PMU off
     u64 ddr_mbps;
 } __attribute__((aligned(64))) baseline_xfer_t;
 
@@ -113,17 +118,97 @@ static inline u64 read_cntpct(void) {
     return v;
 }
 
+#define RK_SIP_GICR_WAKER_GET_64 0xC20000A2ULL
+#define RK_SIP_GICR_WAKE_TRY_64  0xC20000A3ULL
+
+typedef struct {
+    u64 status;
+    u64 waker;
+} sip_gicr_get_t;
+
+typedef struct {
+    u64 status_flags;
+    u64 before;
+    u64 after;
+} sip_gicr_wake_try_t;
+
+static sip_gicr_get_t sip_gicr_waker_get(u64 core)
+{
+    sip_gicr_get_t out;
+    register u64 x0 asm("x0") = RK_SIP_GICR_WAKER_GET_64;
+    register u64 x1 asm("x1") = core;
+    register u64 x2 asm("x2") = 0;
+    register u64 x3 asm("x3") = 0;
+    asm volatile("smc #0"
+                 : "+r"(x0), "+r"(x1)
+                 : "r"(x2), "r"(x3)
+                 : "memory",
+                   "x4", "x5", "x6", "x7", "x8", "x9",
+                   "x10", "x11", "x12", "x13", "x14", "x15",
+                   "x16", "x17");
+    out.status = x0;
+    out.waker = x1;
+    return out;
+}
+
+static sip_gicr_wake_try_t sip_gicr_wake_try(u64 core)
+{
+    sip_gicr_wake_try_t out;
+    register u64 x0 asm("x0") = RK_SIP_GICR_WAKE_TRY_64;
+    register u64 x1 asm("x1") = core;
+    register u64 x2 asm("x2") = 0;
+    register u64 x3 asm("x3") = 0;
+    asm volatile("smc #0"
+                 : "+r"(x0), "+r"(x1), "+r"(x2)
+                 : "r"(x3)
+                 : "memory",
+                   "x4", "x5", "x6", "x7", "x8", "x9",
+                   "x10", "x11", "x12", "x13", "x14", "x15",
+                   "x16", "x17");
+    out.status_flags = x0;
+    out.before = x1;
+    out.after = x2;
+    return out;
+}
+
 // Runs on A72 core 4 via wq_dispatch. Mirrors the A53 baseline loop in kmain
 // so the only delta vs v2 is "which cluster executed". PMU registers are
 // banked per-core so we must call pmu_init_local() before taking snapshots.
 static void baseline_runner_a72(u64 arg) {
     (void)arg;
 
-    // Raise A72 cluster B clock from fallback OPP (~408 MHz) to 1608 MHz
-    // via direct ABPLL writes. During the call this CPU briefly runs from
-    // OSC (24 MHz) while the PLL relocks.
+    // Source-backed deterministic OPP ladder:
+    // try the target first, then fall back to known-safe lower OPPs without
+    // ad-hoc retuning.
+    static const u32 a72_opp_ladder[] = {1608u, 1416u, 1200u, 1008u, 816u};
+
     g_a72_baseline.clk_target_mhz = 1608;
-    g_a72_baseline.clk_set_ret    = (i64)cru_set_a72_freq_mhz(1608);
+    g_a72_baseline.clk_applied_mhz = 0;
+    g_a72_baseline.clk_first_ret = -3;
+    g_a72_baseline.clk_diag_rk808_id1 = 0xFF;
+    g_a72_baseline.clk_diag_i2c_status = 0;
+
+    i64 last_ret = -3;
+    for (u32 i = 0; i < (sizeof(a72_opp_ladder) / sizeof(a72_opp_ladder[0])); i++) {
+        i64 ret = (i64)cru_set_a72_freq_mhz(a72_opp_ladder[i]);
+        if (i == 0) {
+            g_a72_baseline.clk_first_ret = ret;
+            if (ret < 0) {
+                u32 rk808_id1 = 0xFF;
+                u32 i2c_status = 0;
+                cru_get_last_pmic_diag(&rk808_id1, &i2c_status,
+                                       0, 0, 0, 0, 0, 0, 0, 0);
+                g_a72_baseline.clk_diag_rk808_id1 = rk808_id1;
+                g_a72_baseline.clk_diag_i2c_status = i2c_status;
+            }
+        }
+        last_ret = ret;
+        if (ret == 0) {
+            g_a72_baseline.clk_applied_mhz = a72_opp_ladder[i];
+            break;
+        }
+    }
+    g_a72_baseline.clk_set_ret = (g_a72_baseline.clk_applied_mhz != 0) ? 0 : last_ret;
     asm volatile("dmb ish" ::: "memory");
 
     // Per-core PMU setup (A72 has its own PMCR/CNTENSET/PMCCFILTR/MDCR_EL2).
@@ -137,13 +222,32 @@ static void baseline_runner_a72(u64 arg) {
     u64 asimd_sum = 0;
     
     inference_result_t r;
+
+    // Phase 1.4: warmup pass — populate L1i (NEON hidden+output code) and
+    // L1d (weight rows w1/w2, bias, hidden buffer) on this PE before the
+    // measured loop begins. Without warmup the first iteration eats the
+    // cold-cache fill penalty (observed: max=1429 vs avg=228 on A72, 6.3x).
+    // 32 iterations is enough to fully populate 32KB L1i/L1d for the 6->8->4
+    // network (~1.5KB code + ~256B data). Results are discarded.
+    for (u32 wu = 0; wu < 32u; wu++) {
+        adaptive_inference_a72(&adaptive_sched, &g_a72_warmup_tel, &r);
+    }
+    asm volatile("dsb ish; isb" ::: "memory");
+
     u64 t0 = read_cntpct();
     for (u32 it = 0; it < PMU_BASELINE_COUNT; it++) {
+        // Phase 1.3 (ADL-016): mask IRQ around the measurement window so SGI
+        // delivery (timer / pipeit fallback) cannot inflate per-iter cycles.
+        // A72 baseline runs locally on core 4; no work-queue dispatch inside
+        // adaptive_inference_a72(), so masking is safe here.
+        u64 daif_save;
+        pmu_meas_critical_enter(&daif_save);
         u64 ts0 = read_cntpct();
         pmu_take_snapshot(&b_start);
         adaptive_inference_a72(&adaptive_sched, &g_a72_warmup_tel, &r);
         pmu_take_snapshot(&b_end);
         u64 dt = read_cntpct() - ts0;
+        pmu_meas_critical_exit(daif_save);
         pmu_calc_delta(&b_start, &b_end, &b_delta);
         if (dt < t_min) t_min = dt;
         if (dt > t_max) t_max = dt;
@@ -196,6 +300,10 @@ static void baseline_runner_a72(u64 arg) {
     g_a72_baseline.elapsed_us = elapsed / 24;
     g_a72_baseline.ipc_x1000  = avg_cycles ? (avg_inst * 1000) / avg_cycles : 0;
     g_a72_baseline.cpu_mhz    = avg_ns ? (avg_cycles * 1000) / avg_ns : 0;
+    // Phase 0.2 (ADL: cpu_mhz from per-iter avg_ticks is noisy at ~4-tick
+    // windows). Sample over a 1 ms wall-time window via PMCCNTR/CNTPCT —
+    // independent of inference geometry, sub-1% accurate at any OPP.
+    g_a72_baseline.cpu_mhz_actual = pmu_measure_cpu_freq_mhz(1000u);
 
     // Ensure all writes visible to boot CPU before flag flips.
     asm volatile("dmb ish" ::: "memory");
@@ -271,6 +379,8 @@ static void runtime_run_inference(bool prefer_offload) {
     if (use_parallel_inference && online >= 6) {
         res = neuro_parallel_inference_sync(&runtime_telemetry_snapshot, &result);
         if (res == OK) {
+            last_inference_result = result;
+            runtime_last_offload_state = true;
             if (!parallel_mode_active) {
                 uart_puts(&console, "[RUNTIME] inference -> 6-core parallel (cores=");
                 uart_put_hex(&console, online);
@@ -306,6 +416,8 @@ static void runtime_run_inference(bool prefer_offload) {
         uart_puts(&console, "\r\n");
         runtime_last_worker_core = worker_core;
     }
+
+    runtime_last_offload_state = offloaded;
 
     // PMU Phase 0: Take snapshot after inference and accumulate stats
     if (pmu_inference_count < PMU_BASELINE_COUNT) {
@@ -370,24 +482,25 @@ void kmain(void) {
     };
     uart_init(&console, &uart_cfg);
 
-    // v19 DIAGNOSTIC: Read I2C0 registers from A53 core (core 0) BEFORE any init
-    // to determine if the 0x65 phenomenon is system-wide or A72-specific.
+    // v20 DIAGNOSTIC: Read I2C0 RK3x registers from A53 core (core 0) BEFORE any init
     {
         volatile u32 *i2c0 = (volatile u32 *)(uintptr_t)0xFF3C0000UL;
-        uart_puts(&console, "[I2C0_DIAG_A53] IC_CON=0x");
+        uart_puts(&console, "[I2C0_DIAG_A53] CON=0x");
         uart_put_hex(&console, i2c0[0x00 >> 2]);
-        uart_puts(&console, " IC_STATUS=0x");
-        uart_put_hex(&console, i2c0[0x70 >> 2]);
-        uart_puts(&console, " IC_ENABLE=0x");
-        uart_put_hex(&console, i2c0[0x6C >> 2]);
-        uart_puts(&console, " IC_ENABLE_STATUS=0x");
-        uart_put_hex(&console, i2c0[0x9C >> 2]);
-        uart_puts(&console, " IC_TXFLR=0x");
-        uart_put_hex(&console, i2c0[0x74 >> 2]);
-        uart_puts(&console, " IC_RXFLR=0x");
-        uart_put_hex(&console, i2c0[0x78 >> 2]);
-        uart_puts(&console, " IC_TX_ABRT=0x");
-        uart_put_hex(&console, i2c0[0x80 >> 2]);
+        uart_puts(&console, " CLKDIV=0x");
+        uart_put_hex(&console, i2c0[0x04 >> 2]);
+        uart_puts(&console, " MRXADDR=0x");
+        uart_put_hex(&console, i2c0[0x08 >> 2]);
+        uart_puts(&console, " MRXRADDR=0x");
+        uart_put_hex(&console, i2c0[0x0C >> 2]);
+        uart_puts(&console, " MTXCNT=0x");
+        uart_put_hex(&console, i2c0[0x10 >> 2]);
+        uart_puts(&console, " MRXCNT=0x");
+        uart_put_hex(&console, i2c0[0x14 >> 2]);
+        uart_puts(&console, " IPD=0x");
+        uart_put_hex(&console, i2c0[0x1C >> 2]);
+        uart_puts(&console, " FCNT=0x");
+        uart_put_hex(&console, i2c0[0x20 >> 2]);
         uart_puts(&console, "\r\n");
     }
 
@@ -396,13 +509,33 @@ void kmain(void) {
     mmu_enable();
     LOG_OK("MMU: EL2 identity map active");
 
+    // Refine first-1GB mapping: split into 2MB blocks and mark PA 0x10000000
+    // as Normal Non-Cacheable so cross-cluster bell variables (pipeit pipeline
+    // doorbells) bypass cluster L1/L2 caches and the slow CCI-500 cache
+    // maintenance path. See mmu_nc.c.
+    mmu_install_nc_region();
+    LOG_OK("MMU: NC region installed at 0x10000000 (2MB)");
+
     // 1. Initialize Slab Allocator
     slab_init();
     LOG_OK("Slab: Initialized (512KB Heap)");
 
-    // 1.5 Enable CCI-500 coherency before any secondary core bring-up.
+    // 1.5 CCI-500 coherency.
+    // NOTE: cci500_enable() is a deliberate NO-OP. NS EL2 writes to CCI slave
+    // interfaces create CHANGE_PENDING transactions that never complete (the
+    // CCI is owned by TF-A secure world); the stuck PENDING blocked TF-A's
+    // cci_enable_snoop_dvm_reqs() during pwr_domain_on_finish -> watchdog ->
+    // SoC reset (docs/rk3399/smp-bringup.md, ADL-005). TF-A enables
+    // snoop+DVM for both clusters, so an "OK" return means "nothing to do",
+    // NOT "we enabled it". Report the measured state instead of claiming it.
     if (cci500_enable() == OK) {
-        LOG_OK("CCI-500: snoop+DVM enabled");
+        u32 cci_c = 0, cci_s = 0, cci_a53 = 0, cci_a72 = 0;
+        cci500_diag_read(&cci_c, &cci_s, &cci_a53, &cci_a72);
+        uart_puts(&console, "[OK] CCI-500: TF-A managed (no NS writes) a53_snoop=0x");
+        uart_put_hex(&console, cci_a53);
+        uart_puts(&console, " a72_snoop=0x");
+        uart_put_hex(&console, cci_a72);
+        uart_puts(&console, "\r\n");
     } else {
         LOG_WARN("CCI-500: enable timeout");
     }
@@ -438,8 +571,67 @@ void kmain(void) {
         uart_puts(&console, "\r\n");
     }
     gicv3_prewake_redistributors();
-    LOG_OK("GICv3: All redistributors pre-woken (ProcessorSleep=0)");
+    {
+        u32 ready_mask = 0;
+        u32 stuck_mask = 0;
+        uart_puts(&console, "[GIC] GICR_WAKER after prewake:");
+        for (u32 cpu = 0; cpu < 6; cpu++) {
+            volatile u32 *waker = (volatile u32*)(0xFEF00014UL + (uintptr_t)cpu * 0x20000);
+            u32 w = *waker;
+            if ((w & (1u << 2)) == 0u) {
+                ready_mask |= (1u << cpu);
+            } else {
+                stuck_mask |= (1u << cpu);
+            }
+            uart_puts(&console, " C");
+            uart_put_hex(&console, cpu);
+            uart_puts(&console, "=");
+            uart_put_hex(&console, w);
+        }
+        uart_puts(&console, " ready=0x");
+        uart_put_hex(&console, ready_mask);
+        uart_puts(&console, " stuck=0x");
+        uart_put_hex(&console, stuck_mask);
+        uart_puts(&console, "\r\n");
+    }
+
+    // ADL-014 (Fix #2 / Plan v3.2): set A53 boot-time performance OPP.
+    // Default boot leaves cluster L (A53) on the lowest LPLL OPP (~514 MHz on
+    // NanoPi M4), which biases every downstream baseline by ~2.7x. Lift to a
+    // safe 1008 MHz that does not require a VDD_CPU_L bump (RK808 BUCK1
+    // default ~0.9 V supports 1008 MHz per RK3399 reference OPP table).
+    // 1200/1416 MHz require explicit PMIC bump and are intentionally NOT used
+    // here to keep boot path unconditional and deadlock-free.
+    {
+        int a53_ret = cru_set_a53_freq_mhz(1008u);
+        uart_puts(&console, "[A53_OPP] target_mhz=0x");
+        uart_put_hex(&console, 1008u);
+        uart_puts(&console, " ret=0x");
+        uart_put_hex(&console, (u64)(i64)a53_ret);
+        uart_puts(&console, "\r\n");
+    }
+
     smp_init();
+
+    // Post-PSCI re-wake for A72 redistributors: on some RK3399 boots,
+    // cores 4/5 can come online while GICR_WAKER.ChildrenAsleep remains set.
+    // This pass forces ProcessorSleep=0 again after CPU_ON completion.
+    {
+        u32 w4_before = gicv3_read_waker(4);
+        u32 w5_before = gicv3_read_waker(5);
+        u32 w4_after = gicv3_force_wake_core(4, 8);
+        u32 w5_after = gicv3_force_wake_core(5, 8);
+        uart_puts(&console, "[GIC] post-SMP re-wake w4:");
+        uart_put_hex(&console, w4_before);
+        uart_puts(&console, "->");
+        uart_put_hex(&console, w4_after);
+        uart_puts(&console, " w5:");
+        uart_put_hex(&console, w5_before);
+        uart_puts(&console, "->");
+        uart_put_hex(&console, w5_after);
+        uart_puts(&console, "\r\n");
+    }
+
     wq_init();
 
     // 3. Initialize GICv3 (after secondary cores are running)
@@ -507,7 +699,42 @@ void kmain(void) {
         uart_put_hex(&console, g_smpen_diag[5]);
         uart_puts(&console, "\r\n");
     }
-    
+
+    // Secure-world GICR diagnostics (requires BL31 SiP patch):
+    // GET:  x0=status, x1=waker
+    // WAKE: x0=flags,  x1=before, x2=after
+    // If patch is absent, status typically returns SMC_UNK (0xFFFFFFFF).
+    {
+        sip_gicr_get_t g4 = sip_gicr_waker_get(4);
+        sip_gicr_get_t g5 = sip_gicr_waker_get(5);
+        sip_gicr_wake_try_t w4 = sip_gicr_wake_try(4);
+        sip_gicr_wake_try_t w5 = sip_gicr_wake_try(5);
+
+        uart_puts(&console, "[GICR_SIP] get core4 st=0x");
+        uart_put_hex(&console, g4.status);
+        uart_puts(&console, " waker=0x");
+        uart_put_hex(&console, g4.waker);
+        uart_puts(&console, " | core5 st=0x");
+        uart_put_hex(&console, g5.status);
+        uart_puts(&console, " waker=0x");
+        uart_put_hex(&console, g5.waker);
+        uart_puts(&console, "\r\n");
+
+        uart_puts(&console, "[GICR_SIP] wake core4 flags=0x");
+        uart_put_hex(&console, w4.status_flags);
+        uart_puts(&console, " before=0x");
+        uart_put_hex(&console, w4.before);
+        uart_puts(&console, " after=0x");
+        uart_put_hex(&console, w4.after);
+        uart_puts(&console, " | core5 flags=0x");
+        uart_put_hex(&console, w5.status_flags);
+        uart_puts(&console, " before=0x");
+        uart_put_hex(&console, w5.before);
+        uart_puts(&console, " after=0x");
+        uart_put_hex(&console, w5.after);
+        uart_puts(&console, "\r\n");
+    }
+
     LOG_OK("WQ: Work queue initialized");
     dbg_putc_raw('>');
     dbg_putc_raw('W');
@@ -531,7 +758,13 @@ void kmain(void) {
             LOG_OK("Mali-T860: MMU identity-mapped (4GB, CCI-500 ACE-Lite)");
             // Phase 3.4: Run NULL job smoke test to verify JM/MMU pipeline
             if (mali_compute_smoke_test() == OK) {
-                LOG_OK("Mali-T860: Smoke test PASSED (NULL job submission works)");
+                LOG_OK("Mali-T860: Smoke test PASSED (NULL + WRITE_VALUE + CACHE_FLUSH + COMPUTE_PROBE)");
+                // Phase 3.5: 4×4 matrix multiply via GPU compute shader
+                if (mali_compute_matmul_4x4() == OK) {
+                    LOG_OK("Mali-T860: MATMUL 4x4 PASSED (I*I=I)");
+                } else {
+                    LOG_WARN("Mali-T860: MATMUL 4x4 FAILED");
+                }
             } else {
                 LOG_WARN("Mali-T860: Smoke test FAILED");
             }
@@ -585,6 +818,100 @@ void kmain(void) {
         }
     } else {
         LOG_WARN("TSADC: Initialization failed");
+    }
+
+    // Low-level eMMC operability probe: PMIC rails + host/PHY read-only snapshot.
+    emmc_low_level_diag_t emmc_diag;
+    i32 emmc_ret = cru_emmc_low_level_probe(&emmc_diag);
+    uart_puts(&console, "\r\n[EMMC_DIAG] i2c_ret=0x");
+    uart_put_hex(&console, (u64)emmc_diag.i2c_ret);
+    uart_puts(&console, " rk808_id1=0x");
+    uart_put_hex(&console, emmc_diag.rk808_chip_id);
+    uart_puts(&console, " rk808_buck2=0x");
+    uart_put_hex(&console, emmc_diag.rk808_buck2_on);
+    uart_puts(&console, " rk808_23=0x");
+    uart_put_hex(&console, emmc_diag.rk808_reg23);
+    uart_puts(&console, " rk808_24=0x");
+    uart_put_hex(&console, emmc_diag.rk808_reg24);
+    uart_puts(&console, " sw1=0x");
+    uart_put_hex(&console, emmc_diag.sw1_en);
+    uart_puts(&console, " sw2=0x");
+    uart_put_hex(&console, emmc_diag.sw2_en);
+    uart_puts(&console, " ldo6=0x");
+    uart_put_hex(&console, emmc_diag.ldo6_vsel);
+    uart_puts(&console, " ldo9=0x");
+    uart_put_hex(&console, emmc_diag.ldo9_vsel);
+    uart_puts(&console, " ldo_en2=0x");
+    uart_put_hex(&console, emmc_diag.ldo_en2);
+    uart_puts(&console, "\r\n");
+    uart_puts(&console, "[EMMC_DIAG] mmc ctrl=0x");
+    uart_put_hex(&console, emmc_diag.mmc_ctrl);
+    uart_puts(&console, " pwren=0x");
+    uart_put_hex(&console, emmc_diag.mmc_pwren);
+    uart_puts(&console, " clkena=0x");
+    uart_put_hex(&console, emmc_diag.mmc_clkena);
+    uart_puts(&console, " cdetect=0x");
+    uart_put_hex(&console, emmc_diag.mmc_cdetect);
+    uart_puts(&console, " status=0x");
+    uart_put_hex(&console, emmc_diag.mmc_status);
+    uart_puts(&console, " rint=0x");
+    uart_put_hex(&console, emmc_diag.mmc_rintsts);
+    uart_puts(&console, "\r\n[EMMC_DIAG] grf_soc_con22=0x");
+    uart_put_hex(&console, emmc_diag.grf_soc_con22);
+    uart_puts(&console, " phy_con0=0x");
+    uart_put_hex(&console, emmc_diag.emmc_phy_con0);
+    uart_puts(&console, " phy_status=0x");
+    uart_put_hex(&console, emmc_diag.emmc_phy_status);
+    uart_puts(&console, "\r\n");
+    if (emmc_ret == 0) {
+        LOG_OK("eMMC: low-level probe captured");
+    } else {
+        uart_puts(&console, "[INFO] eMMC: low-level probe PMIC read unavailable, continuing boot\r\n");
+    }
+
+    // Attempt eMMC recovery if PHY is not ready, but do not block boot on failure.
+    // The NanoPi M4 eMMC module may be physically dead (removable module format).
+    if (emmc_ret == 0 &&
+        (emmc_diag.sw1_en == 0 || emmc_diag.sw2_en == 0 ||
+         ((emmc_diag.emmc_phy_status & 1u) == 0))) {
+        i32 emmc_fix = cru_emmc_recover_power_and_phy();
+        uart_puts(&console, "[EMMC_RECOVER] ret=0x");
+        uart_put_hex(&console, (u64)emmc_fix);
+        uart_puts(&console, "\r\n");
+
+        emmc_low_level_diag_t emmc_post;
+        i32 emmc_post_ret = cru_emmc_low_level_probe(&emmc_post);
+        uart_puts(&console, "[EMMC_DIAG_POST] i2c_ret=0x");
+        uart_put_hex(&console, (u64)emmc_post.i2c_ret);
+        uart_puts(&console, " rk808_id1=0x");
+        uart_put_hex(&console, emmc_post.rk808_chip_id);
+        uart_puts(&console, " rk808_buck2=0x");
+        uart_put_hex(&console, emmc_post.rk808_buck2_on);
+        uart_puts(&console, " rk808_23=0x");
+        uart_put_hex(&console, emmc_post.rk808_reg23);
+        uart_puts(&console, " sw1=0x");
+        uart_put_hex(&console, emmc_post.sw1_en);
+        uart_puts(&console, " sw2=0x");
+        uart_put_hex(&console, emmc_post.sw2_en);
+        uart_puts(&console, " ldo6=0x");
+        uart_put_hex(&console, emmc_post.ldo6_vsel);
+        uart_puts(&console, " ldo9=0x");
+        uart_put_hex(&console, emmc_post.ldo9_vsel);
+        uart_puts(&console, " ldo_en2=0x");
+        uart_put_hex(&console, emmc_post.ldo_en2);
+        uart_puts(&console, " mmc_status=0x");
+        uart_put_hex(&console, emmc_post.mmc_status);
+        uart_puts(&console, " rint=0x");
+        uart_put_hex(&console, emmc_post.mmc_rintsts);
+        uart_puts(&console, " phy_status=0x");
+        uart_put_hex(&console, emmc_post.emmc_phy_status);
+        uart_puts(&console, "\r\n");
+
+        if (emmc_fix == 0 && emmc_post_ret == 0 && ((emmc_post.emmc_phy_status & 1u) != 0)) {
+            LOG_OK("eMMC: recovery sequence applied (PHY ready)");
+        } else {
+            uart_puts(&console, "[INFO] eMMC: module not responding (likely hardware dead), continuing boot\r\n");
+        }
     }
 
     // Initialize PMU for Phase 0 baseline measurements
@@ -680,7 +1007,7 @@ void kmain(void) {
         uart_puts(&console, " stability=0x");
         uart_put_hex(&console, adaptive_sched.stability_score);
         uart_puts(&console, "\r\n");
-        
+
         // Phase 0.4: full PMU baseline (10000 inferences). PMCCNTR_EL0 +
         // event counters now tick at NS EL2 thanks to PMCCFILTR/PMEVTYPER
         // NSH=1 fix in hal/pmu.c. CNTPCT kept as secondary wall-clock signal.
@@ -699,14 +1026,33 @@ void kmain(void) {
         u64 t_sum_sq = 0;
         u64 cyc_min = ~0ULL, cyc_max = 0, cyc_sum = 0;
         u64 inst_sum = 0, l1m_sum = 0, l2m_sum = 0, bus_sum = 0, br_sum = 0;
+
+        // Phase 1.4: warmup pass — populate L1i/L1d on the boot CPU (A53#0)
+        // before the measured loop. Eliminates cold-cache outlier on iter 0.
+        // Discarded results, same input frame as the measured loop.
+        {
+            inference_result_t wr;
+            for (u32 wu = 0; wu < 32u; wu++) {
+                adaptive_inference(&adaptive_sched, &warmup_tel, &wr);
+            }
+            asm volatile("dsb ish; isb" ::: "memory");
+        }
+
         u64 baseline_t0 = read_cntpct();
         for (u32 it = 0; it < PMU_BASELINE_COUNT; it++) {
+            // Phase 1.3 (ADL-016): mask IRQ around the per-iter measurement
+            // window. Boot CPU (A53#0) services timer/SGI which would otherwise
+            // inflate cyc_max outliers. Inference is local (no wq_dispatch),
+            // so safe to mask. Restored before the next iteration's overhead.
+            u64 daif_save;
+            pmu_meas_critical_enter(&daif_save);
             u64 ts0 = read_cntpct();
             pmu_take_snapshot(&b_start);
             inference_result_t r;
             adaptive_inference(&adaptive_sched, &warmup_tel, &r);
             pmu_take_snapshot(&b_end);
             u64 dt = read_cntpct() - ts0;
+            pmu_meas_critical_exit(daif_save);
             pmu_calc_delta(&b_start, &b_end, &b_delta);
             if (dt < t_min) t_min = dt;
             if (dt > t_max) t_max = dt;
@@ -742,6 +1088,8 @@ void kmain(void) {
         // freq_hz = (cycles per inference) * (inferences per second)
         //        = avg_cycles * 1e6 / avg_ns  -> express in MHz: avg_cycles * 1000 / avg_ns
         u64 cpu_mhz    = (avg_ns > 0) ? ((avg_cycles * 1000) / avg_ns) : 0;
+        // Phase 0.2: authoritative freq via PMCCNTR/CNTPCT over 1 ms window.
+        u32 cpu_mhz_actual = pmu_measure_cpu_freq_mhz(1000u);
         u64 ddr_mbps   = baseline_total_ticks ? (bus_sum * 64 * 24) / baseline_total_ticks : 0;
         
         // Persist for legacy printers and PMU baseline status
@@ -764,6 +1112,7 @@ void kmain(void) {
         uart_puts(&console, "\r\n[BASELINE] ddr_mbps=0x");     uart_put_hex(&console, ddr_mbps);
         uart_puts(&console, "\r\n[BASELINE] ipc_x1000=0x");    uart_put_hex(&console, ipc_x1000);
         uart_puts(&console, "\r\n[BASELINE] cpu_mhz=0x");      uart_put_hex(&console, cpu_mhz);
+        uart_puts(&console, "\r\n[BASELINE] cpu_mhz_actual=0x"); uart_put_hex(&console, (u64)cpu_mhz_actual);
         uart_puts(&console, "\r\n[BASELINE] avg_ticks=0x");    uart_put_hex(&console, avg_ticks);
         uart_puts(&console, "\r\n[BASELINE] min_ticks=0x");    uart_put_hex(&console, t_min);
         uart_puts(&console, "\r\n[BASELINE] max_ticks=0x");    uart_put_hex(&console, t_max);
@@ -785,6 +1134,7 @@ void kmain(void) {
         uart_puts(&console, ",\"ddr_mbps\":0x");     uart_put_hex(&console, ddr_mbps);
         uart_puts(&console, ",\"ipc_x1000\":0x");    uart_put_hex(&console, ipc_x1000);
         uart_puts(&console, ",\"cpu_mhz\":0x");      uart_put_hex(&console, cpu_mhz);
+        uart_puts(&console, ",\"cpu_mhz_actual\":0x"); uart_put_hex(&console, (u64)cpu_mhz_actual);
         uart_puts(&console, ",\"avg_ticks\":0x");    uart_put_hex(&console, avg_ticks);
         uart_puts(&console, ",\"min_ticks\":0x");    uart_put_hex(&console, t_min);
         uart_puts(&console, ",\"max_ticks\":0x");    uart_put_hex(&console, t_max);
@@ -809,16 +1159,29 @@ void kmain(void) {
         asm volatile("dmb ish" ::: "memory");
 
         if (g_a72_baseline.done_flag) {
-            uart_puts(&console, "[BASELINE_A72] clk_set_ret=0x");    uart_put_hex(&console, (u64)g_a72_baseline.clk_set_ret);
+            uart_puts(&console, "[BASELINE_A72] target_mhz=0x");     uart_put_hex(&console, g_a72_baseline.clk_target_mhz);
+            uart_puts(&console, " applied_mhz=0x");                   uart_put_hex(&console, g_a72_baseline.clk_applied_mhz);
+            uart_puts(&console, " clk_set_ret=0x");                   uart_put_hex(&console, (u64)g_a72_baseline.clk_set_ret);
+            uart_puts(&console, " first_ret=0x");                     uart_put_hex(&console, (u64)g_a72_baseline.clk_first_ret);
+            if (g_a72_baseline.clk_first_ret <= -100) {
+                uart_puts(&console, " pmic_id1=0x");                  uart_put_hex(&console, g_a72_baseline.clk_diag_rk808_id1);
+                uart_puts(&console, " pmic_i2c=0x");                  uart_put_hex(&console, g_a72_baseline.clk_diag_i2c_status);
+            }
             uart_puts(&console, "\r\n[BASELINE_A72] avg_cycles=0x");  uart_put_hex(&console, g_a72_baseline.avg_cycles);
             uart_puts(&console, " avg_ns=0x");                        uart_put_hex(&console, g_a72_baseline.avg_ns);
             uart_puts(&console, " ipc=0x");                           uart_put_hex(&console, g_a72_baseline.ipc_x1000);
             uart_puts(&console, " cpu_mhz=0x");                      uart_put_hex(&console, g_a72_baseline.cpu_mhz);
+            uart_puts(&console, " cpu_mhz_actual=0x");               uart_put_hex(&console, g_a72_baseline.cpu_mhz_actual);
             uart_puts(&console, " avg_asimd=0x");                    uart_put_hex(&console, g_a72_baseline.avg_asimd);
             uart_puts(&console, "\r\n[BASELINE_A72] === BASELINE_JSON_BEGIN ===\r\n");
-            uart_puts(&console, "{\"version\":\"v6\",\"timer\":\"pmccntr+cntpct\",\"core\":\"A72\",\"mpidr\":0x");
+            uart_puts(&console, "{\"version\":\"v7\",\"timer\":\"pmccntr+cntpct\",\"core\":\"A72\",\"mpidr\":0x");
             uart_put_hex(&console, g_a72_baseline.mpidr);
+            uart_puts(&console, ",\"clk_target_mhz\":0x"); uart_put_hex(&console, g_a72_baseline.clk_target_mhz);
+            uart_puts(&console, ",\"clk_applied_mhz\":0x");uart_put_hex(&console, g_a72_baseline.clk_applied_mhz);
             uart_puts(&console, ",\"clk_set_ret\":0x");    uart_put_hex(&console, (u64)g_a72_baseline.clk_set_ret);
+            uart_puts(&console, ",\"clk_first_ret\":0x");  uart_put_hex(&console, (u64)g_a72_baseline.clk_first_ret);
+            uart_puts(&console, ",\"pmic_id1\":0x");       uart_put_hex(&console, g_a72_baseline.clk_diag_rk808_id1);
+            uart_puts(&console, ",\"pmic_i2c\":0x");       uart_put_hex(&console, g_a72_baseline.clk_diag_i2c_status);
             uart_puts(&console, ",\"n\":0x");               uart_put_hex(&console, PMU_BASELINE_COUNT);
             uart_puts(&console, ",\"avg_cycles\":0x");     uart_put_hex(&console, g_a72_baseline.avg_cycles);
             uart_puts(&console, ",\"min_cycles\":0x");     uart_put_hex(&console, g_a72_baseline.min_cycles);
@@ -832,6 +1195,7 @@ void kmain(void) {
             uart_puts(&console, ",\"ddr_mbps\":0x");       uart_put_hex(&console, g_a72_baseline.ddr_mbps);
             uart_puts(&console, ",\"ipc_x1000\":0x");      uart_put_hex(&console, g_a72_baseline.ipc_x1000);
             uart_puts(&console, ",\"cpu_mhz\":0x");        uart_put_hex(&console, g_a72_baseline.cpu_mhz);
+            uart_puts(&console, ",\"cpu_mhz_actual\":0x"); uart_put_hex(&console, g_a72_baseline.cpu_mhz_actual);
             uart_puts(&console, ",\"avg_ticks\":0x");      uart_put_hex(&console, g_a72_baseline.avg_ticks);
             uart_puts(&console, ",\"min_ticks\":0x");      uart_put_hex(&console, g_a72_baseline.min_ticks);
             uart_puts(&console, ",\"max_ticks\":0x");      uart_put_hex(&console, g_a72_baseline.max_ticks);
@@ -911,6 +1275,10 @@ void kmain(void) {
         // -- fire SGI 1 to core 4 --
         gicv3_sgi_send(SGI_STAGE_HIDDEN, 0x100);
         u32 isp4_imm = gicv3_read_ispendr0(4);
+        // Secondaries idle in WFE during this pre-pipeline probe.
+        // Nudge them with SEV so they exit WFE and can service pending SGI.
+        asm volatile("sev" ::: "memory");
+        asm volatile("sev" ::: "memory");
         // wait 10ms for handlers
         u64 t_self = read_cntpct();
         while ((read_cntpct() - t_self) < 240000ULL) asm volatile("yield");
@@ -945,7 +1313,7 @@ void kmain(void) {
     // Phase 2: Start pipeline now that baseline is done.
     // Core 4/5 will transition from WFE workqueue mode to WFI+SGI pipeline mode.
     pipeit_start(&g_pipeit);
-    LOG_INFO("Pipeline active — core 4 (hidden), core 5 (output) in WFI+SGI mode");
+    LOG_INFO("Pipeline active — A72 mailbox/SEV fallback; SGI assist only if mode=1");
     
     LOG_INFO("Runtime: core0-first control loop active");
     
@@ -968,26 +1336,48 @@ void kmain(void) {
         g_pipeit.hidden_count = 0;
         g_pipeit.output_count = 0;
         g_pipeit.total_frames = 0;
-        
+        // Reset completion bell. Bell is in NC region (PIPEIT_NC_BASE),
+        // so the write goes straight to DRAM; no dc cvac needed. dsb ish
+        // ensures the store is visible to A72 worker before bench starts.
+        g_pipeit_completion_seq = 0;
+        asm volatile("dsb ish" ::: "memory");
+
         u64 t_pipe_start = read_cntpct();
-        
+
         u32 timeout_frames = 0;
+        u32 submit_invalid = 0;
+        u32 submit_oom = 0;
+        u32 submit_other = 0;
+        u32 submit_ok = 0;
         for (u32 i = 0; i < PIPE_BENCH_COUNT; i++) {
             u32 frame_id;
-            pipeit_submit_frame(&g_pipeit, &bench_tel, &frame_id);
-            
-            // Wait for frame to complete (poll stage_complete)
-            // dispatch_idx is the actual buffer slot index (not frame_id counter)
-            u32 fidx = g_pipe_buffer.dispatch_idx;
+            result_t sub = pipeit_submit_frame(&g_pipeit, &bench_tel, &frame_id);
+            if (sub == ERR_OUT_OF_MEMORY) {
+                u64 t_retry = read_cntpct();
+                while ((read_cntpct() - t_retry) < 1200000ULL) {
+                    if (g_pipeit_completion_seq >= (u64)i) break;
+                }
+                sub = pipeit_submit_frame(&g_pipeit, &bench_tel, &frame_id);
+            }
+
+            if (sub != OK) {
+                if (sub == ERR_INVALID_PARAM) submit_invalid++;
+                else if (sub == ERR_OUT_OF_MEMORY) submit_oom++;
+                else submit_other++;
+                timeout_frames++;
+                continue;
+            }
+            submit_ok++;
+
+            u64 expected = (u64)(i + 1);
             u64 t0 = read_cntpct();
-            int timed_out = 0;
-            while (!(g_pipe_buffer.frames[fidx].stage_complete & (1u << PIPE_STAGE_OUTPUT))) {
-                asm volatile("yield");
-                if ((read_cntpct() - t0) > 1200000ULL) { timed_out = 1; break; }  // 50ms
+            u32 timed_out = 0;
+            while (1) {
+                if (g_pipeit_completion_seq >= expected) break;
+                if ((read_cntpct() - t0) > 1200000ULL) { timed_out = 1; break; }
             }
             if (timed_out) timeout_frames++;
-            
-            // Progress log every 100 frames
+
             if (((i + 1) % 100) == 0) {
                 uart_puts(&console, "[PIPE_BENCH] progress=0x");
                 uart_put_hex(&console, i + 1);
@@ -1002,7 +1392,9 @@ void kmain(void) {
         u64 t_pipe_end = read_cntpct();
         u64 pipe_elapsed_ticks = t_pipe_end - t_pipe_start;
         u64 pipe_elapsed_us = pipe_elapsed_ticks / 24;
-        u64 pipe_avg_ns = (pipe_elapsed_ticks * 125) / (PIPE_BENCH_COUNT * 3);
+        u64 completed_frames = (u64)g_pipeit.total_frames;
+        u64 pipe_avg_ns = completed_frames ?
+            ((pipe_elapsed_ticks * 125) / (completed_frames * 3)) : 0;
         
         u64 avg_hidden_cyc = g_pipeit.hidden_count ? 
             g_pipeit.hidden_cycles_sum / g_pipeit.hidden_count : 0;
@@ -1040,9 +1432,19 @@ void kmain(void) {
         extern volatile u64 g_pipeit_output_handler_enter;
         extern volatile u64 g_pipeit_output_handler_exit;
         uart_puts(&console, "[PIPE_DIAG] timeouts=0x");      uart_put_hex(&console, timeout_frames);
-        uart_puts(&console, "\r\n[PIPE_DIAG] sgi_sent: hidden=0x");  uart_put_hex(&console, g_pipeit_sgi_sent[SGI_STAGE_HIDDEN]);
+        uart_puts(&console, " submit_ok=0x");               uart_put_hex(&console, submit_ok);
+        uart_puts(&console, " submit_invalid=0x");          uart_put_hex(&console, submit_invalid);
+        uart_puts(&console, " submit_oom=0x");              uart_put_hex(&console, submit_oom);
+        uart_puts(&console, " submit_other=0x");            uart_put_hex(&console, submit_other);
+        uart_puts(&console, " sgi_hidden_delta=0x");        uart_put_hex(&console,
+            (g_pipeit_sgi_sent[SGI_STAGE_HIDDEN] >= (u64)submit_ok)
+                ? (g_pipeit_sgi_sent[SGI_STAGE_HIDDEN] - (u64)submit_ok)
+                : ((u64)submit_ok - g_pipeit_sgi_sent[SGI_STAGE_HIDDEN]));
+        uart_puts(&console, "\r\n[PIPE_DIAG] sgi_sent: hidden=0x");           uart_put_hex(&console, g_pipeit_sgi_sent[SGI_STAGE_HIDDEN]);
         uart_puts(&console, " output=0x");                            uart_put_hex(&console, g_pipeit_sgi_sent[SGI_STAGE_OUTPUT]);
         uart_puts(&console, " done=0x");                              uart_put_hex(&console, g_pipeit_sgi_sent[SGI_STAGE_DONE]);
+        extern volatile u64 g_pipeit_sgi_a72_enabled;
+        uart_puts(&console, " mode_sgi_a72=0x");                       uart_put_hex(&console, g_pipeit_sgi_a72_enabled);
         uart_puts(&console, "\r\n[PIPE_DIAG] handler_hidden: enter=0x"); uart_put_hex(&console, g_pipeit_hidden_handler_enter);
         uart_puts(&console, " exit=0x");                                  uart_put_hex(&console, g_pipeit_hidden_handler_exit);
         uart_puts(&console, "\r\n[PIPE_DIAG] handler_output: enter=0x"); uart_put_hex(&console, g_pipeit_output_handler_enter);
@@ -1097,7 +1499,7 @@ void kmain(void) {
         // Extended GIC diag (rules out priority/group filters silently blocking IRQ).
         // igrpmodr=0 expected (Group 1 NS). ipri0/ipri1 should show 0xA0 bytes.
         // bpr1 default 0x4 means group preemption at bit[7:3]. ctlr defaults 0.
-        extern volatile u64 gicv3_core_diag2[6][6];
+        extern volatile u64 gicv3_core_diag2[6][7];
         for (u32 c = 0; c < 6; c++) {
             uart_puts(&console, "[GIC_DIAG2] core=0x");      uart_put_hex(&console, c);
             uart_puts(&console, " igrpmodr0=0x");            uart_put_hex(&console, gicv3_core_diag2[c][0]);
@@ -1107,6 +1509,7 @@ void kmain(void) {
             uart_puts(&console, " ctlr=0x");                 uart_put_hex(&console, gicv3_core_diag2[c][4]);
             uart_puts(&console, " gicr_ctlr=0x");             uart_put_hex(&console, gicv3_core_diag2[c][5] & 0xFFFFFFFF);
             uart_puts(&console, " ap1r0=0x");                 uart_put_hex(&console, gicv3_core_diag2[c][5] >> 32);
+            uart_puts(&console, " local_waker_flags=0x");     uart_put_hex(&console, gicv3_core_diag2[c][6]);
             uart_puts(&console, "\r\n");
         }
         // Decode DPG1NS bit (25) of GICR_CTLR for visual scan
@@ -1115,6 +1518,21 @@ void kmain(void) {
             uart_puts(&console, "[GIC_DIAG2] core=0x"); uart_put_hex(&console, c);
             uart_puts(&console, " DPG1NS=");           uart_put_hex(&console, (gicr_ctlr_v >> 25) & 1);
             uart_puts(&console, " DPG0=");             uart_put_hex(&console, (gicr_ctlr_v >> 24) & 1);
+            uart_puts(&console, "\r\n");
+        }
+        // WAKER handshake trace from gicv3_force_wake_core():
+        // pre -> after_ps1 -> after_ps0 -> final, retries, flags.
+        // flags: bit0 sleep_timeout, bit1 wake_timeout,
+        //        bit2 PS=1 write ignored, bit3 PS=0 write ignored.
+        extern volatile u64 gicv3_waker_trace[6][6];
+        for (u32 c = 0; c < 6; c++) {
+            uart_puts(&console, "[WAKER_TRACE] core=0x");     uart_put_hex(&console, c);
+            uart_puts(&console, " pre=0x");                   uart_put_hex(&console, gicv3_waker_trace[c][0]);
+            uart_puts(&console, " ps1=0x");                   uart_put_hex(&console, gicv3_waker_trace[c][1]);
+            uart_puts(&console, " ps0=0x");                   uart_put_hex(&console, gicv3_waker_trace[c][2]);
+            uart_puts(&console, " final=0x");                 uart_put_hex(&console, gicv3_waker_trace[c][3]);
+            uart_puts(&console, " retries=0x");               uart_put_hex(&console, gicv3_waker_trace[c][4]);
+            uart_puts(&console, " flags=0x");                 uart_put_hex(&console, gicv3_waker_trace[c][5]);
             uart_puts(&console, "\r\n");
         }
         // Per-core PE state captured AFTER daifclr in smp_secondary_main.

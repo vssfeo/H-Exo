@@ -7,11 +7,30 @@
 static volatile u32 gicd_lock = 0;
 
 static inline void lock_gicd(void) {
-    while (__atomic_test_and_set(&gicd_lock, __ATOMIC_ACQUIRE));
+    u32 loaded;
+    u32 status;
+    do {
+        do {
+            asm volatile("ldaxr %w0, [%1]"
+                         : "=&r"(loaded)
+                         : "r"(&gicd_lock)
+                         : "memory");
+            if (loaded != 0u) {
+                asm volatile("yield");
+            }
+        } while (loaded != 0u);
+
+        asm volatile("stxr %w0, %w2, [%1]"
+                     : "=&r"(status)
+                     : "r"(&gicd_lock), "r"(1u)
+                     : "memory");
+    } while (status != 0u);
+
+    asm volatile("dmb ish" ::: "memory");
 }
 
 static inline void unlock_gicd(void) {
-    __atomic_clear(&gicd_lock, __ATOMIC_RELEASE);
+    asm volatile("stlr %w1, [%0]" :: "r"(&gicd_lock), "r"(0u) : "memory");
 }
 
 // Register access helpers - proper 64-bit address handling
@@ -196,7 +215,7 @@ result_t gicv3_init(void) {
 volatile u64 __attribute__((aligned(64))) gicv3_core_diag[6][8];
 // Extended diag: IGRPMODR0 (bits per intid) + IPRIORITYR0..3 (4 SGIs)
 // + ICC_BPR1_EL1 + ICC_CTLR_EL1.
-volatile u64 __attribute__((aligned(64))) gicv3_core_diag2[6][6];
+volatile u64 __attribute__((aligned(64))) gicv3_core_diag2[6][7];
 
 // Phase 2: Per-core CPU interface init (must be called on each secondary core)
 // Each core has its own ICC_SRE/PMR/IGRPEN1 system registers
@@ -313,6 +332,7 @@ void gicv3_init_cpu_iface(void) {
     gicv3_core_diag2[core][3] = v_bpr1;
     gicv3_core_diag2[core][4] = v_ctlr;
     gicv3_core_diag2[core][5] = ((u64)*gicr_ctlr_dbg) | (v_ap1r0 << 32);
+    gicv3_core_diag2[core][6] = (u64)gicv3_waker_trace[core][5];  // local wake flags from gicv3_force_wake_core()
     asm volatile("dc civac, %0" :: "r"(&gicv3_core_diag[core][0]) : "memory");
     asm volatile("dc civac, %0" :: "r"(&gicv3_core_diag2[core][0]) : "memory");
     asm volatile("dsb sy" ::: "memory");
