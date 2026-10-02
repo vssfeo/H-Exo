@@ -394,7 +394,12 @@ The following telemetry is permanently wired and survives across SMP failures:
 | 2026-10-02 | `A72_PROBE_B` verdict bug fixed - it printed HPPIR read before injection, so it proved nothing |
 | 2026-10-02 | ADB400 big-cluster to GIC handshake dumped at 4 stages: identical to the little cluster, hypothesis eliminated |
 | 2026-10-02 | BL31 built by CI and written to the SD card at LBA 0x4000 over U-Boot `mmc write` - no card removal required |
-| 2026-10-02 | The BL31 GICR wake patch measured to be a no-op; relabelled from `fix` to a labelled experiment |
+| 2026-10-02 | The BL31 GICR wake patch measured to be a no-op; relabelled from `fix` to a labelled experiment || 2026-10-02 | `L2ACTLR_EL1` probed on cores 4,5 via a new SiP SMC: `raw=0x10` on both, no control bit set - hypothesis not supported |
+| 2026-10-02 | Documented that TF-A's two `ChildrenAsleep` poll loops are unbounded - any future WAKER write could hang BL31 in EL3 forever |
+| 2026-10-02 | Corrected the `Quiesce` row: the SGI frame has no `GICR_CTLR` at all, per IHI 0069 Table 8-29 |
+| 2026-10-02 | Project docs reviewed: `PHASE2_MALI_PIPEIT_RECOVERY.md` credited 928/1000 SGI *sends* as 92.8% *delivery*; real delivery was 0, the polling fallback caught all 1000 |
+| 2026-10-02 | `MASTER_PLAN_v3.2` classified the A72 interrupt failure as silicon errata and rebuilt IPC around a SEV fallback on that basis - premise now measured false, ADL-008 needs superseding |
+
 
 ---
 
@@ -437,7 +442,8 @@ they never join the dispatch rotation. That defect was not recorded until now.
 | `GICR_CTLR` is never written | Measured `0x0` on all six cores, including the working ones |
 | CCI-500 snoop disabled for A72 during bring-up | A real TF-A ordering defect: `plat_cci_enable()` uses `read_mpidr()`, so a cluster node can only be enabled by a PE inside that cluster. But IHI 0069 has zero occurrences of "snoop" - GIC MMIO is Device memory with in-order arrival and the Redistributor to CPU interface link is AXI4-Stream packets. No causal path to SGI delivery |
 | ADB400 big-cluster to GIC handshake broken | Measured identical to the little cluster at all four sampled stages |
-| SGI-frame `GICR_CTLR.Quiesce` stuck | Reads `0` from Non-Secure EL2 for every core, so it is not a discriminator (and may simply not be observable from NS on this part) |
+| A stalled `Quiesce` on the SGI frame | There is no such register. Per IHI 0069 Table 8-29 the SGI frame register map starts at `0x0080` (`GICR_IGROUPR0`); `GICR_CTLR` exists only in the RD frame, and `Quiesce` is a GIC Stream Protocol *command*, not a bit. Reading `SGI_base + 0x0000` returns zeros because nothing is mapped there |
+| A72 `L2ACTLR_EL1` has the L2 GIC-timer clock forced off | Measured `raw=0x10` on both cores 4 and 5, identical. None of the defined bits (6, 7, 8, 11, 14, 26, 27, 28) is set. More importantly `L2ACTLR_EL1` is an *override* register, not a status register: `FORCE_*_CLK_ACTIVE = 0` means software has not forced the clock, which is the reset state, and says nothing about whether the clock runs. Answering that needs a CRU/PMU clock **status** register, not a CPU override register |
 
 ### What remains
 
@@ -453,13 +459,51 @@ one interrupt stream per cluster.
 `.github/workflows/rk3399-full-boot-firmware.yml` as one: it was measured to be
 a no-op and is kept only as a labelled experiment.
 
-### Diagnostic bug found and fixed en route
+### Remaining leads
+
+1. **`rk3399_bl31_v1.36.elf` from rkbin.** The only remaining unexplored
+   artefact. It is a prebuilt Rockchip BL31 with no public source, so it cannot
+   be reasoned about - only disassembled and diffed against the TF-A v2.14.0
+   path. If it configures the A72 redistributor differently, that is the answer.
+   Nothing else known to the project has been left unmeasured.
+2. **CRU/PMU clock status for the A72 L2 GIC-timer domain.** Follows from the
+   `L2ACTLR_EL1` result above: the override register is clean, so the question
+   has to be asked of the clock controller. The register has not been located;
+   it needs the RK3399 TRM clock-gate table.
+
+### Hazards to respect before changing anything
+
+* Both `ChildrenAsleep` poll loops in TF-A's `gicv3_rdistif_mark_core_awake()`
+  (`drivers/arm/gic/v3/gicv3_helpers.c`) are **unbounded** - no counter, no
+  `udelay`, no timeout, and no `WARN` on the second one. Contrast the loops in
+  `pmu.c`, which all bound themselves. Consequence: if any change ever makes
+  `ProcessorSleep` read as `1` on an A72, BL31 will spin in EL3 forever and the
+  core will never reach EL2. This must be bounded before any WAKER write is
+  attempted.
+* TF-A returns immediately from `mark_core_awake()` when `ProcessorSleep` is
+  already 0 (`gicv3_helpers.c:41-43`), which is why the A72 frames are left at
+  `WAKER = 0x4` and why the experimental hook in the CI workflow reads
+  `ChildrenAsleep` as 0 and returns.
+* Never write CCI-500 or `PMU_CCI500_CON` from Non-Secure EL2 (ADL-005). NS
+  writes create `CHANGE_PENDING` transactions that never complete.
+
+### Diagnostic bugs found and fixed en route
 
 `A72_PROBE_B` used to print `ICC_HPPIR1_EL1` read *before* the pending bit was
 injected. That value is trivially `0x3FF` and could never distinguish a live
 forward path from a dead one, so its earlier "FORWARD_PATH_DEAD" verdict proved
 nothing. Fixed in commit `a25a3449`; the verdict now derives from `hppir_after`,
 with `before`, `after` and `final` all printed.
+
+The same class of bug appeared twice and is worth naming, because it produces a
+*false* result rather than a crash. `A72_PROBE_B` read a register before
+injecting the thing it was supposed to observe. A patch can also be wrongly
+declared missing: the `L2ACTLR` SiP patch adds no string literals, only macros,
+two `static` functions and a `case`, so grepping the built `bl31.elf` for
+"L2ACTLR" finds nothing and looks like a failed build. It had to be verified with
+`nm -a` plus `objdump`, where the inlined `mrs x0, s3_1_c15_c0_0`
+(`d539f000`) is present. **Verify a patch reached the binary by symbols or
+disassembly, never by grepping for strings it does not contain.**
 
 ---
 
