@@ -1499,7 +1499,9 @@ void kmain(void) {
         // Extended GIC diag (rules out priority/group filters silently blocking IRQ).
         // igrpmodr=0 expected (Group 1 NS). ipri0/ipri1 should show 0xA0 bytes.
         // bpr1 default 0x4 means group preemption at bit[7:3]. ctlr defaults 0.
-        extern volatile u64 gicv3_core_diag2[6][7];
+        // Column count MUST match hal/gicv3.c. Mismatched extern/definition
+        // across translation units is undefined behaviour, not just a warning.
+        extern volatile u64 gicv3_core_diag2[6][13];
         for (u32 c = 0; c < 6; c++) {
             uart_puts(&console, "[GIC_DIAG2] core=0x");      uart_put_hex(&console, c);
             uart_puts(&console, " igrpmodr0=0x");            uart_put_hex(&console, gicv3_core_diag2[c][0]);
@@ -1510,6 +1512,29 @@ void kmain(void) {
             uart_puts(&console, " gicr_ctlr=0x");             uart_put_hex(&console, gicv3_core_diag2[c][5] & 0xFFFFFFFF);
             uart_puts(&console, " ap1r0=0x");                 uart_put_hex(&console, gicv3_core_diag2[c][5] >> 32);
             uart_puts(&console, " local_waker_flags=0x");     uart_put_hex(&console, gicv3_core_diag2[c][6]);
+        uart_puts(&console, "\r\n");
+        if (c >= 4) {
+            u32 wf = (u32)(gicv3_core_diag2[c][6] >> 32);
+            u32 wpre = (u32)gicv3_core_diag2[c][7];
+            u32 wps1 = (u32)gicv3_core_diag2[c][8];
+            u32 wca1 = (u32)gicv3_core_diag2[c][9];
+            u32 wps0 = (u32)gicv3_core_diag2[c][10];
+            u32 wca0 = (u32)gicv3_core_diag2[c][11];
+            u32 wfin = (u32)gicv3_core_diag2[c][12];
+            uart_puts(&console, "  A72_PROBE_A core=0x"); uart_put_hex(&console, c);
+            uart_puts(&console, " wpre=0x");   uart_put_hex(&console, wpre);
+            uart_puts(&console, " ps1_rb=0x"); uart_put_hex(&console, wps1);
+            uart_puts(&console, " ca_polls_ps1=0x"); uart_put_hex(&console, wca1);
+            uart_puts(&console, " ps0_rb=0x"); uart_put_hex(&console, wps0);
+            uart_puts(&console, " ca_polls_ps0=0x"); uart_put_hex(&console, wca0);
+            uart_puts(&console, " wfinal=0x");  uart_put_hex(&console, wfin);
+            uart_puts(&console, "\r\n");
+            uart_puts(&console, "  A72_PROBE_B core=0x"); uart_put_hex(&console, c);
+            uart_puts(&console, " hppir_before=0x"); uart_put_hex(&console, wf & 0x3FF);
+            uart_puts(&console, " verdict=");
+            uart_puts(&console, (wf & 0x3FFu) != 0x3FFu ? "PPI_DELIVERED" : "FORWARD_PATH_DEAD");
+            uart_puts(&console, "\r\n");
+        }
             uart_puts(&console, "\r\n");
         }
         // Decode DPG1NS bit (25) of GICR_CTLR for visual scan
