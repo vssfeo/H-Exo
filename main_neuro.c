@@ -1716,7 +1716,23 @@ void kmain(void) {
             else           uart_putc(&console, c);
             continue;
         }
-        asm volatile("wfi"); // sleep until next GMAC IRQ or SEV
+        // Idle with a bounded yield loop instead of WFI.
+        //
+        // Only the GMAC interrupt is routed in the GIC (SPI 24, enabled at
+        // the GMAC init above), and no UART RX interrupt is enabled at all.
+        // A byte that arrives while this core is in WFI therefore never
+        // wakes it, so the polled console commands below stay unreachable
+        // for as long as the board is idle. Measured 2026-10-02: with the
+        // board sitting at the ">" prompt, sending "d" or "r" produced no
+        // response at all, which also blocked unattended reboots.
+        //
+        // Spinning briefly keeps the console responsive at negligible cost.
+        // The proper fix is to route and enable the UART2 GIC interrupt and
+        // restore WFI; that needs the RK3399 UART2 IRQ id, which is not
+        // present anywhere in this repository (no dts, no IRQ constant).
+        for (u32 idle_spin = 0; idle_spin < 20000u; idle_spin++) {
+            asm volatile("yield");
+        }
     }
     
 }
