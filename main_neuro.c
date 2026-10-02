@@ -468,6 +468,33 @@ static void print_banner(void) {
 }
 
 
+// ---------------------------------------------------------------------------
+// H-Exo: EXPERIMENT, MEASURED NO-OP. DO NOT READ AS A FIX.
+//
+// This re-init was committed as a fix. That label was wrong and is corrected
+// here. Measured result, in order:
+//
+//   1. Placed right after gicv3_init(): reported c4=0 c5=0. Reason: cores 4/5 were
+//      still inside pipeit_worker_idle_hidden() and never reached
+//      wq_worker_poll(), so the job was never collected. Not a coherency fault.
+//   2. Still c4=0 c5=0. The fault was in the probe: the wait loop used dc civac on
+//      the read side, which is a CLEAN operation, so core 0 wrote its own stale
+//      zero back over the value the A72 had just published. Read side needs
+//      dc ivac.
+//   3. After that fix: entered4=1 entered5=1, c4=0 c5=0. Both A72 cores DO reach
+//      and enter the job and never finish it. gicv3_init_cpu_iface() does not
+//      return when called on a Cortex-A72 at that point, with the A72 self-probes
+//      suppressed or not.
+//   4. gicv3_init_cpu_iface() on core 0 hangs if called before smp_init(), so
+//      moving the whole block earlier is not viable either.
+//
+// So the reorder hypothesis is untested in this form. What IS established: the
+// A72 cores are reachable through the workqueue, and re-running the per-CPU
+// interface enable late on them does not complete. The A72 defect is unchanged -
+// Armbian on the same card with the same BL31 gives cores 4 and 5 thousands of
+// interrupts, so the fault remains in H-Exo's GIC bring-up.
+// ---------------------------------------------------------------------------
+
 // H-Exo: per-core result of the post-Distributor CPU-interface re-init.
 // slot 0 = A72 core 4, slot 1 = A72 core 5 (cluster 1, selected by Aff0).
 volatile u64 __attribute__((aligned(64))) g_a72_gic_reinit_done[2];
