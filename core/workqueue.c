@@ -39,8 +39,18 @@ void wq_dispatch(u32 dst_core, wq_fn_t fn, u64 arg) {
     s->arg   = arg;
     wq_submit_cycles[dst_core] = wq_read_cycles();
     wq_dispatch_counts[dst_core]++;
-    asm volatile("dmb ish" ::: "memory"); // ensure fn/arg visible before ready
+    // dmb orders but does NOT write back. The A72 cluster does not snoop A53
+    // stores (documented in docs/PHASE2_MALI_PIPEIT_RECOVERY.md), so without an
+    // explicit clean-and-invalidate the target core reads a stale cached copy of
+    // this slot and never sees the job. Same pattern as g_pipeit_active,
+    // g_smpen_diag and g_l2actlr_diag.
+    asm volatile("dc civac, %0" :: "r"(&s->ready) : "memory");
+    asm volatile("dc civac, %0" :: "r"(&s->fn) : "memory");
+    asm volatile("dc civac, %0" :: "r"(&s->arg) : "memory");
+    asm volatile("dsb ish" ::: "memory");
     s->ready = 1;
+    asm volatile("dc civac, %0" :: "r"(&s->ready) : "memory");
+    asm volatile("dsb ish" ::: "memory");
     asm volatile("sev");                  // wake the secondary core if in WFE
 }
 
@@ -60,10 +70,34 @@ u32 wq_try_dispatch(u32 dst_core, wq_fn_t fn, u64 arg) {
     return 1;
 }
 
+// Round-robin counter for wq_dispatch_any
+static volatile u32 wq_round_robin_next = 1;
+
+// Dispatch to any available secondary core (round-robin across cores 1..N).
+// Returns core_idx if dispatched, 0 if all cores busy.
+u32 wq_dispatch_any(wq_fn_t fn, u64 arg) {
+    u32 start = wq_round_robin_next;
+    for (u32 i = 0; i < SMP_MAX_CORES - 1; i++) {
+        u32 core = ((start - 1 + i) % (SMP_MAX_CORES - 1)) + 1;  // 1..N
+        if (wq_try_dispatch(core, fn, arg)) {
+            wq_round_robin_next = (core % (SMP_MAX_CORES - 1)) + 1;  // next after this one
+            return core;
+        }
+    }
+    return 0;  // all cores busy
+}
+
 // Called by secondary core in its spin loop.
 void wq_worker_poll(u32 core_idx) {
     wq_slot_t* s = &wq_slots[core_idx];
+    // Invalidate first: this core's cached copy of the slot may predate the
+    // dispatch. Required for the A72 cluster, which does not snoop A53 stores.
+    asm volatile("dc ivac, %0" :: "r"(&s->ready) : "memory");
+    asm volatile("dsb ish" ::: "memory");
     if (s->ready) {
+        asm volatile("dc ivac, %0" :: "r"(&s->fn) : "memory");
+        asm volatile("dc ivac, %0" :: "r"(&s->arg) : "memory");
+        asm volatile("dsb ish" ::: "memory");
         asm volatile("dmb ish" ::: "memory"); // ensure we see fn/arg
         wq_fn_t fn = s->fn;
         u64     arg = s->arg;
@@ -73,6 +107,10 @@ void wq_worker_poll(u32 core_idx) {
         wq_complete_counts[core_idx]++;
         asm volatile("dmb ish" ::: "memory"); // ensure callee writes visible
         s->done = 1;
+        // wq_dispatch() spins on s->done; without this the initiator can spin on
+        // a stale cached copy forever.
+        asm volatile("dc civac, %0" :: "r"(&s->done) : "memory");
+        asm volatile("dsb ish" ::: "memory");
     }
 }
 
