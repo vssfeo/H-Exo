@@ -181,6 +181,42 @@ static u32 smp_core_reached_secondary_entry(u32 core_idx) {
 // PMU per-core PM control: PMU_BASE + 0xC0 + cpu_id*4
 // 0=CORES_PM_DISABLE, BIT(3)=soft_wakeup_en, BIT(0)=core_pm_en
 #define PMU_CORE_PM_CON(n)   (0xC0 + (n) * 4)
+#define PMU_ADB400_CON       0x70
+
+/*
+ * H-Exo: ADB400 big-cluster <-> GIC handshake telemetry.
+ *
+ * Bit numbers are verbatim from TF-A v2.14.0
+ * plat/rockchip/rk3399/include/shared/pmu_bits.h, enums pmu_adb400_con and
+ * pmu_adb400_st, which are numbered identically:
+ *
+ *   0 REQ_CXCS_SW         1 REQ_CORE_L_SW       2 REQ_CORE_L_2GIC_SW
+ *   3 REQ_GIC2_CORE_L_SW  4 REQ_CORE_B_SW       5 REQ_CORE_B_2GIC_SW
+ *   6 REQ_GIC2_CORE_B_SW
+ *   8 CLR_CXCS_HW         9 CLR_CORE_L_HW      10 CLR_CORE_L_2GIC_HW
+ *  11 CLR_GIC2_CORE_L_HW 12 CLR_CORE_B_HW      13 CLR_CORE_B_2GIC_HW
+ *  14 CLR_GIC2_CORE_B_HW
+ *
+ * RK3399 drives GIC->PE over a separate AXI4-Stream interface per cluster, so
+ * bits 5/6 (soft requests) and 13/14 (hardware "clear" handshakes) govern
+ * whether the A72 cluster's interrupt stream to the GIC block is up. Stage
+ * order matches smp_log_cci_state(): 0 pre-cpu_on, 1 post-cpu_on,
+ * 2 post-evict, 3 poll-end.
+ */
+volatile u64 __attribute__((aligned(64))) g_smp_adb_trace[4][2] = {
+    { 0xDEADBEEFDEADBEEFUL, 0xDEADBEEFDEADBEEFUL },
+    { 0xDEADBEEFDEADBEEFUL, 0xDEADBEEFDEADBEEFUL },
+    { 0xDEADBEEFDEADBEEFUL, 0xDEADBEEFDEADBEEFUL },
+    { 0xDEADBEEFDEADBEEFUL, 0xDEADBEEFDEADBEEFUL },
+};
+
+static void smp_adb_sample(u32 stage) {
+    if (stage > 3u) return;
+    g_smp_adb_trace[stage][0] = *(volatile u32 *)(PMU_BASE + PMU_ADB400_CON);
+    g_smp_adb_trace[stage][1] = *(volatile u32 *)(PMU_BASE + PMU_ADB400_ST);
+    asm volatile("dc civac, %0" :: "r"(&g_smp_adb_trace[stage][0]) : "memory");
+    asm volatile("dsb sy" ::: "memory");
+}
 // SGRF_SOC_CON1 (0xFF33C004) holds warmboot address but is SECURE-ONLY — do not read from NS EL2.
 // PMUGRF OS registers (diagnostic breadcrumbs)
 #define PMUGRF_OS_REG1       0xFF320304UL
@@ -662,6 +698,7 @@ result_t smp_init(void) {
     smp_log_a72_hw_sample("pre-cpu_on");
     smp_log_a72_cluster_aff("pre-cpu_on");
     smp_log_gicr_waker_decode("pre-cpu_on");
+    smp_adb_sample(0u);
     smp_log_cci_state("pre-cpu_on");
 
     // A72 must use the SAME trampoline as A53 (TRAMP_PA = 0x200000).
@@ -703,6 +740,7 @@ result_t smp_init(void) {
         uart_put_hex(&console, (u64)(i64)ret);
         uart_puts(&console, "\r\n");
     }
+    smp_adb_sample(1u);
     smp_log_cci_state("post-cpu_on");
 
     // Step 2: Fill A53's L2 (1MB, 8-way) with NS accesses to evict BL31's dirty
@@ -727,6 +765,7 @@ result_t smp_init(void) {
         smp_psci_diag[4].sev_bursts += 2;
         smp_psci_diag[5].sev_bursts += 2;
     }
+    smp_adb_sample(2u);
     smp_log_cci_state("post-evict");
 
     // Poll A72 for up to 5 seconds. While polling, periodically re-evict A53 L2
@@ -803,6 +842,7 @@ result_t smp_init(void) {
         }
         for (u32 y = 0; y < 100; y++) asm volatile("yield");
     }
+    smp_adb_sample(3u);
     smp_log_cci_state("poll-end");
 
     // Report poll results.

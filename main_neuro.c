@@ -1501,7 +1501,7 @@ void kmain(void) {
         // bpr1 default 0x4 means group preemption at bit[7:3]. ctlr defaults 0.
         // Column count MUST match hal/gicv3.c. Mismatched extern/definition
         // across translation units is undefined behaviour, not just a warning.
-        extern volatile u64 gicv3_core_diag2[6][13];
+        extern volatile u64 gicv3_core_diag2[6][17];
         for (u32 c = 0; c < 6; c++) {
             uart_puts(&console, "[GIC_DIAG2] core=0x");      uart_put_hex(&console, c);
             uart_puts(&console, " igrpmodr0=0x");            uart_put_hex(&console, gicv3_core_diag2[c][0]);
@@ -1530,9 +1530,14 @@ void kmain(void) {
             uart_puts(&console, " wfinal=0x");  uart_put_hex(&console, wfin);
             uart_puts(&console, "\r\n");
             uart_puts(&console, "  A72_PROBE_B core=0x"); uart_put_hex(&console, c);
-            uart_puts(&console, " hppir_before=0x"); uart_put_hex(&console, wf & 0x3FF);
+            // wf is the high half of slot 6, which now carries hppir_after, so
+            // printing both proves the probe plumbing end to end.
+            uart_puts(&console, " slot6_hi=0x");     uart_put_hex(&console, wf);
+            uart_puts(&console, " hppir_before=0x"); uart_put_hex(&console, gicv3_core_diag2[c][13]);
+            uart_puts(&console, " hppir_after=0x");  uart_put_hex(&console, gicv3_core_diag2[c][14]);
+            uart_puts(&console, " hppir_final=0x");  uart_put_hex(&console, gicv3_core_diag2[c][16]);
             uart_puts(&console, " verdict=");
-            uart_puts(&console, (wf & 0x3FFu) != 0x3FFu ? "PPI_DELIVERED" : "FORWARD_PATH_DEAD");
+            uart_puts(&console, gicv3_core_diag2[c][15] ? "PPI_DELIVERED" : "FORWARD_PATH_DEAD");
             uart_puts(&console, "\r\n");
         }
             uart_puts(&console, "\r\n");
@@ -1544,6 +1549,45 @@ void kmain(void) {
             uart_puts(&console, " DPG1NS=");           uart_put_hex(&console, (gicr_ctlr_v >> 25) & 1);
             uart_puts(&console, " DPG0=");             uart_put_hex(&console, (gicr_ctlr_v >> 24) & 1);
             uart_puts(&console, "\r\n");
+        }
+        // H-Exo: ADB400 big-cluster <-> GIC handshake, sampled at the four
+        // bring-up stages. RK3399 carries GIC->PE interrupts over a separate
+        // AXI4-Stream interface per cluster, so the A72 columns decide whether
+        // that cluster's interrupt stream to the GIC block is up:
+        // REQ_2GIC / REQ_GIC2 are the soft power requests, CLR_2GIC / CLR_GIC2
+        // the hardware "clear" handshakes.
+        {
+            extern volatile u64 g_smp_adb_trace[4][2];
+            uart_puts(&console, "\r\n");
+            for (u32 st = 0; st < 4u; st++) {
+                u32 con = (u32)(g_smp_adb_trace[st][0] & 0xFFFFFFFFu);
+                u32 stb = (u32)(g_smp_adb_trace[st][1] & 0xFFFFFFFFu);
+                uart_puts(&console, "  [ADB400] stage");
+                uart_put_hex(&console, st);
+                uart_puts(&console, " CON=0x"); uart_put_hex(&console, con);
+                uart_puts(&console, " ST=0x");  uart_put_hex(&console, stb);
+                uart_puts(&console, " | A72 con r2g=");
+                uart_put_hex(&console, (con >> 5) & 1u);
+                uart_puts(&console, " rg2=");
+                uart_put_hex(&console, (con >> 6) & 1u);
+                uart_puts(&console, " c2g=");
+                uart_put_hex(&console, (con >> 13) & 1u);
+                uart_puts(&console, " cg2=");
+                uart_put_hex(&console, (con >> 14) & 1u);
+                uart_puts(&console, " st r2g=");
+                uart_put_hex(&console, (stb >> 5) & 1u);
+                uart_puts(&console, " rg2=");
+                uart_put_hex(&console, (stb >> 6) & 1u);
+                uart_puts(&console, " c2g=");
+                uart_put_hex(&console, (stb >> 13) & 1u);
+                uart_puts(&console, " cg2=");
+                uart_put_hex(&console, (stb >> 14) & 1u);
+                uart_puts(&console, " | A53 con r2g=");
+                uart_put_hex(&console, (con >> 2) & 1u);
+                uart_puts(&console, " rg2=");
+                uart_put_hex(&console, (con >> 3) & 1u);
+                uart_puts(&console, "\r\n");
+            }
         }
         // WAKER handshake trace from gicv3_force_wake_core():
         // pre -> after_ps1 -> after_ps0 -> final, retries, flags.

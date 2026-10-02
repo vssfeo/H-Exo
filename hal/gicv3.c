@@ -215,7 +215,7 @@ result_t gicv3_init(void) {
 volatile u64 __attribute__((aligned(64))) gicv3_core_diag[6][8];
 // Extended diag: IGRPMODR0 (bits per intid) + IPRIORITYR0..3 (4 SGIs)
 // + ICC_BPR1_EL1 + ICC_CTLR_EL1.
-volatile u64 __attribute__((aligned(64))) gicv3_core_diag2[6][13];
+volatile u64 __attribute__((aligned(64))) gicv3_core_diag2[6][17];
 
 // Phase 2: Per-core CPU interface init (must be called on each secondary core)
 // Each core has its own ICC_SRE/PMR/IGRPEN1 system registers
@@ -307,7 +307,21 @@ static void gicv3_probe_local_irq_path(u32 core) {
     asm volatile("dsb sy" ::: "memory");
     asm volatile("isb" ::: "memory");
 
-    gicv3_core_diag2[core][6] |= ((u64)(hppir_before & 0x3FFu) << 32);   // stash HPPIR before in high half
+    /*
+     * The decisive signal is hppir_after. hppir_before is read before anything
+     * is injected, so it is trivially 0x3FF ("nothing pending") and cannot
+     * distinguish a live forward path from a dead one. Stash the AFTER value so
+     * the NS-side verdict reflects what actually reached the CPU interface.
+     */
+    gicv3_core_diag2[core][6]  |= ((u64)(hppir_after & 0x3FFu) << 32);
+    gicv3_core_diag2[core][13] = (u64)(hppir_before & 0x3FFu);
+    gicv3_core_diag2[core][14] = (u64)(hppir_after  & 0x3FFu);
+    gicv3_core_diag2[core][15] = (u64)((hppir_after & 0x3FFu) != 0x3FFu);
+    {
+        u64 hppir_final;
+        asm volatile("mrs %0, S3_0_C12_C12_2" : "=r"(hppir_final));  /* ICC_HPPIR1_EL1 */
+        gicv3_core_diag2[core][16] = (u64)(hppir_final & 0x3FFu);
+    }
     asm volatile("dc civac, %0" :: "r"(&gicv3_core_diag2[core][0]) : "memory");
     asm volatile("dsb sy" ::: "memory");
 }
