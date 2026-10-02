@@ -173,32 +173,68 @@ fb[6] = mair;    // beacon[6] @ 0x02000030
 
 ---
 
-## 🔄 MILESTONE 4 — SMP Bring-Up A72 Cluster (IN PROGRESS)
+## ✅ MILESTONE 4 — SMP Bring-Up A72 Cluster (COMPLETE — 2026-04-22)
 
 **Goal**: Bring Cortex-A72 cores 4–5 online.
 
-### Current State
-- PSCI `CPU_ON` returns 0 (success) for both A72 cores
-- `PMU_PWRDN_ST` changes from `0x3E` → `0x00` (all power domains powered up)
-- But cores 4–5 remain `AFF_STATE_ON_PENDING` after 300 ms timeout
-- No trampoline telemetry for cores 4–5
+### 4.1 What Was Broken (History)
 
-### Hypothesis
-- A72 is a separate cluster (`Aff1=1`) with its own CCI-500 slave port
-- The A72 cluster may require explicit CCI snoop enable for slave 0 (A53 uses slave 1)
-- BL31 may need `SCU_B` (A72 SCU) to be enabled before secondaries can reach the trampoline
-- MPIDR for A72: `0x80000100` (core 4), `0x80000101` (core 5) — different `Aff1`
+#### Stage A — A72 cores reset entire SoC after CPU_ON
+- PSCI `CPU_ON(0x80000100, 0x200000)` returned success but board immediately reset.
+- Reset cause: `RST` (SoC-level watchdog/SError).
+- No trampoline telemetry survived the reset.
 
-### Known Facts
-- `PMU_PWRDN_ST` bit 4 (A72 core 0) and bit 5 (A72 core 1) go to 0 → power domains came up
-- But `AFFINITY_INFO` still returns `ON_PENDING`
-- A72 warmboot path in TF-A may differ from A53 (different PMU domain: `CPU_SCU_B`)
+#### Stage B — GRF OS_REG2 beacons survive reset
+- Added step-by-step beacons (`0xB1..0xB5` in trampoline, `0xC1..0xC4` around CPU_ON).
+- Beacons showed crash happened **inside the SMC call** — no post-CPU_ON beacon written.
 
-### Next Actions
-1. Enable CCI-500 slave 0 (A72 side) in addition to slave 1 (A53) in `hal/cci.c`
-2. Check if A72 cluster needs separate RVBAR_EL3 setup in BL31
-3. Add MPIDR A72 topology check in trampoline (Aff1=1 path)
-4. Consider A72-specific power sequence: `CPUON_B` vs `CPUON_L`
+#### Stage C — CCI-500 CHANGE_PENDING stuck for both clusters
+- CCI state log: `a53=0x80000002(S=0,D=1) a72=0x80000002(S=0,D=1)`
+- Bit 31 = CHANGE_PENDING set, snoop not enabled.
+- Our `cci500_enable()` wrote `0x3` to CCI slave registers from **Non-Secure EL2**.
+- These NS writes created CHANGE_PENDING transactions that **never complete** —
+  CCI-500 is managed by TF-A Secure world, NS writes are ignored but leave PENDING stuck.
+
+#### Stage D — Deploy script disabled caches before kernel launch
+- `deploy_tftp_fixed.ps1` ran `dcache off` / `icache off` before `go 0x02080000`.
+- This broke cache coherency for A72 cores that need coherent CCI path.
+
+#### Stage E — ROOT CAUSE IDENTIFIED AND FIXED ✅
+
+**Root cause**: Two independent problems:
+
+1. **NS CCI writes** — `cci500_enable()` and PMU CCI500_CON writes from NS EL2
+   created stuck CHANGE_PENDING in CCI-500. When TF-A's `cci_enable_snoop_dvm_reqs()`
+   ran during `pwr_domain_on_finish`, it spun forever on CHANGE_PENDING → watchdog reset.
+
+2. **Cache disable** — `dcache off`/`icache off` in deploy script broke coherency.
+
+**Fixes applied**:
+1. `hal/cci.c`: `cci500_enable()` → **no-op** (TF-A manages CCI from Secure)
+2. `core/smp.c`: Removed PMU CCI500_CON write (same NS interference)
+3. `deploy_tftp_fixed.ps1`: Removed `dcache off` / `icache off`
+4. `core/smp.c`: Added `dc civac` + `ic ialluis` + `dsb/isb` before CPU_ON (cache flush only)
+
+### 4.2 Final Proof (UART log 2026-04-22)
+
+```
+[SMP][CCI] post-cpu_on a53=0xC0000003(S=1,D=1) a72=0xC0000003(S=1,D=1)
+[SMP] core 4 ONLINE after 1 polls
+[SMP] core 5 ONLINE after 1 polls
+[OK] SMP: 6 cores online
+```
+
+CCI shows `0xC0000003` = snoop+DVM enabled, no PENDING — TF-A did its job.
+
+### 4.3 Technical Summary
+
+| Layer | Before fix | After fix |
+|-------|-----------|----------|
+| CCI-500 snoop | NS write → stuck PENDING | No-op, TF-A manages |
+| PMU CCI500_CON | NS write → interference | Removed |
+| Deploy caches | dcache/icache off | Kept enabled |
+| Cache flush before CPU_ON | None | dc civac + ic ialluis |
+| A72 bring-up result | SoC reset | All 6 cores online |
 
 ---
 
@@ -294,6 +330,12 @@ fb[6] = mair;    // beacon[6] @ 0x02000030
   returns `PSCI_E_INVALID_PARAMS`.
 - **Date**: 2026-03
 
+### ADL-005 — No NS CCI-500 Register Writes
+- **Decision**: Never write CCI-500 slave interface or PMU_CCI500_CON registers from Non-Secure EL2.
+- **Reason**: NS writes to CCI Snoop Control Registers create CHANGE_PENDING transactions that never complete (CCI is managed by TF-A Secure world). The stuck PENDING blocks TF-A's `cci_enable_snoop_dvm_reqs()` during `pwr_domain_on_finish`, causing infinite wait → watchdog → SoC reset.
+- **Evidence**: `a53=0x80000002(S=0,D=1) a72=0x80000002(S=0,D=1)` — PENDING stuck for both clusters. After removing NS writes: `a53=0xC0000003(S=1,D=1) a72=0xC0000003(S=1,D=1)` — TF-A enables snoop correctly.
+- **Date**: 2026-04-22
+
 ### ADL-004 — No BL31 RAM Override
 - **Decision**: Do NOT copy custom BL31 binary to 0x40000 via U-Boot `cp.b`.
 - **Reason**: `cpuson_flags` and `cpuson_entry_point` arrays reside at the same
@@ -342,3 +384,96 @@ The following telemetry is permanently wired and survives across SMP failures:
 | **2026-04-08** | **MMU enable in trampoline → A53 cores 1,2,3 ONLINE, all in C-worker** |
 | 2026-04-11 | GitHub Action **RK3399 BL31 + trust.img**: TF-A v2.14 BL31 + rkbin `trust_merger` artifact (replace Windows packer) |
 | 2026-04-11 | TF-A RK3399: **PMUSRAM_RSIZE 8→16 KiB** in CI (upstream link overflow ~3.9 KiB; patch file in `patches/`) |
+| 2026-04-22 | GRF OS_REG2 beacons in trampoline + smp.c — survive SoC reset, pinpoint crash inside SMC |
+| 2026-04-22 | **Root cause: NS CCI-500 writes → stuck CHANGE_PENDING → TF-A deadlock → watchdog reset** |
+| 2026-04-22 | `cci500_enable()` → no-op, PMU CCI500_CON write removed, deploy cache disable removed |
+| **2026-04-22** | **A72 cores 4,5 ONLINE — all 6 cores (4×A53 + 2×A72) operational** |
+| 2026-10-02 | A72 cores 4,5 come up ONLINE and execute code, but never take an interrupt - defect recorded here for the first time |
+| 2026-10-02 | `CPUECTLR_EL1.SMPEN` measured = 1 on both A72 via a new SiP SMC; SMPEN hypothesis eliminated (see ADL-006) |
+| 2026-10-02 | RK_SIP_GICR_WAKE_TRY driven from EL3: status flag 0x2 timeout; ChildrenAsleep is normal on working A53s too |
+| 2026-10-02 | `A72_PROBE_B` verdict bug fixed - it printed HPPIR read before injection, so it proved nothing |
+| 2026-10-02 | ADB400 big-cluster to GIC handshake dumped at 4 stages: identical to the little cluster, hypothesis eliminated |
+| 2026-10-02 | BL31 built by CI and written to the SD card at LBA 0x4000 over U-Boot `mmc write` - no card removal required |
+| 2026-10-02 | The BL31 GICR wake patch measured to be a no-op; relabelled from `fix` to a labelled experiment |
+
+---
+
+## A72 Interrupt Delivery - Investigation (2026-10-02)
+
+**Status: OPEN. Fault located to a hardware-level path; no fix known.**
+
+The 2026-04-22 entry below says "all 6 cores operational". That is true only for
+*code execution*. The A72 cores power on, reach C, run the baseline benchmark
+and are reported ONLINE by PSCI - but they **never receive an interrupt**, so
+they never join the dispatch rotation. That defect was not recorded until now.
+
+### Measured facts (NanoPi M4, RK3399, 2 GiB DDR3, TF-A v2.14.0)
+
+| Observation | Value |
+|---|---|
+| A72 executes code | `MPIDR_EL1=0x100`, `cpu_mhz_actual=1607`, baseline `avg_cycles=0xE4` |
+| A72 reaches the C worker | `entry_stage C4=C5=0x33`, `A72_STAGE=COMPLETED entered_c=1 online=1` |
+| Dispatch rotation | cores 1/2/3 only (233/233/233 over 70 s); cores 4/5 never appear |
+| SGI to core 1 | `ispendr0 0x0 -> 0x2 -> 0x0`, `irq_cnt 0 -> 1` - consumed |
+| SGI to core 4 | `ispendr0 0x0 -> 0x2 -> 0x2`, `irq_cnt 0 -> 0` - latches forever |
+| **PPI injected into core 4's OWN redistributor** | **`ICC_HPPIR1_EL1` stays `0x3FF`; never reaches its OWN CPU interface** |
+| `GICR_WAKER` from U-Boot, all 6 frames | core0 `0x00`, core1..5 `0x06` |
+| `GICR_WAKER` in H-Exo after prewake | core1..5 `0x04` |
+| `CPUECTLR_EL1.SMPEN` on cores 4/5 | `1`, read from EL3 via `RK_SIP_SMPEN_GET` |
+| `RK_SIP_GICR_WAKE_TRY` driven from EL3 | `status_flags=0x2` (timeout), `before=0x4 after=0x4` |
+| CPU-interface regs, core 1 vs core 4 | identical: `sre=0xF pmr=0xF8 igrpen1=1 isen=0x2000FFFF igrp=0xFFFFFFFF` |
+| `GICR_CTLR`, RD and SGI frames | `0x0` on all six cores |
+| ADB400 big<->GIC across 4 stages | no requests ever asserted; all six `CLR_*_HW_ST` set, same as the little cluster |
+| CCI-500 snoop node | A53 `S=1,D=1` throughout; A72 `S=0,D=0` until `poll-end` |
+
+### Hypotheses tested and eliminated
+
+| Hypothesis | Why eliminated |
+|---|---|
+| `ChildrenAsleep=1` blocks delivery | Working A53s report it too. Per IHI 0069 only `ProcessorSleep=1` withholds interrupts, and `PS=0,CA=1` is the architecturally expected "PE coming online" state |
+| `CPUECTLR_EL1.SMPEN` never set | Measured `=1` on both A72 cores |
+| GICR_WAKER handshake is a software sequencing bug | `RK_SIP_GICR_WAKE_TRY` drives the full two-phase handshake from EL3 and still times out |
+| Redistributor register state differs | RD and SGI frames are identical between a working A53 and a dead A72 apart from the TYPER CPU_Number field |
+| `GICR_CTLR` is never written | Measured `0x0` on all six cores, including the working ones |
+| CCI-500 snoop disabled for A72 during bring-up | A real TF-A ordering defect: `plat_cci_enable()` uses `read_mpidr()`, so a cluster node can only be enabled by a PE inside that cluster. But IHI 0069 has zero occurrences of "snoop" - GIC MMIO is Device memory with in-order arrival and the Redistributor to CPU interface link is AXI4-Stream packets. No causal path to SGI delivery |
+| ADB400 big-cluster to GIC handshake broken | Measured identical to the little cluster at all four sampled stages |
+| SGI-frame `GICR_CTLR.Quiesce` stuck | Reads `0` from Non-Secure EL2 for every core, so it is not a discriminator (and may simply not be observable from NS on this part) |
+
+### What remains
+
+Every software-visible enable is verified identical between a working A53 and a
+dead A72, and an interrupt injected into the A72's own redistributor never
+crosses to the A72's own CPU interface. The fault is therefore downstream of the
+redistributor and internal to the A72 cluster: either the GIC CPU interface
+inside that cluster (the A72 implements only the CPU interface, per its TRM) or
+the per-cluster AXI4-Stream link from the GIC block to it, since RK3399 wires
+one interrupt stream per cluster.
+
+**No fix is known.** Do not treat the CI patch in
+`.github/workflows/rk3399-full-boot-firmware.yml` as one: it was measured to be
+a no-op and is kept only as a labelled experiment.
+
+### Diagnostic bug found and fixed en route
+
+`A72_PROBE_B` used to print `ICC_HPPIR1_EL1` read *before* the pending bit was
+injected. That value is trivially `0x3FF` and could never distinguish a live
+forward path from a dead one, so its earlier "FORWARD_PATH_DEAD" verdict proved
+nothing. Fixed in commit `a25a3449`; the verdict now derives from `hppir_after`,
+with `before`, `after` and `final` all printed.
+
+---
+
+### ADL-006 - A72 Interrupt Non-Delivery Is Below the Software Interface
+
+- **Decision**: Stop treating this as a bring-up problem. The A72 cores are
+  brought up correctly; the defect is interrupt forwarding, and no firmware
+  register programming has been shown to affect it.
+- **Reason**: Seven distinct hypotheses eliminated by measurement (table above),
+  including the ones this project had already chased for months
+  (`ChildrenAsleep`, `SMPEN`, CCI snooping).
+- **Alternative rejected**: keep tuning `gicv3_init_cpu_iface()` until the A72
+  joins the rotation - its output is already byte-identical to the A53 path
+  that works.
+- **Date**: 2026-10-02
+
+---
