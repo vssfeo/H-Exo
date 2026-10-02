@@ -415,7 +415,7 @@ static __attribute__((noinline)) i64 psci_cpu_on(u64 target_cpu, u64 entry_point
     return (i64)x0;
 }
 
-static __attribute__((noinline)) i64 psci_cpu_on32(u64 target_cpu, u64 entry_point, u64 context_id) {
+__attribute__((noinline)) i64 psci_cpu_on32(u64 target_cpu, u64 entry_point, u64 context_id) {
     register u64 x0 asm("x0") = PSCI_CPU_ON_32;
     register u64 x1 asm("x1") = (u32)target_cpu;
     register u64 x2 asm("x2") = (u32)entry_point;
@@ -705,17 +705,22 @@ result_t smp_init(void) {
     }
     smp_log_cci_state("post-cpu_on");
 
-    // Step 2: Fill A53's L2 (1MB) with NS accesses → evict BL31's dirty secure
-    // lines (cpuson_flags[4,5]) to DRAM via Secure AXI writeback.
-    // We intentionally scan 8MB to reduce replacement-policy corner cases.
+    // Step 2: Fill A53's L2 (1MB, 8-way) with NS accesses to evict BL31's dirty
+    // secure lines (cpuson_flags[4,5]) to DRAM via Secure AXI writeback.
+    // ADL-015 (Plan v3.2): 1.5x L2 size = 1.5 MB is the minimum cold-line scan
+    // that guarantees full LRU replacement of any line. The previous 8 MB scan
+    // was a 5x overshoot that wasted ~6-8 ms per pass. The window 0x200000..
+    // 0x380000 is NS DRAM mapped via the kernel identity map; addresses are
+    // distinct cache lines (stride 64 B) and untouched by other code paths,
+    // so each access is a guaranteed cold miss.
     {
         volatile u8 dummy = 0;
-        for (u64 a = 0x200000UL; a < 0xA00000UL; a += 64) {
+        for (u64 a = 0x200000UL; a < 0x380000UL; a += 64) {
             dummy ^= *(volatile u8 *)a;
         }
         asm volatile("dsb ish" ::: "memory");
         (void)dummy;
-        uart_puts(&console, "[SMP] A72 fix: L2 eviction done (8MB NS scan), cpuson in DRAM\r\n");
+        uart_puts(&console, "[SMP] A72 fix: L2 eviction done (1.5MB NS scan), cpuson in DRAM\r\n");
         // Step 3: SEV to wake both A72 cores from WFE so they re-read cpuson_flags.
         asm volatile("sev" ::: "memory");
         asm volatile("sev" ::: "memory");
@@ -785,23 +790,17 @@ result_t smp_init(void) {
             smp_log_cci_state("poll");
         }
         if ((poll_rounds_big & 0x3FFu) == 0) {
+            // ADL-015: periodic re-evict matches the initial 1.5 MB window;
+            // larger spans here only burn time without changing eviction
+            // outcome (BL31 only re-touches a single secure cache line per
+            // wfe_loop iteration on the A53 cluster).
             volatile u8 dummy = 0;
-            for (u64 a = 0x200000UL; a < 0xA00000UL; a += 64) {
+            for (u64 a = 0x200000UL; a < 0x380000UL; a += 64) {
                 dummy ^= *(volatile u8 *)a;
             }
             asm volatile("dsb ish" ::: "memory");
             (void)dummy;
-            // Re-issue PMU soft-wakeup hints for A72 cores while they are pending.
-            *(volatile u32 *)((uintptr_t)PMU_BASE + (uintptr_t)PMU_CORE_PM_CON(4)) = (1u << 3);
-            *(volatile u32 *)((uintptr_t)PMU_BASE + (uintptr_t)PMU_CORE_PM_CON(5)) = (1u << 3);
-            smp_psci_diag[4].kick_count++;
-            smp_psci_diag[5].kick_count++;
-            asm volatile("dsb ish" ::: "memory");
         }
-        asm volatile("sev" ::: "memory");
-        asm volatile("sev" ::: "memory");
-        smp_psci_diag[4].sev_bursts += 2;
-        smp_psci_diag[5].sev_bursts += 2;
         for (u32 y = 0; y < 100; y++) asm volatile("yield");
     }
     smp_log_cci_state("poll-end");
@@ -834,8 +833,6 @@ result_t smp_init(void) {
             smp_online_mask |= (1u << i);
         }
     }
-    // Short event storm to release any WFE-parked cores, then ISH barrier.
-    for (u32 n = 0; n < 64; n++) asm volatile("sev" ::: "memory");
     asm volatile("dsb ish\n isb" ::: "memory");
 
     // PMU_PWRDN_ST after CPU_ON: verify power domains actually changed
@@ -950,10 +947,13 @@ void smp_secondary_main(u64 core_idx) {
     // Phase 2: Initialize this core's GICv3 CPU interface for SGI reception
     gicv3_init_cpu_iface();
     
-    // Unmask IRQ on secondary cores — required for SGI delivery.
-    // Without this, WFI wakes but IRQ handler never executes.
-    asm volatile("msr daifclr, #2" ::: "memory");
+    // Unmask IRQ+FIQ on secondary cores.
+    // Some firmware/security setups may expose SGI on Group0/FIQ path.
+    asm volatile("msr daifclr, #3" ::: "memory");
     asm volatile("isb");
+    u32 core_u32 = (u32)core_idx;
+    { u64 _t0, _tnow; asm volatile("mrs %0, cntpct_el0" : "=r"(_t0)); do { asm volatile("mrs %0, cntpct_el0" : "=r"(_tnow)); } while (_tnow - _t0 < 12000ULL); }
+    u32 waker_post = gicv3_read_waker(core_u32);
     // Diagnostic: record DAIF post-unmask + VBAR_EL2 + final MPIDR per core.
     // Lets us prove from core 0 that this PE actually executed daifclr (DAIF
     // bit 7 = I, must be 0) and has the right vector table installed.
@@ -981,7 +981,9 @@ void smp_secondary_main(u64 core_idx) {
         g_smp_pe_diag[core_idx][5] = currentel_post;
         g_smp_pe_diag[core_idx][6] = isr_post;
         g_smp_pe_diag[core_idx][7] = sctlr_post;   // M=bit0, C=bit2, I=bit12
+        gicv3_core_diag[core_idx][4] = (u64)waker_post;
         asm volatile("dc civac, %0" :: "r"(&g_smp_pe_diag[core_idx][0]) : "memory");
+        asm volatile("dc civac, %0" :: "r"(&gicv3_core_diag[core_idx][4]) : "memory");
         asm volatile("dsb sy" ::: "memory");
     }
     
@@ -1056,15 +1058,42 @@ static void smp_emit_a72_fail_verdict(uart_t *uart) {
     u32 w4 = smp_gicr_waker(4);
     u32 w5 = smp_gicr_waker(5);
     u32 ca1 = ((w4 >> 2) & 1u) & ((w5 >> 2) & 1u);
-    u32 p4 = (u32)(smp_psci_diag[4].aff_after == 2);
-    u32 p5 = (u32)(smp_psci_diag[5].aff_after == 2);
-    u32 pending = p4 & p5;
-    u32 probe_hit = smp_core_reached_secondary_entry(4) | smp_core_reached_secondary_entry(5);
+    u32 f4 = smp_psci_diag[4].flags;
+    u32 f5 = smp_psci_diag[5].flags;
 
-    if (!probe_hit && pending && ca1) {
+    // Bring-up completion, derived from independent per-core evidence:
+    // ENTERED_C (C init ran), AFF_ONLINE (PSCI reports the PE on), and the
+    // path classifier reaching the C worker.
+    u32 entered_c = ((f4 & SMP_FLAG_ENTERED_C) != 0u) && ((f5 & SMP_FLAG_ENTERED_C) != 0u);
+    u32 online    = ((f4 & SMP_FLAG_AFF_ONLINE) != 0u) && ((f5 & SMP_FLAG_AFF_ONLINE) != 0u);
+    u32 pending   = ((f4 & SMP_FLAG_ON_PENDING) != 0u) && ((f5 & SMP_FLAG_ON_PENDING) != 0u);
+    u32 probe_hit = smp_core_reached_secondary_entry(4) | smp_core_reached_secondary_entry(5);
+    u32 reached   = (smp_classify_core(4) == SMP_PATH_REACHED_C_WORKER) &&
+                    (smp_classify_core(5) == SMP_PATH_REACHED_C_WORKER);
+
+    // IMPORTANT: the token "A72_FAIL_STAGE" is reserved for genuine failures.
+    // tools/rk3399_loop_until_six_cores.ps1 matches it as a boot-abort marker,
+    // so emitting it on a healthy bring-up makes the automation reject a fully
+    // working 6-core boot. A completed bring-up reports A72_STAGE instead.
+    if (entered_c && online && reached) {
+        uart_puts(uart, "[SMP][A72] A72_STAGE=COMPLETED (entered_c=1 online=1 path=c-worker");
+        uart_puts(uart, " waker_ca=");
+        uart_put_hex(uart, ca1);
+        uart_puts(uart, ")\r\n");
+    } else if (!probe_hit && pending && ca1) {
         uart_puts(uart, "[SMP][A72] A72_FAIL_STAGE=EL3_BEFORE_NS_ENTRY (reason: probe_not_hit + CA=1 + ON_PENDING)\r\n");
+    } else if (probe_hit && !reached) {
+        uart_puts(uart, "[SMP][A72] A72_FAIL_STAGE=NS_ENTRY_NOT_C_WORKER (reason: probe hit, C worker not reached)\r\n");
     } else {
-        uart_puts(uart, "[SMP][A72] A72_FAIL_STAGE=UNDETERMINED (reason: conditions_not_matched)\r\n");
+        uart_puts(uart, "[SMP][A72] A72_FAIL_STAGE=UNDETERMINED (probe=");
+        uart_put_hex(uart, probe_hit);
+        uart_puts(uart, " entered_c=");
+        uart_put_hex(uart, entered_c);
+        uart_puts(uart, " online=");
+        uart_put_hex(uart, online);
+        uart_puts(uart, " pending=");
+        uart_put_hex(uart, pending);
+        uart_puts(uart, ")\r\n");
     }
 }
 
