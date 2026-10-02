@@ -398,14 +398,28 @@ The following telemetry is permanently wired and survives across SMP failures:
 | 2026-10-02 | Documented that TF-A's two `ChildrenAsleep` poll loops are unbounded - any future WAKER write could hang BL31 in EL3 forever |
 | 2026-10-02 | Corrected the `Quiesce` row: the SGI frame has no `GICR_CTLR` at all, per IHI 0069 Table 8-29 |
 | 2026-10-02 | Project docs reviewed: `PHASE2_MALI_PIPEIT_RECOVERY.md` credited 928/1000 SGI *sends* as 92.8% *delivery*; real delivery was 0, the polling fallback caught all 1000 |
-| 2026-10-02 | `MASTER_PLAN_v3.2` classified the A72 interrupt failure as silicon errata and rebuilt IPC around a SEV fallback on that basis - premise now measured false, ADL-008 needs superseding |
+| 2026-10-02 | `MASTER_PLAN_v3.2` classified the A72 interrupt failure as silicon errata and rebuilt IPC around a SEV fallback on that basis - premise now measured false, ADL-008 needs superseding || 2026-10-02 | **CONTROL EXPERIMENT**: Armbian Linux on the same card with the same BL31 brings up 6/6 CPUs; cores 4,5 take thousands of interrupts. Hardware and BL31 exonerated |
+| 2026-10-02 | **CORRECTION**: the earlier conclusion `fault is below the software interface, internal to the A72 cluster` is withdrawn - it was inferred from probes running inside H-Exo, which configures the GIC itself |
+| 2026-10-02 | New prime suspect: `gicv3_init()` runs after `smp_init()` and begins with `gicd_write(GICD_CTLR, 0)`, disabling the Distributor after the CPU interfaces were programmed |
+
 
 
 ---
 
 ## A72 Interrupt Delivery - Investigation (2026-10-02)
 
-**Status: OPEN. Fault located to a hardware-level path; no fix known.**
+**Status: OPEN, but the fault is NOT below the software interface. A control
+experiment on 2026-10-02 exonerated BL31 and the hardware; the fault is in
+H-Exo's own GIC bring-up. Earlier revisions of this section said the opposite
+and were wrong.**
+
+> **Correction (2026-10-02).** An earlier version of this entry concluded that the
+> redistributor-to-CPU-interface path inside the A72 cluster was dead. That
+> conclusion was reached from measurements taken *inside H-Exo*, and H-Exo is what
+> configures the GIC. It is therefore not admissible as evidence about the
+> hardware. Armbian Linux, booted from the same card with the **same BL31 binary**,
+> brings up all six cores and cores 4 and 5 receive thousands of interrupts from
+> the same GICv3 distributor. Hardware and BL31 are exonerated.
 
 The 2026-04-22 entry below says "all 6 cores operational". That is true only for
 *code execution*. The A72 cores power on, reach C, run the baseline benchmark
@@ -430,6 +444,9 @@ they never join the dispatch rotation. That defect was not recorded until now.
 | `GICR_CTLR`, RD and SGI frames | `0x0` on all six cores |
 | ADB400 big<->GIC across 4 stages | no requests ever asserted; all six `CLR_*_HW_ST` set, same as the little cluster |
 | CCI-500 snoop node | A53 `S=1,D=1` throughout; A72 `S=0,D=0` until `poll-end` |
+| **CONTROL: Linux on the same card, same BL31** | **6/6 processors online** |
+| **CONTROL: interrupts seen by each CPU under Linux** | IPI1 `3719 4663 3420 4291 4338 4610`; arch_timer `11487 7877 1873 1651 3131 2953`; rk_timer `933 779 738 663 647 675` - **cores 4 and 5 take interrupts in thousands** |
+| **CONTROL: Linux GIC init note** | `GIC: enabling workaround for GICv3: Insecure RK3399 integration`, `GICv3: Broken GIC integration, security disabled` |
 
 ### Hypotheses tested and eliminated
 
@@ -447,13 +464,30 @@ they never join the dispatch rotation. That defect was not recorded until now.
 
 ### What remains
 
-Every software-visible enable is verified identical between a working A53 and a
-dead A72, and an interrupt injected into the A72's own redistributor never
-crosses to the A72's own CPU interface. The fault is therefore downstream of the
-redistributor and internal to the A72 cluster: either the GIC CPU interface
-inside that cluster (the A72 implements only the CPU interface, per its TRM) or
-the per-cluster AXI4-Stream link from the GIC block to it, since RK3399 wires
-one interrupt stream per cluster.
+The control experiment changes the question. The A72 cluster can receive
+interrupts and does so under Linux with the identical BL31, so the redistributor,
+its CPU interface and the per-cluster AXI4-Stream link are all working. The
+differences between the working and failing case are therefore all inside
+H-Exo, and the measurements in this section were taken in a GIC state that
+H-Exo itself configured.
+
+The prime suspect is an ordering defect in H-Exo's own GIC bring-up:
+
+* `gicv3_init_cpu_iface()` runs on each secondary inside `smp_secondary_main()`,
+  which is invoked from `smp_init()`.
+* `gicv3_init()` runs on core 0 **after** `smp_init()` and begins with
+  `gicd_write(GICD_CTLR, 0)`, disabling the Distributor wholesale, before
+  re-asserting `ARE_S | ARE_NS | EnableGrp0 | EnableGrp1NS`.
+
+So the per-CPU CPU interfaces are configured while the Distributor is still in
+BL31's state, and the Distributor is then disabled and reprogrammed underneath
+them. Linux never does this; it applies a specific workaround for what it calls
+the insecure RK3399 GIC integration. **This is a hypothesis, not a conclusion.**
+What is unexplained is why the A53 secondaries survive the same sequence while
+the A72 do not, and that difference has not yet been identified.
+
+An `A72_PROBE_B` verdict of `FORWARD_PATH_DEAD` taken inside H-Exo cannot settle
+this, because the probe observes a GIC that H-Exo has already reconfigured.
 
 **No fix is known.** Do not treat the CI patch in
 `.github/workflows/rk3399-full-boot-firmware.yml` as one: it was measured to be
@@ -507,17 +541,33 @@ disassembly, never by grepping for strings it does not contain.**
 
 ---
 
-### ADL-006 - A72 Interrupt Non-Delivery Is Below the Software Interface
+### ADL-006 - A72 Interrupt Non-Delivery Is an H-Exo GIC Bring-Up Defect
 
-- **Decision**: Stop treating this as a bring-up problem. The A72 cores are
-  brought up correctly; the defect is interrupt forwarding, and no firmware
-  register programming has been shown to affect it.
-- **Reason**: Seven distinct hypotheses eliminated by measurement (table above),
-  including the ones this project had already chased for months
-  (`ChildrenAsleep`, `SMPEN`, CCI snooping).
-- **Alternative rejected**: keep tuning `gicv3_init_cpu_iface()` until the A72
-  joins the rotation - its output is already byte-identical to the A53 path
-  that works.
-- **Date**: 2026-10-02
+> **Superseded the same day.** The original text of this entry read "Below the
+> Software Interface" and concluded no firmware programming could affect the
+> fault. Both halves of that were wrong, and the error was to reason from
+> measurements taken inside the system under investigation.
+
+- **Decision**: The A72 cores are brought up correctly by BL31 and the defect is
+  in H-Exo's own GIC bring-up, not in the hardware and not in BL31. Treat this as
+  a GIC initialisation-order bug in H-Exo, and stop hunting the SoC.
+- **Reason**: Ten hypotheses eliminated by measurement (table above). Then the
+  decisive one: Armbian Linux booted from the same card with the **same BL31
+  binary** brings up 6/6 processors and cores 4 and 5 take thousands of
+  interrupts (`arch_timer` 3131 and 2953 on CPUs 4 and 5, `IPI1` 4338 and 4610).
+  Hardware, redistributor, CPU interface and the per-cluster AXI4-Stream link all
+  work. Every measurement in this entry was, however, taken inside H-Exo, which
+  configures the GIC - so none of them was admissible evidence about the hardware.
+- **Prime suspect**: `gicv3_init()` runs after `smp_init()` and starts with
+  `gicd_write(GICD_CTLR, 0)`, disabling the Distributor after the per-CPU CPU
+  interfaces were already programmed. HYPOTHESIS, not yet confirmed.
+- **Alternative rejected**: keep hunting CCI snooping, ADB400, `ChildrenAsleep`
+  or `L2ACTLR_EL1` - all measured, all clean. Ten cycles were spent there.
+- **Method rule that follows from this**: never use the system under test as the
+  instrument. A probe running inside the suspect sees the suspect's own
+  configuration, which is how ten plausible hypotheses survived a whole
+  investigation and all were wrong. The control has to be a different program on
+  the same hardware.
+- **Date**: 2026-10-02, revised the same day
 
 ---
