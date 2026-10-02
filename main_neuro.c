@@ -468,6 +468,26 @@ static void print_banner(void) {
 }
 
 
+// H-Exo: per-core result of the post-Distributor CPU-interface re-init.
+// slot 0 = A72 core 4, slot 1 = A72 core 5 (cluster 1, selected by Aff0).
+volatile u64 __attribute__((aligned(64))) g_a72_gic_reinit_done[2];
+
+// Workqueue job run by an A72 secondary on ITSELF. Deliberately re-runs the
+// per-CPU CPU interface enable now that gicv3_init() has finished programming the
+// Distributor, instead of leaving it configured against BL31's Distributor state.
+static void a72_gic_cpu_iface_reinit(u64 arg) {
+    (void)arg;
+    u64 mpidr;
+    asm volatile("mrs %0, mpidr_el1" : "=r"(mpidr));
+    u64 aff1 = (mpidr >> 8) & 0xFF;
+    u64 slot = aff1 ? (mpidr & 0xFF) : 0ULL;
+    if (slot > 1ULL) slot = 0ULL;
+    gicv3_init_cpu_iface();
+    g_a72_gic_reinit_done[slot] = 1;
+    asm volatile("dc cvac, %0" :: "r"(&g_a72_gic_reinit_done[slot]) : "memory");
+    asm volatile("dsb sy" ::: "memory");
+}
+
 void kmain(void) {
     u64 boot_start = read_cntpct();
 
@@ -646,6 +666,42 @@ void kmain(void) {
     // can never be received here, and a self-SGI test from core 0 to core 0
     // will silently drop.
     gicv3_init_cpu_iface();
+
+    // Ordering defect under test. gicv3_init() runs AFTER smp_init(), and its
+    // first action is gicd_write(GICD_CTLR, 0): the Distributor is disabled and
+    // reprogrammed after every secondary already programmed its own CPU
+    // interface from smp_secondary_main(). Armbian, on the same card with the
+    // same BL31, brings up 6/6 CPUs and cores 4,5 take thousands of interrupts;
+    // it never disables the Distributor underneath a live CPU interface.
+    // Re-run gicv3_init_cpu_iface() on cores 4 and 5 now that the Distributor is
+    // settled. The A72 idle loop calls wq_worker_poll() unconditionally, so the
+    // job is collected by polling - no interrupt is needed to deliver it, which
+    // is exactly the property being tested.
+    {
+        g_a72_gic_reinit_done[0] = 0;
+        g_a72_gic_reinit_done[1] = 0;
+        asm volatile("dc cvac, %0" :: "r"(&g_a72_gic_reinit_done[0]) : "memory");
+        asm volatile("dsb sy" ::: "memory");
+        wq_dispatch(4, a72_gic_cpu_iface_reinit, 0);
+        wq_dispatch(5, a72_gic_cpu_iface_reinit, 0);
+
+        u64 t0, t1 = 0;
+        asm volatile("mrs %0, cntpct_el0" : "=r"(t0));
+        for (u32 spin = 0; spin < 40000u; spin++) {
+            asm volatile("dc cvac, %0" :: "r"(&g_a72_gic_reinit_done[0]) : "memory");
+            asm volatile("dc civac, %0" :: "r"(&g_a72_gic_reinit_done[0]) : "memory");
+            asm volatile("dsb sy" ::: "memory");
+            if (g_a72_gic_reinit_done[0] != 0ULL && g_a72_gic_reinit_done[1] != 0ULL) break;
+            asm volatile("mrs %0, cntpct_el0" : "=r"(t1));
+            if (t1 - t0 > (24000000ULL / 5)) break;   /* ~200 ms at 24 MHz */
+        }
+        uart_puts(&console, "[A72_GIC_REINIT] c4=");
+        uart_put_hex(&console, g_a72_gic_reinit_done[0]);
+        uart_puts(&console, " c5=");
+        uart_put_hex(&console, g_a72_gic_reinit_done[1]);
+        uart_puts(&console, "\r\n");
+    }
+
     uart_puts(&console, "[OK] SMP: ");
     uart_put_hex(&console, smp_get_online_count());
     uart_puts(&console, " cores online\r\n");
