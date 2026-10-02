@@ -395,6 +395,9 @@ jobs:
           from pathlib import Path
           import textwrap
 
+          applied = []
+
+          # ---------------------------------------------- 1) pmu.c active-PE wake hook
           p = Path("plat/rockchip/rk3399/drivers/pmu/pmu.c")
           if not p.exists():
               raise SystemExit(f"missing {p}")
@@ -402,28 +405,76 @@ jobs:
           s = p.read_text()
           marker = "h_exo_a72_gicr_on_finish"
           if marker in s:
-              print("A72 GICR on_finish patch already present")
-              raise SystemExit(0)
-
-          helper = textwrap.dedent(r'''
-
+              print("pmu.c: A72 GICR on_finish already present")
+          else:
+              helper = textwrap.dedent(r'''
           /*
            * H-Exo RK3399 A72 GICR fix.
            *
-           * Keep TF-A's stock PMU/ADB400/CCI sequencing authoritative. Do not
-           * write PMU/CRU/CCI here: those register layouts and ordering are
-           * SoC/firmware-owned, and non-standard writes can wedge CHANGE_PENDING
-           * or create board-specific side effects. This hook runs after the
-           * stock per-core on_finish has disabled core PM.
+           * Keep TF-A stock PMU/ADB400/CCI sequencing authoritative. Do not write
+           * PMU/CRU/CCI here: those register layouts and ordering are SoC/firmware
+           * owned, and non-standard writes can wedge CHANGE_PENDING. This hook runs
+           * after the stock per-core on_finish has disabled core PM.
            *
-           * The only operation here is the architectural GICR_WAKER active-PE
-           * wake: clear ProcessorSleep and wait for ChildrenAsleep to drop.
+           * The only operation here is the architectural GICR_WAKER active-PE wake.
+           * GICR_WAKER.ChildrenAsleep is read-only and only drops once the
+           * redistributor Downstream Control has been acknowledged by the CPU
+           * interface (Arm ECM-0495013 4.7.1).
+           *
+           * Measured on this board: the A72 frames present WAKER = 0x4, i.e.
+           * ProcessorSleep already clear while ChildrenAsleep is still set. Clearing
+           * ProcessorSleep again is then a no-op with no wake edge, so in that state
+           * the handshake has to be driven explicitly.
            */
           #define H_EXO_RK3399_GICR_BASE      U(0xFEF00000)
           #define H_EXO_RK3399_GICR_STRIDE    U(0x20000)
           #define H_EXO_RK3399_GICR_WAKER_OFF U(0x14)
           #define H_EXO_GICR_WAKER_PS         BIT(1)
           #define H_EXO_GICR_WAKER_CA         BIT(2)
+          #define H_EXO_GICR_WAKER_SPIN       100000
+
+          static void h_exo_a72_gicr_wake(uint32_t cpu_id)
+          {
+          	uintptr_t gicr_waker = H_EXO_RK3399_GICR_BASE +
+          		(cpu_id * H_EXO_RK3399_GICR_STRIDE) +
+          		H_EXO_RK3399_GICR_WAKER_OFF;
+          	uint32_t waker = mmio_read_32(gicr_waker);
+
+          	/* Interface already active: nothing to do. */
+          	if ((waker & H_EXO_GICR_WAKER_CA) == 0U) {
+          		return;
+          	}
+
+          	/*
+          	 * ProcessorSleep clear but ChildrenAsleep set: the handshake never
+          	 * completed. Force a real sleep to wake cycle, bounded so BL31 always
+          	 * makes progress even if the redistributor never answers.
+          	 */
+          	if ((waker & H_EXO_GICR_WAKER_PS) == 0U) {
+          		INFO("H-Exo GICR: cpu %u PS=0 CA=1, forcing wake handshake\n", cpu_id);
+          		mmio_write_32(gicr_waker, waker | H_EXO_GICR_WAKER_PS);
+          		dsb();
+          		for (volatile uint32_t i = 0; i < H_EXO_GICR_WAKER_SPIN; i++) {
+          			if ((mmio_read_32(gicr_waker) & H_EXO_GICR_WAKER_CA) != 0U) {
+          				break;
+          			}
+          		}
+          	}
+
+          	mmio_write_32(gicr_waker,
+          		mmio_read_32(gicr_waker) & ~H_EXO_GICR_WAKER_PS);
+          	dsb();
+          	for (volatile uint32_t i = 0; i < H_EXO_GICR_WAKER_SPIN; i++) {
+          		waker = mmio_read_32(gicr_waker);
+          		if ((waker & H_EXO_GICR_WAKER_CA) == 0U) {
+          			INFO("H-Exo GICR: cpu %u ChildrenAsleep cleared\n", cpu_id);
+          			isb();
+          			return;
+          		}
+          	}
+          	ERROR("H-Exo GICR: cpu %u ChildrenAsleep stuck at 1\n", cpu_id);
+          	isb();
+          }
 
           static void h_exo_a72_gicr_on_finish(uint32_t cpu_id)
           {
@@ -431,29 +482,16 @@ jobs:
           		return;
           	}
 
-          	uintptr_t gicr_waker = H_EXO_RK3399_GICR_BASE +
-          		(cpu_id * H_EXO_RK3399_GICR_STRIDE) +
-          		H_EXO_RK3399_GICR_WAKER_OFF;
-
-            uint32_t waker = mmio_read_32(gicr_waker);
-            mmio_write_32(gicr_waker, waker & ~H_EXO_GICR_WAKER_PS);
-          	dsb();
-            for (volatile int i = 0; i < 100000; i++) {
-                waker = mmio_read_32(gicr_waker);
-                if ((waker & H_EXO_GICR_WAKER_CA) == 0U) {
-                    break;
-                }
-            }
-          	isb();
+          	h_exo_a72_gicr_wake(cpu_id);
           }
           ''')
 
-          anchor = "int rockchip_soc_cores_pwr_dm_on_finish(void)"
-          if anchor not in s:
-              raise SystemExit("cannot find rockchip_soc_cores_pwr_dm_on_finish")
-          s = s.replace(anchor, helper + "\n" + anchor, 1)
+              anchor = "int rockchip_soc_cores_pwr_dm_on_finish(void)"
+              if anchor not in s:
+                  raise SystemExit("pmu.c: cannot find rockchip_soc_cores_pwr_dm_on_finish")
+              s = s.replace(anchor, helper + "\n" + anchor, 1)
 
-          old = textwrap.dedent(r'''
+              old = textwrap.dedent(r'''
           int rockchip_soc_cores_pwr_dm_on_finish(void)
           {
           	uint32_t cpu_id = plat_my_core_pos();
@@ -463,28 +501,61 @@ jobs:
           	return PSCI_E_SUCCESS;
           }
           ''')
-
-          new = textwrap.dedent(r'''
+              new = textwrap.dedent(r'''
           int rockchip_soc_cores_pwr_dm_on_finish(void)
           {
           	uint32_t cpu_id = plat_my_core_pos();
 
           	mmio_write_32(PMU_BASE + PMU_CORE_PM_CON(cpu_id),
           		      CORES_PM_DISABLE);
-            h_exo_a72_gicr_on_finish(cpu_id);
+          	h_exo_a72_gicr_on_finish(cpu_id);
           	return PSCI_E_SUCCESS;
           }
           ''')
+              if old not in s:
+                  raise SystemExit("pmu.c: on_finish body not matched")
+              s = s.replace(old, new, 1)
+              p.write_text(s)
+              applied.append("pmu.c")
+              print("pmu.c: A72 GICR wake hook applied")
 
-          if old not in s:
-              raise SystemExit("on_finish body not matched")
-          s = s.replace(old, new, 1)
+          # ------------------------------------- 2) gicv3_main.c retry after ICC setup
+          g = Path("drivers/arm/gic/v3/gicv3_main.c")
+          if not g.exists():
+              raise SystemExit(f"missing {g}")
 
-          p.write_text(s)
-          print("A72 GICR on_finish patch applied")
+          t = g.read_text()
+          retry_marker = "H_EXO_GICR_RETRY_AFTER_ICC"
+          if retry_marker in t:
+              print("gicv3_main.c: retry already present")
+          else:
+              a2 = ("\t/* Enable Group1 Secure interrupts */\n"
+                    "\twrite_icc_igrpen1_el3(read_icc_igrpen1_el3() |\n"
+                    "\t\t\t\tIGRPEN1_EL3_ENABLE_G1S_BIT);")
+              if a2 not in t:
+                  raise SystemExit("gicv3_main.c: cannot find igrpen1_el3 anchor")
+
+              block = textwrap.dedent(r'''
+
+          	/* H_EXO_GICR_RETRY_AFTER_ICC
+          	 * H-Exo/RK3399: gicv3_rdistif_mark_core_awake() runs above, before the
+          	 * CPU interface registers are programmed, but the Downstream Control
+          	 * acknowledge that clears GICR_WAKER.ChildrenAsleep is produced by that
+          	 * interface. Retry now that SRE / PMR / IGRPEN are in place. Bounded and
+          	 * a no-op whenever the interface is already awake.
+          	 */
+          	gicv3_rdistif_mark_core_awake(gicr_base);''')
+
+              t = t.replace(a2, a2 + block, 1)
+              g.write_text(t)
+              applied.append("gicv3_main.c")
+              print("gicv3_main.c: post-ICC wake retry applied")
+
+          print("applied: " + (", ".join(applied) if applied else "nothing (idempotent)"))
           PY
           python3 /tmp/h_exo_patch_pmu_a72_gicr.py
-
+          grep -n H_EXO_GICR_WAKER_SPIN plat/rockchip/rk3399/drivers/pmu/pmu.c
+          grep -n H_EXO_GICR_RETRY_AFTER_ICC drivers/arm/gic/v3/gicv3_main.c
       - name: Build BL31
         working-directory: ${{ runner.temp }}/tfa
         run: |
