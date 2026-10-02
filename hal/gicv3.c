@@ -215,10 +215,102 @@ result_t gicv3_init(void) {
 volatile u64 __attribute__((aligned(64))) gicv3_core_diag[6][8];
 // Extended diag: IGRPMODR0 (bits per intid) + IPRIORITYR0..3 (4 SGIs)
 // + ICC_BPR1_EL1 + ICC_CTLR_EL1.
-volatile u64 __attribute__((aligned(64))) gicv3_core_diag2[6][7];
+volatile u64 __attribute__((aligned(64))) gicv3_core_diag2[6][13];
 
 // Phase 2: Per-core CPU interface init (must be called on each secondary core)
 // Each core has its own ICC_SRE/PMR/IGRPEN1 system registers
+// ===== EXPERIMENT-3: discriminate the remaining A72 interrupt-delivery
+// hypotheses using only this PE and its own redistributor. Nothing here
+// changes functional state beyond a self-test PPI that is cleared again.
+//
+// Observed 2026-10-02: on cores 4/5 (A72) GICR_WAKER reads 0x4
+// (ProcessorSleep=0, ChildrenAsleep=1) and never changes, SGI sent by core 0
+// latches in ISPENDR0 but is never acknowledged, while every software-
+// visible CPU-interface register is byte-identical to the A53 cores that do
+// take interrupts. Two probes separate the remaining causes:
+//
+// PROBE A - local-PE wake cycle. Runs ON the affected core, so the write is
+//   from the PE that owns the redistributor (not a cross-PE write). It drives
+//   ProcessorSleep 1 then 0 and records whether ChildrenAsleep ever moves.
+//   If PS reads back as written but CA never clears, the wake state machine
+//   itself is wedged (TF-A side). If PS reads back unchanged, this SoC ignores
+//   WAKER writes entirely on the big cluster.
+//
+// PROBE B - private PPI delivery. PPI 29 is per-PE and already enabled in
+//   ISENABLER0, so it needs no IROUTER routing. Setting ISPENDR0 bit 29 on
+//   this core's own redistributor and then reading ICC_HPPIR1_EL1 on this
+//   PE answers the decisive question:
+//     HPPIR returns a real INTID  => the redistributor->CPU-interface forward
+//                                 path is alive; only the SGI path is broken.
+//     HPPIR returns 0x3FF (spurious) => the forward path itself is dead for
+//                                 this PE, which is what CA=1 would imply.
+static void gicv3_probe_local_wake(u32 core) {
+    volatile u32 *waker = (volatile u32 *)(
+        (uintptr_t)GICR_BASE + (uintptr_t)core * 0x20000u + GICR_WAKER);
+    u32 pre  = *waker;
+    u32 ps1  = pre;
+    u32 ca1_polls = 0;
+    u32 ps0  = pre;
+    u32 ca0_polls = 0;
+    u32 fin  = pre;
+
+    // Drive ProcessorSleep=1 (bit 1) and see whether it takes effect.
+    *waker = pre | (1u << 1);
+    asm volatile("dsb sy" ::: "memory");
+    ps1 = *waker;
+    for (u32 i = 0; i < 20000u; i++) {
+        if ((*waker & (1u << 2)) != 0u) { ca1_polls = i + 1u; break; }
+        asm volatile("yield");
+    }
+
+    // Drive ProcessorSleep=0 and watch ChildrenAsleep (bit 2).
+    *waker = *waker & ~(1u << 1);
+    asm volatile("dsb sy" ::: "memory");
+    ps0 = *waker;
+    for (u32 i = 0; i < 20000u; i++) {
+        if ((*waker & (1u << 2)) == 0u) { ca0_polls = i + 1u; break; }
+        asm volatile("yield");
+    }
+    fin = *waker;
+    asm volatile("dsb sy" ::: "memory");
+    asm volatile("isb" ::: "memory");
+
+    gicv3_core_diag2[core][7]  = pre;
+    gicv3_core_diag2[core][8]  = ps1;
+    gicv3_core_diag2[core][9]  = ca1_polls;
+    gicv3_core_diag2[core][10] = ps0;
+    gicv3_core_diag2[core][11] = ca0_polls;
+    gicv3_core_diag2[core][12] = fin;
+}
+
+static void gicv3_probe_local_irq_path(u32 core) {
+    volatile u32 *ispendr = (volatile u32 *)(
+        (uintptr_t)GICR_BASE + (uintptr_t)core * 0x20000u + GICR_ISPENDR0);
+    volatile u32 *icpendr = (volatile u32 *)(
+        (uintptr_t)GICR_BASE + (uintptr_t)core * 0x20000u + GICR_ICPENDR0);
+    const u32 PPI_BIT = 1u << 29;   // PPI 29 = ARM_IRQ_SEC_PHY_TIMER, per-PE, pre-enabled
+    u64 hppir_before, hppir_after, iar;
+
+    asm volatile("mrs %0, S3_0_C12_C12_2" : "=r"(hppir_before));  // ICC_HPPIR1_EL1
+    *ispendr = PPI_BIT;
+    asm volatile("dsb sy" ::: "memory");
+    asm volatile("isb");
+    asm volatile("mrs %0, S3_0_C12_C12_2" : "=r"(hppir_after));
+
+    if ((hppir_after & 0x3FFu) != 0x3FFu) {
+        // A real INTID reached the CPU interface: consume it so we do not
+        // leave a stray interrupt pending.
+        asm volatile("mrs %0, S3_0_C12_C12_0" : "=r"(iar));   // ICC_IAR1_EL1
+        asm volatile("msr S3_0_C12_C12_1, %0" :: "r"(iar));   // ICC_EOIR1_EL1
+    }
+    *icpendr = PPI_BIT;
+    asm volatile("dsb sy" ::: "memory");
+    asm volatile("isb" ::: "memory");
+
+    gicv3_core_diag2[core][6] |= ((u64)(hppir_before & 0x3FFu) << 32);   // stash HPPIR before in high half
+    asm volatile("dc civac, %0" :: "r"(&gicv3_core_diag2[core][0]) : "memory");
+    asm volatile("dsb sy" ::: "memory");
+}
 void gicv3_init_cpu_iface(void) {
     // 1. Wake this core's redistributor (ProcessorSleep clear)
     u64 mpidr;
@@ -336,6 +428,12 @@ void gicv3_init_cpu_iface(void) {
     asm volatile("dc civac, %0" :: "r"(&gicv3_core_diag[core][0]) : "memory");
     asm volatile("dc civac, %0" :: "r"(&gicv3_core_diag2[core][0]) : "memory");
     asm volatile("dsb sy" ::: "memory");
+
+    // EXPERIMENT-3: self-tests, A72 only (cores 0-3 already work).
+    if (core >= 4u && core < 6u) {
+        gicv3_probe_local_wake(core);
+        gicv3_probe_local_irq_path(core);
+    }
 }
 
 void gicv3_enable_irq(u32 irq) {
