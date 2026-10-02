@@ -264,6 +264,25 @@ volatile u64 __attribute__((aligned(64))) gicv3_core_diag[6][8];
 // + ICC_BPR1_EL1 + ICC_CTLR_EL1.
 volatile u64 __attribute__((aligned(64))) gicv3_core_diag2[6][17];
 
+// Which numbered step of gicv3_init_cpu_iface() this PE reached. Written BEFORE
+// each step, so a PE that never completes leaves behind the number of the step it
+// stopped on. 99 means it returned normally.
+//
+// Added 2026-10-02 because gicv3_init_cpu_iface() is known not to return when
+// called on a Cortex-A72 after smp_init(), while the same call does return on the
+// same core during smp_secondary_main(). Without this there is no way to tell
+// which statement wedges it.
+volatile u64 __attribute__((aligned(64))) gicv3_cpu_iface_stage[6];
+
+static inline void gicv3_stage(u32 core, u32 v) {
+    if (core >= 6u) return;
+    gicv3_cpu_iface_stage[core] = v;
+    // Clean to DRAM: the A72 cluster does not snoop A53 stores, so a dirty line
+    // here would never be visible to the reporting core.
+    asm volatile("dc cvac, %0" :: "r"(&gicv3_cpu_iface_stage[core]) : "memory");
+    asm volatile("dsb sy" ::: "memory");
+}
+
 // Phase 2: Per-core CPU interface init (must be called on each secondary core)
 // Each core has its own ICC_SRE/PMR/IGRPEN1 system registers
 // ===== EXPERIMENT-3: discriminate the remaining A72 interrupt-delivery
@@ -367,7 +386,8 @@ static void gicv3_probe_local_irq_path(u32 core) {
     {
         u64 hppir_final;
         asm volatile("mrs %0, S3_0_C12_C12_2" : "=r"(hppir_final));  /* ICC_HPPIR1_EL1 */
-        gicv3_core_diag2[core][16] = (u64)(hppir_final & 0x3FFu);
+        gicv3_stage(core, 99u);   /* returned normally */
+    gicv3_core_diag2[core][16] = (u64)(hppir_final & 0x3FFu);
     }
     asm volatile("dc civac, %0" :: "r"(&gicv3_core_diag2[core][0]) : "memory");
     asm volatile("dsb sy" ::: "memory");
@@ -387,8 +407,10 @@ void gicv3_init_cpu_iface(void) {
     u32 aff1 = (u32)((mpidr >> 8) & 0xFF);
     u32 core = (aff1 ? (aff0 + 4) : aff0);
     if (core >= 6) return;
+    gicv3_stage(core, 1u);
     u32 waker_after = gicv3_force_wake_core(core, 16);
 
+    gicv3_stage(core, 2u);
     // 2. Enable system register access (ICC_SRE_EL2)
     u32 sre;
     asm volatile("mrs %0, ICC_SRE_EL2" : "=r"(sre));
@@ -396,16 +418,19 @@ void gicv3_init_cpu_iface(void) {
     asm volatile("msr ICC_SRE_EL2, %0" :: "r"(sre));
     asm volatile("isb");
     
+    gicv3_stage(core, 3u);
     // 3. Set priority mask
     u64 pmr = 0xFF;
     asm volatile("msr ICC_PMR_EL1, %0" :: "r"(pmr));
     
+    gicv3_stage(core, 4u);
     // 4. Enable Group 0 + Group 1 interrupts at CPU interface.
     u64 igrp = 1;
     asm volatile("msr ICC_IGRPEN0_EL1, %0" :: "r"(igrp));
     asm volatile("msr ICC_IGRPEN1_EL1, %0" :: "r"(igrp));
     asm volatile("isb");
     
+    gicv3_stage(core, 5u);
     // 5. CRITICAL: Set per-core SGI priority. GICR_IPRIORITYR0..3 (one byte per
     //    SGI 0-15). PMR is 0xFF and the rule is `prio < PMR`, so a reset value
     //    of 0xFF would silently block every SGI on this core. Use 0xA0 (lower
@@ -418,6 +443,7 @@ void gicv3_init_cpu_iface(void) {
         *p = 0xA0A0A0A0u;
     }
     
+    gicv3_stage(core, 6u);
     // 6. Configure SGI as Group 1 NS (must be set BEFORE enable).
     //    Per GICv3 spec, group is encoded by TWO bits per intid:
     //      IGROUPR  = 0, IGRPMODR = 0  -> Group 0 (Secure)
@@ -432,11 +458,13 @@ void gicv3_init_cpu_iface(void) {
     *igrpmodr = 0u;            // Clear Secure modifier -> Group 1 NS
     asm volatile("dsb sy" ::: "memory");
     
+    gicv3_stage(core, 7u);
     // 7. Enable SGI 0-15 in this core's redistributor
     volatile u32 *isenabler = (volatile u32*)(rd_sgi + GICR_ISENABLER0);
     *isenabler = 0xFFFF;  // Enable SGI 0-15
     asm volatile("dsb sy" ::: "memory");
     
+    gicv3_stage(core, 8u);
     // 8. Wait for redistributor RWP (Register Write Pending) to clear so the
     //    enable/group/priority writes are committed before we hit WFI.
     volatile u32 *gicr_ctlr = (volatile u32*)(
@@ -446,6 +474,7 @@ void gicv3_init_cpu_iface(void) {
     
     asm volatile("dsb sy\n isb" ::: "memory");
     
+    gicv3_stage(core, 9u);
     // 9. Diagnostic snapshot — record GIC state visible from THIS core so we
     //    can prove init actually executed and registers stuck.
     u64 v_sre, v_pmr, v_igrpen;

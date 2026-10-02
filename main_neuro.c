@@ -468,53 +468,6 @@ static void print_banner(void) {
 }
 
 
-// ---------------------------------------------------------------------------
-// H-Exo: EXPERIMENT, MEASURED NO-OP. DO NOT READ AS A FIX.
-//
-// This re-init was committed as a fix. That label was wrong and is corrected
-// here. Measured result, in order:
-//
-//   1. Placed right after gicv3_init(): reported c4=0 c5=0. Reason: cores 4/5 were
-//      still inside pipeit_worker_idle_hidden() and never reached
-//      wq_worker_poll(), so the job was never collected. Not a coherency fault.
-//   2. Still c4=0 c5=0. The fault was in the probe: the wait loop used dc civac on
-//      the read side, which is a CLEAN operation, so core 0 wrote its own stale
-//      zero back over the value the A72 had just published. Read side needs
-//      dc ivac.
-//   3. After that fix: entered4=1 entered5=1, c4=0 c5=0. Both A72 cores DO reach
-//      and enter the job and never finish it. gicv3_init_cpu_iface() does not
-//      return when called on a Cortex-A72 at that point, with the A72 self-probes
-//      suppressed or not.
-//   4. gicv3_init_cpu_iface() on core 0 hangs if called before smp_init(), so
-//      moving the whole block earlier is not viable either.
-//
-// So the reorder hypothesis is untested in this form. What IS established: the
-// A72 cores are reachable through the workqueue, and re-running the per-CPU
-// interface enable late on them does not complete. The A72 defect is unchanged -
-// Armbian on the same card with the same BL31 gives cores 4 and 5 thousands of
-// interrupts, so the fault remains in H-Exo's GIC bring-up.
-// ---------------------------------------------------------------------------
-
-// H-Exo: per-core result of the post-Distributor CPU-interface re-init.
-// slot 0 = A72 core 4, slot 1 = A72 core 5 (cluster 1, selected by Aff0).
-volatile u64 __attribute__((aligned(64))) g_a72_gic_reinit_done[2];
-
-// Workqueue job run by an A72 secondary on ITSELF. Deliberately re-runs the
-// per-CPU CPU interface enable now that gicv3_init() has finished programming the
-// Distributor, instead of leaving it configured against BL31's Distributor state.
-static void a72_gic_cpu_iface_reinit(u64 arg) {
-    (void)arg;
-    u64 mpidr;
-    asm volatile("mrs %0, mpidr_el1" : "=r"(mpidr));
-    u64 aff1 = (mpidr >> 8) & 0xFF;
-    u64 slot = aff1 ? (mpidr & 0xFF) : 0ULL;
-    if (slot > 1ULL) slot = 0ULL;
-    gicv3_init_cpu_iface();
-    g_a72_gic_reinit_done[slot] = 1;
-    asm volatile("dc cvac, %0" :: "r"(&g_a72_gic_reinit_done[slot]) : "memory");
-    asm volatile("dsb sy" ::: "memory");
-}
-
 void kmain(void) {
     u64 boot_start = read_cntpct();
 
@@ -658,26 +611,6 @@ void kmain(void) {
         uart_puts(&console, "\r\n");
     }
 
-    // GIC ordering change under test. This used to run AFTER smp_init().
-    // Arm IHI 0069G s2.3.3 makes the ARE 1->0 transition UNPREDICTABLE and the
-    // 0->1 transition unpredictable unless the Group Enables are observably
-    // clear, which gicd_wait_for_rwp() in gicv3_init() now enforces. Beyond that,
-    // both reference implementations configure the Distributor FIRST and never
-    // rewrite it: TF-A's gicv3_rdistif_init() asserts ARE is already 1 before
-    // touching a Redistributor, and Linux calls gic_dist_init() before
-    // gic_cpu_init() and brings secondaries up afterwards via the CPU-hotplug
-    // notifier. H-Exo was the only one rewriting GICD_CTLR underneath live
-    // per-CPU interfaces.
-    //
-    // Core 0's own gicv3_init_cpu_iface() deliberately STAYS after smp_init():
-    // it depends on state smp_init() establishes. An earlier attempt that moved
-    // both together hung the board during early bring-up.
-    // 3. Initialize GICv3 (after secondary cores are running)
-    if (gicv3_init() == OK) {
-        LOG_OK("GICv3: Interrupt Controller Ready");
-    } else {
-        LOG_ERR("GICv3: Initialization Failed");
-    }
     smp_init();
 
     // Post-PSCI re-wake for A72 redistributors: on some RK3399 boots,
@@ -699,50 +632,16 @@ void kmain(void) {
         uart_puts(&console, "\r\n");
     }
 
-    wq_init();
-
-    // Core 0's per-PE GIC state (SGI enable/group/priority on its own
-    // redistributor) is NOT touched by gicv3_init(); it must run the same
-    // per-core init the secondaries do, otherwise SGI_STAGE_DONE from core 5
-    // can never be received here, and a self-SGI test from core 0 to core 0
-    // will silently drop.
-    gicv3_init_cpu_iface();
-
-    // Ordering defect under test. gicv3_init() runs AFTER smp_init(), and its
-    // first action is gicd_write(GICD_CTLR, 0): the Distributor is disabled and
-    // reprogrammed after every secondary already programmed its own CPU
-    // interface from smp_secondary_main(). Armbian, on the same card with the
-    // same BL31, brings up 6/6 CPUs and cores 4,5 take thousands of interrupts;
-    // it never disables the Distributor underneath a live CPU interface.
-    // Re-run gicv3_init_cpu_iface() on cores 4 and 5 now that the Distributor is
-    // settled. The A72 idle loop calls wq_worker_poll() unconditionally, so the
-    // job is collected by polling - no interrupt is needed to deliver it, which
-    // is exactly the property being tested.
-    {
-        g_a72_gic_reinit_done[0] = 0;
-        g_a72_gic_reinit_done[1] = 0;
-        asm volatile("dc cvac, %0" :: "r"(&g_a72_gic_reinit_done[0]) : "memory");
-        asm volatile("dsb sy" ::: "memory");
-        wq_dispatch(4, a72_gic_cpu_iface_reinit, 0);
-        wq_dispatch(5, a72_gic_cpu_iface_reinit, 0);
-
-        u64 t0, t1 = 0;
-        asm volatile("mrs %0, cntpct_el0" : "=r"(t0));
-        for (u32 spin = 0; spin < 40000u; spin++) {
-            asm volatile("dc cvac, %0" :: "r"(&g_a72_gic_reinit_done[0]) : "memory");
-            asm volatile("dc civac, %0" :: "r"(&g_a72_gic_reinit_done[0]) : "memory");
-            asm volatile("dsb sy" ::: "memory");
-            if (g_a72_gic_reinit_done[0] != 0ULL && g_a72_gic_reinit_done[1] != 0ULL) break;
-            asm volatile("mrs %0, cntpct_el0" : "=r"(t1));
-            if (t1 - t0 > (24000000ULL / 5)) break;   /* ~200 ms at 24 MHz */
-        }
-        uart_puts(&console, "[A72_GIC_REINIT] c4=");
-        uart_put_hex(&console, g_a72_gic_reinit_done[0]);
-        uart_puts(&console, " c5=");
-        uart_put_hex(&console, g_a72_gic_reinit_done[1]);
-        uart_puts(&console, "\r\n");
-    }
-
+    // Reverted to running AFTER smp_init(). With gicd_wait_for_rwp() in place,
+    // calling gicv3_init() ahead of smp_init() hangs the board: it prints
+    // "GICv3: Interrupt Controller Ready" and then stops dead, with no UART
+    // response and no network, because the runtime console handlers are
+    // registered far later in kmain. Verified on hardware 2026-10-03. The three
+    // IHI 0069G s2.3.3 / s12.9.4 corrections inside gicv3_init() are kept - they
+    // stand on their own and are tested in this position.
+    //
+    // Core 0's own gicv3_init_cpu_iface() must also stay after smp_init(): it
+    // depends on state smp_init() establishes, and moving it earlier hangs too.
     uart_puts(&console, "[OK] SMP: ");
     uart_put_hex(&console, smp_get_online_count());
     uart_puts(&console, " cores online\r\n");
@@ -821,6 +720,53 @@ void kmain(void) {
             uart_puts(&console, " ace_sh_dis=");  uart_put_hex(&console, (dec >> 5) & 1u);
             uart_puts(&console, " haz_timeout="); uart_put_hex(&console, (dec >> 6) & 1u);
             uart_puts(&console, " uniq_clean=");  uart_put_hex(&console, (dec >> 7) & 1u);
+            // Which step of gicv3_init_cpu_iface() this PE reached; 99 = returned
+            // normally. Appended here rather than printed separately so it rides
+            // out on a line that is already proven to reach the console.
+            {
+                extern volatile u64 gicv3_cpu_iface_stage[6];
+                asm volatile("dc ivac, %0" :: "r"(&gicv3_cpu_iface_stage[0]) : "memory");
+                asm volatile("dc ivac, %0" :: "r"(&gicv3_cpu_iface_stage[1]) : "memory");
+                asm volatile("dc ivac, %0" :: "r"(&gicv3_cpu_iface_stage[2]) : "memory");
+                asm volatile("dc ivac, %0" :: "r"(&gicv3_cpu_iface_stage[3]) : "memory");
+                asm volatile("dc ivac, %0" :: "r"(&gicv3_cpu_iface_stage[4]) : "memory");
+                asm volatile("dc ivac, %0" :: "r"(&gicv3_cpu_iface_stage[5]) : "memory");
+                asm volatile("dsb sy" ::: "memory");
+                uart_puts(&console, " cpuiface_stage=");
+                for (u32 cs = 0; cs < 6u; cs++) {
+                    if (cs) uart_puts(&console, "/");
+                    uart_put_hex(&console, gicv3_cpu_iface_stage[cs]);
+                }
+
+    // RK3399 TRM: the A72 interrupt path to the GIC is clocked through CRU
+    // GATES / ADB400. CRU_CLKGATE_CON12 (CRU + 0x0330) carries the two ADB400
+    // clock-disable bits for the big cluster:
+    //   bit 3  aclk_core_adb400_gic_2_core_b_en   GIC -> A72
+    //   bit 4  aclk_core_adb400_core_b_2_gic_en   A72 -> GIC
+    // and their little-cluster counterparts at bits 10 and 11, plus bit 12
+    // aclk_gic_src_en. Per the TRM, 1 = disable. These are the clocks that would
+    // gate the Redistributor -> CPU interface stream inside the big cluster, and
+    // no diagnostic has read them per-cluster before - the April probe read
+    // CLKGATE_CON33 but never decoded which bits it was looking at.
+    {
+        volatile u32 *cru_gates12 = (volatile u32 *)0xFF760330UL;
+        volatile u32 *cru_gates33 = (volatile u32 *)0xFF760384UL;
+        u32 g12 = *cru_gates12;
+        u32 g33 = *cru_gates33;
+        uart_puts(&console, " [GICCLK] CON12=0x"); uart_put_hex(&console, g12);
+        uart_puts(&console, " | A72 b2g="); uart_put_hex(&console, (g12 >> 4) & 1u);
+        uart_puts(&console, " g2b=");        uart_put_hex(&console, (g12 >> 3) & 1u);
+        uart_puts(&console, " | A53 b2g="); uart_put_hex(&console, (g12 >> 11) & 1u);
+        uart_puts(&console, " g2b=");        uart_put_hex(&console, (g12 >> 10) & 1u);
+        uart_puts(&console, " | gic_src=");   uart_put_hex(&console, (g12 >> 12) & 1u);
+        uart_puts(&console, " CON33=0x");      uart_put_hex(&console, g33);
+        uart_puts(&console, " | g33 L2G=");    uart_put_hex(&console, (g33 >> 2) & 1u);
+        uart_puts(&console, " B2G=");         uart_put_hex(&console, (g33 >> 3) & 1u);
+        uart_puts(&console, " G2L=");         uart_put_hex(&console, (g33 >> 4) & 1u);
+        uart_puts(&console, " G2B=");         uart_put_hex(&console, (g33 >> 5) & 1u);
+        uart_puts(&console, "\r\n");
+    }
+            }
             uart_puts(&console, "\r\n");
         }
     }

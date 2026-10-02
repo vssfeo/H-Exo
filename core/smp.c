@@ -1279,6 +1279,26 @@ void smp_dump_diagnostics(uart_t *uart) {
         uart_puts(uart, "[SMP] GRF all-zero: trampoline NEVER ran! BL31 ERET to wrong address?\r\n");
     }
     print_u64_array(uart, "[SMP] idle:", smp_idle_counters, SMP_MAX_CORES);
+    // Which step of gicv3_init_cpu_iface() each PE reached; 99 = returned.
+    // On the A72 this reads 1, meaning the PE is still inside
+    // gicv3_force_wake_core(). That function is bounded (16 retries x 600k polls)
+    // so it cannot hang, but on cores 4/5 it can take a long time. Pressing 'd'
+    // again later shows whether the value ever advances past 1.
+    {
+        extern volatile u64 gicv3_cpu_iface_stage[6];
+        uart_puts(uart, "[SMP] cpuiface_stage:");
+        for (u32 i = 0; i < SMP_MAX_CORES; i++) {
+            asm volatile("dc ivac, %0" :: "r"(&gicv3_cpu_iface_stage[i]) : "memory");
+        }
+        asm volatile("dsb sy" ::: "memory");
+        for (u32 i = 0; i < SMP_MAX_CORES; i++) {
+            uart_puts(uart, " C");
+            uart_put_hex(uart, i);
+            uart_puts(uart, "=");
+            uart_put_hex(uart, gicv3_cpu_iface_stage[i]);
+        }
+        uart_puts(uart, "\r\n");
+    }
     print_u64_array(uart, "[SMP] entry_stage:", smp_entry_stage, SMP_MAX_CORES);
     uart_puts(uart, "[SMP] _start tombstone=0x");
     uart_put_hex(uart, smp_start_tombstone);
