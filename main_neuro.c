@@ -631,6 +631,26 @@ void kmain(void) {
         uart_puts(&console, "\r\n");
     }
 
+    // GIC ordering change under test. This used to run AFTER smp_init().
+    // Arm IHI 0069G s2.3.3 makes the ARE 1->0 transition UNPREDICTABLE and the
+    // 0->1 transition unpredictable unless the Group Enables are observably
+    // clear, which gicd_wait_for_rwp() in gicv3_init() now enforces. Beyond that,
+    // both reference implementations configure the Distributor FIRST and never
+    // rewrite it: TF-A's gicv3_rdistif_init() asserts ARE is already 1 before
+    // touching a Redistributor, and Linux calls gic_dist_init() before
+    // gic_cpu_init() and brings secondaries up afterwards via the CPU-hotplug
+    // notifier. H-Exo was the only one rewriting GICD_CTLR underneath live
+    // per-CPU interfaces.
+    //
+    // Core 0's own gicv3_init_cpu_iface() deliberately STAYS after smp_init():
+    // it depends on state smp_init() establishes. An earlier attempt that moved
+    // both together hung the board during early bring-up.
+    // 3. Initialize GICv3 (after secondary cores are running)
+    if (gicv3_init() == OK) {
+        LOG_OK("GICv3: Interrupt Controller Ready");
+    } else {
+        LOG_ERR("GICv3: Initialization Failed");
+    }
     smp_init();
 
     // Post-PSCI re-wake for A72 redistributors: on some RK3399 boots,
@@ -654,12 +674,6 @@ void kmain(void) {
 
     wq_init();
 
-    // 3. Initialize GICv3 (after secondary cores are running)
-    if (gicv3_init() == OK) {
-        LOG_OK("GICv3: Interrupt Controller Ready");
-    } else {
-        LOG_ERR("GICv3: Initialization Failed");
-    }
     // Core 0's per-PE GIC state (SGI enable/group/priority on its own
     // redistributor) is NOT touched by gicv3_init(); it must run the same
     // per-core init the secondaries do, otherwise SGI_STAGE_DONE from core 5

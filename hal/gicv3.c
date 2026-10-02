@@ -52,6 +52,27 @@ static inline u32 gicd_read(u32 reg) {
     return val;
 }
 
+// Wait until the Distributor has drained the writes it is tracking.
+//
+// Arm IHI 0069G s12.9.4, GICD_CTLR.RWP bit [31], verbatim:
+//   "This field tracks writes to: GICD_CTLR[2:0], the Group Enables, for
+//    transitions from 1 to 0 only. GICD_CTLR[7:4], the ARE bits, E1NWF bit and
+//    DS bit. GICR_ICENABLER<n>."
+//
+// So RWP covers exactly the ARE bits and the group-enable clears - both of
+// which gicv3_init() writes. The old code only ever polled GICR_CTLR.RWP, which
+// is a different register in a different frame and does not cover any of this.
+//
+// dsb sy alone is not sufficient: it orders the store, it does not tell you the
+// Distributor has consumed it. Bounded so a wedged Distributor cannot hang boot.
+static u32 gicd_wait_for_rwp(void) {
+    u32 spins = 2000000u;
+    while ((gicd_read(GICD_CTLR) & (1u << 31)) && spins--) {
+        asm volatile("yield");
+    }
+    return spins;
+}
+
 static inline void gicr_write(u32 reg, u32 val) {
     *(volatile u32*)((uintptr_t)GICR_BASE + reg) = val;
     asm volatile("dsb sy" ::: "memory");
@@ -159,9 +180,26 @@ void gicv3_prewake_redistributors(void) {
 }
 
 result_t gicv3_init(void) {
-    // 1. Disable Distributor
+    // 1. Stop interrupt delivery, and do it the way the specification defines.
+    //
+    //    Arm IHI 0069G s2.3.3, verbatim:
+    //      "Changing GICD_CTLR.ARE_NS from 1 to 0 is UNPREDICTABLE."
+    //      "Changing GICD_CTLR.ARE_NS from 0 to 1 is unpredictable except when
+    //       GICD_CTLR.EnableGrp1NS == 0."
+    //      "The effect of clearing GICD_CTLR.EnableGrp0, GICD_CTLR.EnableGrp1S,
+    //       or GICD_CTLR.EnableGrp1NS, as appropriate, must be visible when
+    //       changing GICD_CTLR.ARE_S or GICD_CTLR.ARE_NS from 0 to 1.
+    //       Software can poll GICD_CTLR.RWP to check that writes that clear
+    //       GICD_CTLR.EnableGrp0, GICD_CTLR.EnableGrp1S, or GICD_CTLR.EnableGrp1NS
+    //       bits have completed."
+    //
+    //    So: clear the Group Enables and WAIT for that to be visible, never touch
+    //    ARE on the way down (1->0 is itself UNPREDICTABLE), then raise ARE, then
+    //    re-enable the groups. The previous code wrote 0 and moved straight on,
+    //    so the group-enable clear had not necessarily landed when ARE was raised.
     gicd_write(GICD_CTLR, 0);
-    
+    gicd_wait_for_rwp();
+
     // 2. Wake up Redistributor
     u32 waker = gicr_read(GICR_WAKER);
     waker &= ~(1 << 1); // Clear ProcessorSleep
@@ -175,17 +213,26 @@ result_t gicv3_init(void) {
     
     if (timeout <= 0) return ERR_TIMEOUT;
 
-    // 3. Configure Group 1 (Normal World) interrupts
-    // Set ARE bits (Affinity Routing Enable)
+    // 3. Configure Group 1 (Normal World) interrupts.
+    // Raise ARE only with the Group Enables observably clear - see s2.3.3 quoted
+    // above. Belt and braces: the Distributor was already zeroed and drained
+    // above, but assert the precondition explicitly rather than rely on it.
     u32 ctrl = gicd_read(GICD_CTLR);
+    ctrl &= ~((1u << 0) | (1u << 1) | (1u << 2)); // EnableGrp0/1NS/1S clear
+    gicd_write(GICD_CTLR, ctrl);
+    gicd_wait_for_rwp();
+
+    ctrl = gicd_read(GICD_CTLR);
     ctrl |= (1 << 4) | (1 << 5); // ARE_S and ARE_NS
     gicd_write(GICD_CTLR, ctrl);
-    
+    gicd_wait_for_rwp();
+
     // Enable Group 0 (BL31 EL3 SGIs) AND Group 1 NS (our IRQs)
     // EnableGrp0 MUST be restored: a pending BL31 Group-0 wake-SGI is blocked
     // until this bit is set again.  Leaving it at 0 silently drops the SGI.
     ctrl |= (1 << 0) | (1 << 1); // EnableGrp0 + EnableGrp1NS
     gicd_write(GICD_CTLR, ctrl);
+    gicd_wait_for_rwp();
 
     // 4. Configure CPU Interface (System Registers)
     u32 sre;
