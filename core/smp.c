@@ -30,6 +30,20 @@ volatile u64 __attribute__((aligned(64))) g_smp_loop_diag[6][4];
 //   1 = SMPEN bit set
 //   0xFFFFFFFF = SMC_UNK (TF-A patch not applied)
 //   other = unexpected
+// Idea #6 probe: L2ACTLR_EL1, read from EL3 via RK_SIP_L2ACTLR_GET because
+// the register is EL3-only on Cortex-A72 (S3_1_C15_C0_0). The L2 block of the
+// big cluster owns a clock-gated GIC timer subdomain, so if that domain is not
+// up the redistributor can latch a pending bit while the CPU interface never
+// observes it. Only cores 4/5 may call it: this encoding is A72 specific.
+volatile u64 __attribute__((aligned(64))) g_l2actlr_diag[6][2] = {
+    { 0xDEADBEEFDEADBEEFUL, 0xDEADBEEFDEADBEEFUL },
+    { 0xDEADBEEFDEADBEEFUL, 0xDEADBEEFDEADBEEFUL },
+    { 0xDEADBEEFDEADBEEFUL, 0xDEADBEEFDEADBEEFUL },
+    { 0xDEADBEEFDEADBEEFUL, 0xDEADBEEFDEADBEEFUL },
+    { 0xDEADBEEFDEADBEEFUL, 0xDEADBEEFDEADBEEFUL },
+    { 0xDEADBEEFDEADBEEFUL, 0xDEADBEEFDEADBEEFUL },
+};
+
 volatile u64 __attribute__((aligned(64))) g_smpen_diag[6] = {
     [0 ... 5] = 0xDEADBEEFUL,  // sentinel: probe not run
 };
@@ -978,6 +992,32 @@ void smp_secondary_main(u64 core_idx) {
         g_smpen_diag[core_idx] = x0;
         asm volatile("dc cvac, %0" :: "r"(&g_smpen_diag[core_idx]) : "memory");
         asm volatile("dsb sy" ::: "memory");
+    }
+    // Idea #6: L2ACTLR_EL1 probe. Deliberately inside the same core>=4 gate as
+    // the SMPEN probe above, because S3_1_C15_C0_0 is the A72 encoding and
+    // running it on an A53 would fault in EL3.
+    if (core_idx >= 4 && core_idx < 6) {
+        g_l2actlr_diag[core_idx][0] = 0xCAFE0000UL | (u64)core_idx;
+        g_l2actlr_diag[core_idx][1] = 0;
+        asm volatile("dc cvac, %0" :: "r"(&g_l2actlr_diag[core_idx][0]) : "memory");
+        asm volatile("dsb sy" ::: "memory");
+        {
+            register u64 x0 asm("x0") = 0xC200009BUL; /* RK_SIP_L2ACTLR_GET_64 */
+            register u64 x1 asm("x1") = 0;
+            register u64 x2 asm("x2") = 0;
+            register u64 x3 asm("x3") = 0;
+            asm volatile("smc #0"
+                         : "+r"(x0)
+                         : "r"(x1), "r"(x2), "r"(x3)
+                         : "memory",
+                           "x4", "x5", "x6", "x7", "x8", "x9",
+                           "x10", "x11", "x12", "x13", "x14", "x15",
+                           "x16", "x17");
+            g_l2actlr_diag[core_idx][0] = x0; /* raw L2ACTLR_EL1   */
+            g_l2actlr_diag[core_idx][1] = x1; /* decoded bit field */
+            asm volatile("dc cvac, %0" :: "r"(&g_l2actlr_diag[core_idx][0]) : "memory");
+            asm volatile("dsb sy" ::: "memory");
+        }
     }
     smp_secondary_enter_mask |= (1u << (u32)core_idx);
     smp_trace_or(SMP_TRACE_C_ENTRY_MASK, 1ull << core_idx);

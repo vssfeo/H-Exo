@@ -700,6 +700,34 @@ void kmain(void) {
         uart_puts(&console, "\r\n");
     }
 
+    // Idea #6: L2ACTLR_EL1 of the A72 cluster's L2 block, read from EL3.
+    // dec bit0 is FORCE_L2_GIC_TIMER_RCG_CLK_ACTIVE - the clock-gated GIC timer
+    // subdomain. If it is off, the redistributor latches a pending bit but the
+    // CPU interface never observes it, which is the measured symptom.
+    // raw == DEADBEEF means the probe never ran on that core (by design: the
+    // S3_1_C15_C0_0 encoding is A72 specific and must not run on an A53).
+    {
+        extern volatile u64 g_l2actlr_diag[6][2];
+        for (u32 ci = 0; ci < 6u; ci++) {
+            u64 raw = g_l2actlr_diag[ci][0];
+            u64 dec = g_l2actlr_diag[ci][1];
+            if (raw == 0xDEADBEEFDEADBEEFUL) continue;
+            uart_puts(&console, "[L2ACTLR_DIAG] core=0x");
+            uart_put_hex(&console, ci);
+            uart_puts(&console, " raw=0x"); uart_put_hex(&console, raw);
+            uart_puts(&console, " dec=0x"); uart_put_hex(&console, dec);
+            uart_puts(&console, " gic_tmr_clk=");  uart_put_hex(&console, dec & 1u);
+            uart_puts(&console, " l2_logic_clk="); uart_put_hex(&console, (dec >> 1) & 1u);
+            uart_puts(&console, " tag_bank_clk="); uart_put_hex(&console, (dec >> 2) & 1u);
+            uart_puts(&console, " dvm_cmo_dis="); uart_put_hex(&console, (dec >> 3) & 1u);
+            uart_puts(&console, " no_dvm_sync="); uart_put_hex(&console, (dec >> 4) & 1u);
+            uart_puts(&console, " ace_sh_dis=");  uart_put_hex(&console, (dec >> 5) & 1u);
+            uart_puts(&console, " haz_timeout="); uart_put_hex(&console, (dec >> 6) & 1u);
+            uart_puts(&console, " uniq_clean=");  uart_put_hex(&console, (dec >> 7) & 1u);
+            uart_puts(&console, "\r\n");
+        }
+    }
+
     // Secure-world GICR diagnostics (requires BL31 SiP patch):
     // GET:  x0=status, x1=waker
     // WAKE: x0=flags,  x1=before, x2=after

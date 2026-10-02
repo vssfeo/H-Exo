@@ -388,6 +388,101 @@ jobs:
           PY
           python3 /tmp/h_exo_patch_gicr_sip.py
 
+      - name: Patch RK3399 SiP A72 L2ACTLR_EL1 probe
+        working-directory: ${{ runner.temp }}/tfa
+        run: |
+          cat > /tmp/h_exo_patch_l2actlr_sip.py <<'PY'
+          from pathlib import Path
+          import textwrap
+
+          p = Path("plat/rockchip/rk3399/plat_sip_calls.c")
+          if not p.exists():
+              raise SystemExit(f"missing {p}")
+
+          s = p.read_text()
+          marker = "RK_SIP_L2ACTLR_GET"
+          if marker in s:
+              print("H-Exo L2ACTLR SiP patch already present")
+          else:
+              helper = textwrap.dedent(r'''
+          #define RK_SIP_L2ACTLR_GET          U(0x8200009B)
+          #define RK_SIP_L2ACTLR_GET_64       U(0xC200009B)
+
+          /* Cortex-A72 L2ACTLR_EL1 is S3_1_C15_C0_0, reachable from EL3 only.
+           * Bit positions are verbatim from TF-A v2.14.0
+           * include/lib/cpus/aarch64/cortex_a72.h.
+           *
+           * Bit 26 is FORCE_L2_GIC_TIMER_RCG_CLK_ACTIVE: the L2 block of the
+           * big cluster owns a clock-gated GIC timer subdomain. If that domain
+           * is not up, the redistributor can latch a pending bit while the
+           * CPU interface never sees it - which is exactly the measured
+           * symptom. Read-only probe; nothing is written.
+           */
+          #define A72_L2ACTLR_GIC_TIMER_CLK_BIT  (1ULL << 26)
+          #define A72_L2ACTLR_L2_LOGIC_CLK_BIT   (1ULL << 27)
+          #define A72_L2ACTLR_TAG_BANK_CLK_BIT   (1ULL << 28)
+          #define A72_L2ACTLR_UNIQUE_CLEAN_BIT   (1ULL << 14)
+          #define A72_L2ACTLR_NO_DVM_SYNC_BIT    (1ULL << 11)
+          #define A72_L2ACTLR_NO_DVM_CMO_BIT     (1ULL << 8)
+          #define A72_L2ACTLR_HAZARD_TIMEOUT_BIT (1ULL << 7)
+          #define A72_L2ACTLR_NO_ACE_SH_BIT      (1ULL << 6)
+
+          static uint64_t rk_l2actlr_get(void)
+          {
+          	uint64_t v;
+          	__asm__ volatile ("mrs %0, S3_1_C15_C0_0" : "=r"(v));
+          	return v;
+          }
+
+          /* Pack the interesting bits into a low byte so one SMC return value
+           * carries a readable decode next to the raw register.
+           * bit0 gic_timer_clk  bit1 l2_logic_clk  bit2 tag_bank_clk
+           * bit3 dvm_cmo_dis    bit4 no_dvm_sync    bit5 ace_sh_dis
+           * bit6 hazard_timeout bit7 unique_clean    bits[15:8] = raw bits[7:0]
+           */
+          static uint64_t rk_l2actlr_decode(void)
+          {
+          	uint64_t v = rk_l2actlr_get();
+          	uint64_t d = 0;
+          	d |= ((v >> 26) & 1ULL) << 0;
+          	d |= ((v >> 27) & 1ULL) << 1;
+          	d |= ((v >> 28) & 1ULL) << 2;
+          	d |= ((v >>  8) & 1ULL) << 3;
+          	d |= ((v >> 11) & 1ULL) << 4;
+          	d |= ((v >>  6) & 1ULL) << 5;
+          	d |= ((v >>  7) & 1ULL) << 6;
+          	d |= ((v >> 14) & 1ULL) << 7;
+          	d |= ((v & 0xFFULL) << 8);
+          	return d;
+          }
+          ''')
+
+              helper_anchor = "uint64_t sip_smc_dram("
+              if helper_anchor in s:
+                  s = s.replace(helper_anchor, helper + "\n" + helper_anchor, 1)
+              else:
+                  include_pos = s.rfind("#include")
+                  if include_pos < 0:
+                      raise SystemExit("cannot find include/helper insertion point")
+                  line_end = s.find("\n", include_pos)
+                  s = s[:line_end + 1] + helper + s[line_end + 1:]
+
+              cases = textwrap.dedent(r'''
+          	case RK_SIP_L2ACTLR_GET:
+          	case RK_SIP_L2ACTLR_GET_64:
+          		SMC_RET2(handle, rk_l2actlr_get(), rk_l2actlr_decode());
+          ''')
+
+              switch_anchor = "switch (smc_fid) {"
+              if switch_anchor not in s:
+                  raise SystemExit("cannot find SiP switch (smc_fid)")
+              s = s.replace(switch_anchor, switch_anchor + cases, 1)
+
+              p.write_text(s)
+              print("H-Exo L2ACTLR SiP patch applied")
+          PY
+          python3 /tmp/h_exo_patch_l2actlr_sip.py
+
       - name: Patch TF-A RK3399 A72 GICR wake in on_finish
         working-directory: ${{ runner.temp }}/tfa
         run: |
