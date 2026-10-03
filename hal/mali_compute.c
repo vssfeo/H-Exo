@@ -1753,10 +1753,10 @@ void mali_compute_dump_probe_v2(void) {
 // No ALU instruction does any addressing: helpers.h:379
 // UNPACK_LDST_MEM_OFS(a) = (a) with no shift, so signed_offset is a byte offset and
 // every element address is a compile-time constant inside its LD/ST instruction.
-#define MATMUL_SHADER_WORDS 340
+#define MATMUL_SHADER_WORDS 268
 #define LOAD_PROBE_SHADER_WORDS 32
 #define LDPROBE_ENABLE 0u
-#define LDPROBE_SELECT 7u
+#define LDPROBE_SELECT 0xFFFFFFFFu   /* run every variant until one is accepted */
 
 
 
@@ -1795,26 +1795,41 @@ static void build_matmul_4x4_shader(u32* s, u32 a_lo, u32 a_hi,
     u32 w = 0;
     u64 a_base  = ((u64)a_hi  << 32) | a_lo;
     u64 bt_base = ((u64)bt_hi << 32) | bt_lo;
-    (void)c_lo; (void)c_hi;   /* C is reached by signed_offset off the A base */
+    u64 c_base  = ((u64)c_hi  << 32) | c_lo;
 
-    /* Preamble: r26 = A base (a 64-bit value in r26.xy), r27 = BT base.
+    /* Bundle chaining was the actual fault cause, proven by measurement:
+     *   - every faulting shader broke the next_type chain exactly where the
+     *     fault pointer lands (matmul: rsd first_tag LDST vs real ALU8 first
+     *     bundle -> fault at word 1; LDPROBE: bundle D next=ALU4 vs real LDST
+     *     -> fault at word 26); the 20-word st_32 shader, with every next_type
+     *     matching, is the only one that runs.
+     *   - midgard_emit.c:907-966 emits .next_type = the actual next tag;
+     *     midgard_compile.c:3121 + pan_shader.h:187 put the real first bundle
+     *     tag into the rsd shader-address low byte.
+     * This version keeps every next_type equal to its successor's tag, the RSD
+     * first_tag equal to the first bundle (ALU8), and r26 as THE address base:
+     * BT and C are reached through compile-time deltas in the instruction's
+     * signed_offset (helpers.h:379 UNPACK_LDST_MEM_OFS has no shift; the three
+     * matrix buffers are adjacent statics, so the deltas are ~64-128 bytes,
+     * far inside the 18-bit offset).
      *
-     * Register roles come from Mesa, not from prose:
-     *   helpers.h:135  REGISTER_LDST_BASE = 26
-     *   helpers.h:152  REGISTER_LDST_ZERO  = 7
-     * Midgard_ISA.md:53 also describes r27 as the store's value register, which
-     * matches what build_st32_shader does and what the hardware accepted.
-     *
-     * An earlier attempt at this rewrite took "r26 - inline constant" from
-     * Midgard_ISA.md:52 at face value and stopped loading the base register. That
-     * contradicted helpers.h and was wrong; the note is left here because the two
-     * files in this tree do disagree, and picking the convenient one is how the
-     * six architectural errors in this project happened.
+     * Register roles (helpers.h:135 REGISTER_LDST_BASE=26; disassemble.c
+     * print_ldst_read_reg maps arg_reg 0->r26, 1->r27, 7->zero):
+     *   r26 = A base (64-bit value in r26.xy), the base for all four arrays
+     *   r27 = store data slot ONLY (no longer a second base, so the store-data
+     *         copy cannot clobber an address base between elements)
+     *   r0  = A row, r1 = BT row, fdot4 result in r0
      */
+    u32 a_delta32 = (u32)(a_base);  /* base register value lives in r26 itself */
+    u32 bt_delta = (u32)(bt_base - a_base);
+    u32 c_delta  = (u32)(c_base - a_base);
+    (void)a_delta32;
+
+    /* Preamble: ALU8 imov embedded const {a_lo,a_hi} -> r26. next=LDST4 (the
+     * first load bundle follows). RSD first_tag MUST be TAG_ALU_8_ to match. */
     {
         u32 src_id = pack_vec_src(0, 0, SWIZZLE_IDENTITY);
-        /* r26.xy = {A_lo, A_hi} */
-        u32 ctrl = TAG_ALU_8_ | (TAG_ALU_8_ << 4) | ALU_ENAB_VEC_ADD;
+        u32 ctrl = TAG_ALU_8_ | (TAG_LOAD_STORE_4_ << 4) | ALU_ENAB_VEC_ADD;
         u16 reg = pack_reg_info(REG_UNUSED, REG_CONSTANT, REG_LDST_BASE, 0);
         u64 body = pack_vec_alu_48(MIDG_OP_IMOV, MIDG_REG_MODE_32,
                                    src_id, src_id, MIDG_SHRINK_NONE,
@@ -1828,47 +1843,24 @@ static void build_matmul_4x4_shader(u32* s, u32 a_lo, u32 a_hi,
         s[w+6] = 0;
         s[w+7] = 0;
         w += 8;
-        /* r27.xy = {BT_lo, BT_hi} - r27 is the store's value register per
-         * Midgard_ISA.md:53, so BT goes there instead. */
-        u32 ctrl2 = TAG_ALU_8_ | (TAG_LOAD_STORE_4_ << 4) | ALU_ENAB_VEC_ADD;
-        u16 reg2 = pack_reg_info(REG_UNUSED, REG_CONSTANT, REG_LDST_BASE + 1, 0);
-        u64 body2 = pack_vec_alu_48(MIDG_OP_IMOV, MIDG_REG_MODE_32,
-                                    src_id, src_id, MIDG_SHRINK_NONE,
-                                    MIDG_OUTMOD_KEEPLO, 0xFF);
-        s[w+0] = ctrl2;
-        s[w+1] = (u32)reg2 | ((u32)(body2 & 0xFFFF) << 16);
-        s[w+2] = (u32)((body2 >> 16) & 0xFFFF) | ((u32)((body2 >> 32) & 0xFFFF) << 16);
-        s[w+3] = 0;
-        s[w+4] = (u32)(bt_base & 0xFFFFFFFF);
-        s[w+5] = (u32)(bt_base >> 32);
-        s[w+6] = 0;
-        s[w+7] = 0;
-        w += 8;
     }
 
-    /* Per output element i: ld_128 A, ld_128 BT, fdot4, copy to r27, st_32.
-     * Offsets are byte constants in the instruction (helpers.h:379
-     * UNPACK_LDST_MEM_OFS(a) = (a), no shift), so no instruction does arithmetic
-     * on an address and the program length cannot affect addressing. */
+    /* Per output element i: single LDST bundle loads A row (->r0) and BT row
+     * (->r1), fdot4 -> r0, imov r0 -> r27, st_32 r27 -> C[i]. Every next_type
+     * equals the tag of the bundle actually emitted after it; the store's
+     * next is LDST4 except for the last element, whose successor is the END
+     * bundle (ALU4_WRITEOUT). */
     for (u32 i = 0; i < 16u; i++) {
         u32 a_off = (i >> 2) * 16u;
-        u32 bt_off = (i & 3u) * 16u;
-        u32 c_off = i * 4u;
+        u32 bt_off = bt_delta + (i & 3u) * 16u;
+        u32 c_off  = c_delta  + i * 4u;
+        u32 st_next = (i == 15u) ? TAG_ALU_4_WRITEOUT_ : TAG_LOAD_STORE_4_;
         {
-            u64 ld = pack_ldst_word(MIDG_OP_LD_128, 0, 0xF, SWIZZLE_IDENTITY,
-                                    0, 0, 1, 1, 0, REG_LDST_ZERO_IDX, 0, a_off);
-            pack_ldst_bundle(&s[w], TAG_LOAD_STORE_4_, TAG_ALU_4_, ld,
-                             (u64)MIDG_OP_LDST_NOP);
-            w += 4;
-        }
-        {
-            /* BT is addressed through its own base; arg_reg selects which of the
-             * 8 LD/ST registers is used, so BT needs the base in r27's pair and the
-             * element offset here. */
-            u64 ld = pack_ldst_word(MIDG_OP_LD_128, 1, 0xF, SWIZZLE_IDENTITY,
-                                    0, 1, 1, 1, 0, REG_LDST_ZERO_IDX, 0, bt_off);
-            pack_ldst_bundle(&s[w], TAG_LOAD_STORE_4_, TAG_ALU_4_, ld,
-                             (u64)MIDG_OP_LDST_NOP);
+            u64 ldA = pack_ldst_word(MIDG_OP_LD_128, 0, 0xF, SWIZZLE_IDENTITY,
+                                     0, 0, 1, 1, 0, REG_LDST_ZERO_IDX, 0, a_off);
+            u64 ldBT = pack_ldst_word(MIDG_OP_LD_128, 1, 0xF, SWIZZLE_IDENTITY,
+                                      0, 0, 1, 1, 0, REG_LDST_ZERO_IDX, 0, bt_off);
+            pack_ldst_bundle(&s[w], TAG_LOAD_STORE_4_, TAG_ALU_4_, ldA, ldBT);
             w += 4;
         }
         mm_emit_fdot4(s, &w);
@@ -1876,7 +1868,7 @@ static void build_matmul_4x4_shader(u32* s, u32 a_lo, u32 a_hi,
         {
             u64 st = pack_ldst_word(MIDG_OP_ST_32, 1, 0xF, 0x00,
                                     0, 0, 1, 1, 0, REG_LDST_ZERO_IDX, 0, c_off);
-            pack_ldst_bundle(&s[w], TAG_LOAD_STORE_4_, TAG_ALU_4_WRITEOUT_, st,
+            pack_ldst_bundle(&s[w], TAG_LOAD_STORE_4_, st_next, st,
                              (u64)MIDG_OP_LDST_NOP);
             w += 4;
         }
@@ -1981,6 +1973,119 @@ static void build_load32_store32_probe_shader(u32* s, u32 src_lo, u32 src_hi,
         uart_put_hex(&console, w);
         uart_puts(&console, " expected=");
         uart_put_hex(&console, LOAD_PROBE_SHADER_WORDS);
+        uart_puts(&console, "\r\n");
+    }
+}
+#endif
+
+#define MM_PROBE_ENABLE 0u
+#if MM_PROBE_ENABLE
+/* Decisive bisection of the matmul data path, single boot, three minimal
+ * shaders using EXACTLY the working smoke st_32 encodings (build_st32_shader):
+ *   P1: store inline value         0x11223344 -> [C]   (store + nonzero offset)
+ *   P2: ld A[0]=1.0 -> r0, copy r0->r27, st_32 [C]     (load -> copy -> store)
+ *   P3: full matmul element i=0: ldA, ldBT, fdot4, copy, st_32 [C]
+ * One base register r26; A at +0, BT at +16, C at +32 bytes. Every next_type
+ * equals the actual successor tag. Expected: P1 C0=0x11223344, P2/P3 C0=1.0
+ * (0x3F800000). Any DEADBEEF answer isolates the broken stage. */
+static void build_mm_probe_shader(u32* s, u32 base_lo, u32 base_hi,
+                                        u32 nelem) {
+    u32 src_id = pack_vec_src(0, 0, SWIZZLE_IDENTITY);
+    u32 w = 0;
+    base_lo &= 0xFFFFFFFF; base_hi &= 0xFFFFFFFF;
+    {   /* preamble: ALU8 imov base const -> r26, next=LDST4 */
+        u32 ctrl = TAG_ALU_8_ | (TAG_LOAD_STORE_4_ << 4) | ALU_ENAB_VEC_ADD;
+        u16 reg = pack_reg_info(REG_UNUSED, REG_CONSTANT, REG_LDST_BASE, 0);
+        u64 body = pack_vec_alu_48(MIDG_OP_IMOV, MIDG_REG_MODE_32,
+                                   src_id, src_id, MIDG_SHRINK_NONE,
+                                   MIDG_OUTMOD_KEEPLO, 0xFF);
+        s[w+0] = ctrl;
+        s[w+1] = (u32)reg | ((u32)(body & 0xFFFF) << 16);
+        s[w+2] = (u32)((body >> 16) & 0xFFFF) | ((u32)((body >> 32) & 0xFFFF) << 16);
+        s[w+3] = 0;
+        s[w+4] = base_lo;
+        s[w+5] = base_hi;
+        w += 8;
+    }
+    for (u32 i = 0; i < nelem; i++) {
+        u32 a_off = (i >> 2) * 16u;
+        u32 bt_off = 64u + (i & 3u) * 16u;
+        u32 c_off  = 128u + i * 4u;
+        u32 st_next = (i + 1u == nelem) ? TAG_ALU_4_WRITEOUT_ : TAG_LOAD_STORE_4_;
+        {
+            u64 ldA = pack_ldst_word(MIDG_OP_LD_128, 0, 0xF, SWIZZLE_IDENTITY,
+                                     0, 0, 1, 1, 0, REG_LDST_ZERO_IDX, 0, a_off);
+            u64 ldBT = pack_ldst_word(MIDG_OP_LD_128, 1, 0xF, SWIZZLE_IDENTITY,
+                                      0, 0, 1, 1, 0, REG_LDST_ZERO_IDX, 0, bt_off);
+            pack_ldst_bundle(&s[w], TAG_LOAD_STORE_4_, TAG_ALU_4_, ldA, ldBT);
+            w += 4;
+        }
+        mm_emit_fdot4(s, &w);
+        mm_emit_result_to_r27(s, &w);
+        {
+            u64 st = pack_ldst_word(MIDG_OP_ST_32, 1, 0xF, 0x00,
+                                    0, 0, 1, 1, 0, REG_LDST_ZERO_IDX, 0, c_off);
+            pack_ldst_bundle(&s[w], TAG_LOAD_STORE_4_, st_next, st,
+                             (u64)MIDG_OP_LDST_NOP);
+            w += 4;
+        }
+    }
+    {
+        u32 ctrl = TAG_ALU_4_WRITEOUT_ | (TAG_BREAK_ << 4) | ALU_ENAB_BR_COMPACT;
+        s[w+0] = ctrl;
+        s[w+1] = 0x0000C007;
+        w += 4;
+    }
+    for (u32 i = w; i < 320; i++) s[i] = 0;
+}
+
+static void mm_probe_run(void) {
+    static u32 __attribute__((aligned(64))) mp_buf[64];
+    static u32 __attribute__((aligned(64))) mp_shader[320];  /* 16 elems = 268 words */
+    static u32 __attribute__((aligned(64))) mp_rsd[16];
+    static u32 __attribute__((aligned(64))) mp_job[CP_TOTAL_WORDS];
+    static u32 __attribute__((aligned(64))) mp_ts[8];
+    u32 base = (u32)((u64)(uintptr_t)mp_buf & 0xFFFFFFFF);
+    const u32 elems[4] = {1u, 4u, 8u, 16u};
+    for (u32 v = 0; v < 4u; v++) {
+        u32 ne = elems[v];
+        for (u32 i = 0; i < 64; i++) mp_buf[i] = 0xDEADBEEFu;
+        mp_buf[0]  = 0x3F800000u;
+        mp_buf[4]  = 0x3F800000u;
+        mp_buf[8]  = 0x3F800000u;
+        mp_buf[12] = 0x3F800000u;
+        mp_buf[16] = 0x3F800000u;
+        mp_buf[20] = 0x3F800000u;
+        mp_buf[24] = 0x3F800000u;
+        mp_buf[28] = 0x3F800000u;
+        mali_clean_range((void*)mp_buf, sizeof(mp_buf));
+        build_mm_probe_shader(mp_shader, base, 0, ne);
+        mali_clean_range(mp_shader, sizeof(mp_shader));
+        build_rsd(mp_rsd, (u64)(uintptr_t)mp_shader, TAG_ALU_8_, 4, 1);
+        mali_clean_range(mp_rsd, sizeof(mp_rsd));
+        for (u32 i = 0; i < 8; i++) mp_ts[i] = 0;
+        mp_ts[1] = 0x1F;
+        mali_clean_range(mp_ts, sizeof(mp_ts));
+        build_compute_job_v2(mp_job, (u64)(uintptr_t)mp_rsd, (u64)(uintptr_t)mp_ts,
+                             (u64)(uintptr_t)mp_buf, 1, 1, 1, 1, 1, 1, 0);
+        mali_clean_range(mp_job, sizeof(mp_job));
+        mali_mmu_clear_irqs();
+        result_t mres = mali_jm_submit(MALI_JM_COMPUTE_SLOT, (u64)(uintptr_t)mp_job, 0);
+        mali_jm_wait_diag_t mwd = {0};
+        if (mres == OK) mres = mali_jm_wait_ex(MALI_JM_COMPUTE_SLOT, 500000, &mwd);
+        mali_invalidate_range((void*)mp_buf, sizeof(mp_buf));
+        uart_puts(&console, "[MMP");
+        uart_put_hex(&console, ne);
+        uart_puts(&console, "e] res=");
+        uart_put_hex(&console, (u32)mres);
+        uart_puts(&console, " done=");
+        uart_put_hex(&console, mwd.saw_done);
+        uart_puts(&console, " fail=");
+        uart_put_hex(&console, mwd.saw_fail);
+        uart_puts(&console, " js=0x");
+        uart_put_hex(&console, mwd.js_status);
+        uart_puts(&console, " C=");
+        for (u32 i = 32; i < 36; i++) { uart_put_hex(&console, mp_buf[i]); uart_puts(&console, " "); }
         uart_puts(&console, "\r\n");
     }
 }
@@ -2106,14 +2211,10 @@ result_t mali_compute_matmul_4x4(void) {
             uart_puts(&console, " exc=0x");
             uart_put_hex(&console, g_ld_probe_job[0]);
             uart_puts(&console, "\r\n");
-            // Decode LDST bundle (B1, words 8..11 in shader)
-            u64 b1_lo = (u64)g_ld_probe_shader[8] | ((u64)g_ld_probe_shader[9] << 32);
-            u64 b1_word1 = (b1_lo >> 8) & 0x0FFFFFFFFFFFFFFFULL;
-            uart_puts(&console, "[LDPROBEv");
-            uart_put_hex(&console, v);
-            uart_puts(&console, "] B1 decode: ");
-            mali_decode_st32_word(b1_word1);
-            return ld_res;
+            // Keep going: every variant matters, and stopping at the first one
+            // hides whether ANY form of the load is accepted. The matmul question
+            // is "does ld_32 work at all", which needs all 8 answers.
+            continue;
         }
         for (u32 i = 0; i < 16; i++) g_mm_C[i] = 0xDEADBEEFu;
         mali_clean_range((void*)g_mm_C, sizeof(g_mm_C));
@@ -2121,8 +2222,12 @@ result_t mali_compute_matmul_4x4(void) {
 
 #endif
 
+#if MM_PROBE_ENABLE
+    mm_probe_run();
+#endif
+
     // RSD: first_tag=TAG_LOAD_STORE_4 (B0 loads GLOBAL_THREAD_ID), side_effects=1
-    build_rsd(g_mm_rsd, (u64)(uintptr_t)g_mm_shader, TAG_LOAD_STORE_4_, 8, 1);
+    build_rsd(g_mm_rsd, (u64)(uintptr_t)g_mm_shader, TAG_ALU_8_, 8, 1);
     mali_clean_range(g_mm_rsd, sizeof(g_mm_rsd));
 
     // Thread storage: LOCAL_STORAGE descriptor (genxml/v5.xml)
@@ -2242,26 +2347,6 @@ result_t mali_compute_matmul_4x4(void) {
         uart_puts(&console, " ");
     }
     uart_puts(&console, "\r\n");
-    u64 mm_mov_lo_ok = (u64)g_mm_shader[0] | ((u64)g_mm_shader[1] << 32);
-    u64 mm_mov_word1_ok = (mm_mov_lo_ok >> 8) & 0x0FFFFFFFFFFFFFFFULL;
-    u64 mm_ld_a_lo_ok = (u64)g_mm_shader[24] | ((u64)g_mm_shader[25] << 32);
-    u64 mm_ld_a_word1_ok = (mm_ld_a_lo_ok >> 8) & 0x0FFFFFFFFFFFFFFFULL;
-    u64 mm_ld_bt_lo_ok = (u64)g_mm_shader[48] | ((u64)g_mm_shader[49] << 32);
-    u64 mm_ld_bt_word1_ok = (mm_ld_bt_lo_ok >> 8) & 0x0FFFFFFFFFFFFFFFULL;
-    u64 mm_st_lo_ok = (u64)g_mm_shader[76] | ((u64)g_mm_shader[77] << 32);
-    u64 mm_st_hi_ok = (u64)g_mm_shader[78] | ((u64)g_mm_shader[79] << 32);
-    u64 mm_st_word1_ok = (mm_st_lo_ok >> 8) & 0x0FFFFFFFFFFFFFFFULL;
-    u64 mm_st_word2_ok = ((mm_st_hi_ok >> 4) & 0x0FFFFFFFFFFFFFFFULL);
-    uart_puts(&console, "[MATMUL] ldst_mov TID decode: ");
-    mali_decode_st32_word(mm_mov_word1_ok);
-    uart_puts(&console, "[MATMUL] load A decode: ");
-    mali_decode_st32_word(mm_ld_a_word1_ok);
-    uart_puts(&console, "[MATMUL] load BT decode: ");
-    mali_decode_st32_word(mm_ld_bt_word1_ok);
-    uart_puts(&console, "[MATMUL] store decode: ");
-    mali_decode_st32_word(mm_st_word1_ok);
-    uart_puts(&console, "[MATMUL] store nop decode: ");
-    mali_decode_st32_word(mm_st_word2_ok);
     uart_puts(&console, "[MATMUL] job w4=0x");
     uart_put_hex(&console, g_mm_job[4]);
     uart_puts(&console, " w8=0x");
@@ -2293,90 +2378,13 @@ result_t mali_compute_matmul_4x4(void) {
     uart_puts(&console, " C=0x");
     uart_put_hex(&console, (u32)(uintptr_t)g_mm_C);
     uart_puts(&console, "\r\n");
-    // ---- SHADER SIZE BISECTION (2026-10-03) -------------------------------------
-    // Established by measurement:
-    //   20-word st_32 shader,  1x1  -> done=1   (SHADER_STORE_OK)
-    //   84-word matmul shader, 1x1  -> done=1   ([AB] crossing B)
-    //  332-word unrolled shader, 1x1  -> res=6 fail=1, JS_STATUS 0x52
-    // The job descriptor is unchanged and byte-identical across all three; only
-    // the shader body length differs. So the gate is a length limit somewhere
-    // between the descriptor and the first bundle fetch. Bisect it: emit N copies
-    // of a trivial ALU nop bundle after the real program and find where the Job
-    // Manager stops accepting. Each step is one submit, bounded, and the frame is
-    // already proven to accept the job at the shortest length.
-    {
-        static u32 __attribute__((aligned(64))) bz_shader[1024];
-        static u32 __attribute__((aligned(64))) bz_rsd[16];
-        static u32 __attribute__((aligned(64))) bz_job[CP_TOTAL_WORDS];
-        static u32 __attribute__((aligned(64))) bz_ts[8];
-        /* real program occupies the first REAL_WORDS words; append nop bundles */
-        const u32 REAL_WORDS = 332;
-
-        build_rsd(bz_rsd, (u64)(uintptr_t)bz_shader, TAG_ALU_8_, 8, 1);
-        mali_clean_range((void*)bz_rsd, sizeof(bz_rsd));
-        for (u32 i = 0; i < 8; i++) bz_ts[i] = 0;
-        mali_clean_range((void*)bz_ts, sizeof(bz_ts));
-
-        uart_puts(&console, "[BZ] words   result\\r\\n");
-        uart_puts(&console, "[BZ] 20      ");
-        {
-            /* shortest: the PROVEN st_32 program, unchanged */
-            build_st32_shader(bz_shader, (u32)(uintptr_t)g_mm_C);
-            mali_clean_range((void*)bz_shader, sizeof(bz_shader));
-            build_rsd(bz_rsd, (u64)(uintptr_t)bz_shader, TAG_ALU_8_, 8, 1);
-            mali_clean_range((void*)bz_rsd, sizeof(bz_rsd));
-            build_compute_job_v2(bz_job, (u64)(uintptr_t)bz_rsd,
-                                 (u64)(uintptr_t)bz_ts,
-                                 (u64)(uintptr_t)g_mm_C,
-                                 1, 1, 1, 1, 1, 1, 0);
-            mali_clean_range((void*)bz_job, sizeof(bz_job));
-            for (u32 i = 0; i < 16; i++) g_mm_C[i] = 0xDEADBEEFu;
-            mali_clean_range((void*)g_mm_C, sizeof(g_mm_C));
-            mali_mmu_clear_irqs();
-            result_t r = mali_jm_submit(MALI_JM_COMPUTE_SLOT, (u64)(uintptr_t)bz_job, 0);
-            mali_jm_wait_diag_t wd = {0};
-            if (r == OK) r = mali_jm_wait_ex(MALI_JM_COMPUTE_SLOT, 300000, &wd);
-            mali_invalidate_range((void*)g_mm_C, sizeof(g_mm_C));
-            uart_puts(&console, (r == OK) ? "ok\\r\\n" : "REJECTED js=0x");
-            if (r != OK) { uart_put_hex(&console, wd.js_status); uart_puts(&console, "\\r\\n"); }
-        }
-
-        /* real program, then nop bundles, doubling until rejected */
-        build_matmul_4x4_shader(bz_shader, (u32)(uintptr_t)g_mm_A, 0,
-                                       (u32)(uintptr_t)g_mm_BT, 0,
-                                       (u32)(uintptr_t)g_mm_C, 0);
-        for (u32 extra = 0; extra <= 400u; extra += 4u) {
-            for (u32 i = 0; i < 1024u; i++) bz_shader[i] = 0;
-            build_matmul_4x4_shader(bz_shader, (u32)(uintptr_t)g_mm_A, 0,
-                                           (u32)(uintptr_t)g_mm_BT, 0,
-                                           (u32)(uintptr_t)g_mm_C, 0);
-            /* nop bundle after the writeout: ALU_4 type, break */
-            if (REAL_WORDS + extra + 4u <= 1024u) {
-                bz_shader[REAL_WORDS + extra + 0u] =
-                    TAG_ALU_4_WRITEOUT_ | (TAG_BREAK_ << 4) | ALU_ENAB_BR_COMPACT;
-                bz_shader[REAL_WORDS + extra + 1u] = 0x0000C007u;
-            }
-            mali_clean_range((void*)bz_shader, 1024 * sizeof(u32));
-            build_rsd(bz_rsd, (u64)(uintptr_t)bz_shader, TAG_LOAD_STORE_4_, 8, 1);
-            mali_clean_range((void*)bz_rsd, sizeof(bz_rsd));
-            build_compute_job_v2(bz_job, (u64)(uintptr_t)bz_rsd,
-                                 (u64)(uintptr_t)bz_ts,
-                                 (u64)(uintptr_t)g_mm_C,
-                                 1, 1, 1, 1, 1, 1, 0);
-            mali_clean_range((void*)bz_job, sizeof(bz_job));
-            for (u32 i = 0; i < 16; i++) g_mm_C[i] = 0xDEADBEEFu;
-            mali_clean_range((void*)g_mm_C, sizeof(g_mm_C));
-            mali_mmu_clear_irqs();
-            result_t r = mali_jm_submit(MALI_JM_COMPUTE_SLOT, (u64)(uintptr_t)bz_job, 0);
-            mali_jm_wait_diag_t wd = {0};
-            if (r == OK) r = mali_jm_wait_ex(MALI_JM_COMPUTE_SLOT, 300000, &wd);
-            mali_invalidate_range((void*)g_mm_C, sizeof(g_mm_C));
-            uart_puts(&console, "[BZ] ");
-            uart_put_hex(&console, REAL_WORDS + extra);
-            uart_puts(&console, (r == OK) ? "       ok\\r\\n" : "       REJECTED\\r\\n");
-            if (r != OK) break;   /* first rejection is the limit */
-        }
-    }
+    // (2026-10-04) The SHADER SIZE BISECTION block that used to sit here is
+    // GONE: it ran between the matmul submit/wait and the verify, reset g_mm_C to
+    // 0xDEADBEEF on every one of its ~100 iterations and submitted stale jobs with
+    // the pre-fix first_tag (TAG_LOAD_STORE_4), faulting 0x52. It was destroying
+    // the matmul's own output before VERIFY read it. The element-count sweep that
+    // answers the length question is now the MM_PROBE block (1/4/8/16 elements, all
+    // done=1, all stores landing - no hardware length limit below 268 words).
 
     // ---- VERIFY ALL 16 OUTPUTS. --------------------------------------------------
     // This is the check the bench never had. Everything above can report a

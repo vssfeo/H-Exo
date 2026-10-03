@@ -132,3 +132,47 @@ The `MATMUL 4x4 FAILED` warning is chronic: present in every log from
 this machine, and `docs/H-Exo_MASTER_PLAN_v3.3.md` (dated 2026-05-03) records
 "matmul NOT started" with `st_32` store verified. So the 4x4 matmul has **never**
 passed; there is no working version to regress to.
+
+## Resolution (2026-10-04, measured)
+
+The 4x4 matmul now passes **16/16 on the NanoPi M4**. `I * I = I` with exact bit
+patterns, verified on-image (final image e904fab9, proof image 9ef229ec, both
+FATAL=0):
+
+```text
+[MATMUL] wait res=0 done=1 fail=0 js=0
+[MATMUL] VERIFY match=16/16 bad_mask=0x00000000 first_bad=0xFFFFFFFF
+[MATMUL] C=3F800000 0 0 0 | 0 3F800000 0 0 | 0 0 3F800000 0 | 0 0 0 3F800000
+[OK] Mali-T860: MATMUL 4x4 CORRECT (16/16)
+[OK] Mali-T860: MATMUL 4x4 PASSED (I*I=I)
+```
+
+What the two failure classes actually were (each established by measurement,
+not inference):
+
+1. **"Long shader rejected, js=0x52" was NOT a length limit.** Every faulting
+   shader had a broken bundle chain: a `next_type` that was not the tag of the
+   bundle actually emitted after it, or an RSD `first_tag` that was not the tag
+   of the shader's first bundle. The fault pointer landed exactly where the
+   decode diverged (matmul: word 1 = RSD first_tag LDST vs real ALU8 preamble;
+   LDPROBE: word 26 = bundle next ALU4 vs real LDST). The 268-word shader runs
+   when every `next_type` matches its successor and `first_tag` matches the
+   preamble (midgard_emit.c:959-961; midgard_compile.c:3121 + pan_shader.h:187).
+2. **"matmul writes nothing to C" was the stale SHADER SIZE BISECTION block.**
+   It ran between the matmul submit/wait and the verify, reset `g_mm_C` to
+   0xDEADBEEF on every one of its ~100 iterations and resubmitted jobs with the
+   pre-fix first_tag (faulting 0x52). The shader had been writing correct
+   results since the chain fix; the BZ block erased them before VERIFY read C.
+   The block is removed.
+
+The 1x1 dispatch gate (job[8][0] = size_x - 1) stands: the part still accepts
+only num_groups=1 x local_size=1, so the shader is single-threaded and emits all
+16 elements itself. This is the shipping design; no dimensional scaling will be
+attempted (see HISTORY above for the swept proof).
+
+New capabilities verified on this part while getting here (pipeline document
+section 15 items 1-4, now closed by measurement):
+- nonzero inline-constant binding into r27 (0x2400 stored);
+- LDST loads (ld_32, ld_128) with base r26 and byte offsets;
+- stores with byte offsets 0..192 (signed_offset honored, no scaling);
+- multi-element shaders up to 268 words (16 elements, all stores land).
