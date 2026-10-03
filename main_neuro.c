@@ -642,6 +642,17 @@ void kmain(void) {
     //
     // Core 0's own gicv3_init_cpu_iface() must also stay after smp_init(): it
     // depends on state smp_init() establishes, and moving it earlier hangs too.
+    //
+    // NOTE (2026-10-03, regression found): an earlier revert of the reorder
+    // experiment accidentally deleted the gicv3_init() CALL, leaving only this
+    // comment. All builds since ran with the Distributor left in BL31's state.
+    // gicv3_init() must run here - after smp_init, before per-core cpu-iface.
+    if (gicv3_init() == OK) {
+        LOG_OK("GICv3: Interrupt Controller Ready");
+    } else {
+        LOG_ERR("GICv3: Initialization Failed");
+    }
+    gicv3_init_cpu_iface();
     uart_puts(&console, "[OK] SMP: ");
     uart_put_hex(&console, smp_get_online_count());
     uart_puts(&console, " cores online\r\n");
@@ -737,6 +748,78 @@ void kmain(void) {
                     if (cs) uart_puts(&console, "/");
                     uart_put_hex(&console, gicv3_cpu_iface_stage[cs]);
                 }
+
+    // Two-moment GIC snapshot comparison. Every software-visible register has
+    // compared identical between the working A53s and the dead A72s, so the
+    // useful question is no longer "what differs between clusters" but "what
+    // changed on the A72 between the moment its CPU interface was initialised
+    // and the moment it went back to its idle loop". Moment A is taken by the PE
+    // itself right after gicv3_init_cpu_iface() returns; moment B on its first
+    // idle-loop pass. The A53 columns are the control.
+    {
+        static const char *slot_name[GICV3_SNAP_SLOTS] = {
+            "GICR_CTLR","GICR_IIDR","GICR_TYPER","GICR_0C","GICR_10","GICR_WAKER",
+            "IGROUPR0","ISENABLER0","ICENABLER0","ISPENDR0","ICPENDR0","IPRIORITYR0",
+            "ICFGR0","IGRPMODR0","NSACR","GICD_CTLR","GICD_TYPER","GICD_IGROUPR",
+            "ICC_SRE_EL1","ICC_PMR_EL1","ICC_IGRPEN0","ICC_IGRPEN1","ICC_HPPIR1",
+            "ICC_RPR_EL1","ICC_AP1R0_EL1","DAIF","SCTLR_EL2","HCR_EL2","CNTFRQ",
+            "ENDMARK"
+        };
+        for (u32 ci = 0; ci < 6u; ci++) {
+            for (u32 k = 0; k < GICV3_SNAP_SLOTS; k++) {
+                asm volatile("dc ivac, %0" :: "r"(&g_gic_snap[ci][0][k]) : "memory");
+            }
+            for (u32 k = 0; k < GICV3_SNAP_SLOTS; k++) {
+                for (u32 m = 0; m < 2u; m++) {
+                    asm volatile("dc ivac, %0" :: "r"(&g_gic_snap[ci][m][k]) : "memory");
+                }
+            }
+        }
+        asm volatile("dsb sy" ::: "memory");
+        // Moment B, taken by core 0 right here, memory-mapped registers only.
+        // The A72 cores deliberately do NOT run this code - see
+        // gicv3_take_snapshot_mmio(). An MMIO or system-register read that
+        // faults on them wedges them before the runtime console exists.
+        for (u32 ci = 0; ci < 6u; ci++) {
+            gicv3_take_snapshot_mmio(ci, 1u);
+        }
+        uart_puts(&console, "\r\n[GICSNAP] A = after gicv3_init_cpu_iface, B = first idle pass\r\n");
+        for (u32 ci = 0; ci < 6u; ci++) {
+            u32 ndiff = 0;
+            for (u32 k = 0; k < GICV3_SNAP_SLOTS; k++) {
+                if (g_gic_snap[ci][0][k] != g_gic_snap[ci][1][k]) ndiff++;
+            }
+            uart_puts(&console, "[GICSNAP] core");
+            uart_put_hex(&console, ci);
+            uart_puts(&console, " A_vs_B_diff=");
+            uart_put_hex(&console, ndiff);
+            uart_puts(&console, " B_taken=");
+            uart_put_hex(&console, (u64)g_gic_snap_b_done[ci]);
+            uart_puts(&console, "\r\n");
+            if (ndiff == 0u) continue;
+            for (u32 k = 0; k < GICV3_SNAP_SLOTS; k++) {
+                if (g_gic_snap[ci][0][k] == g_gic_snap[ci][1][k]) continue;
+                uart_puts(&console, "   ");
+                uart_puts(&console, slot_name[k]);
+                uart_puts(&console, " A=0x"); uart_put_hex(&console, g_gic_snap[ci][0][k]);
+                uart_puts(&console, " B=0x"); uart_put_hex(&console, g_gic_snap[ci][1][k]);
+                uart_puts(&console, "\r\n");
+            }
+        }
+        // The headline comparison: the A72 at moment A against the A53 at moment A.
+        // Both have just finished the same init sequence.
+        uart_puts(&console, "[GICSNAP] core4(A) vs core1(A):");
+        for (u32 k = 0; k < GICV3_SNAP_SLOTS; k++) {
+            if (g_gic_snap[4][0][k] != g_gic_snap[1][0][k]) {
+                uart_puts(&console, " ");
+                uart_puts(&console, slot_name[k]);
+                uart_puts(&console, "(4=0x"); uart_put_hex(&console, g_gic_snap[4][0][k]);
+                uart_puts(&console, " 1=0x"); uart_put_hex(&console, g_gic_snap[1][0][k]);
+                uart_puts(&console, ")");
+            }
+        }
+        uart_puts(&console, "\r\n");
+    }
 
     // RK3399 TRM: the A72 interrupt path to the GIC is clocked through CRU
     // GATES / ADB400. CRU_CLKGATE_CON12 (CRU + 0x0330) carries the two ADB400
@@ -1220,12 +1303,19 @@ void kmain(void) {
         asm volatile("dmb ish" ::: "memory");
         wq_dispatch(4, baseline_runner_a72, 0);
         
-        // Wait up to 30s for A72 to finish
+        // Wait, but NOT 30 s: a wedged A72 here would swallow the whole boot
+        // capture (diagnostics that follow - SGI_TEST, the decisive delivery
+        // check - would never print). 1.5 s is enough for a baseline that runs
+        // in ~0.5 ms when the workqueue actually reaches the A72. If it does
+        // time out we print that and continue; SGI_TEST below is the answer.
         u64 wait_t0 = read_cntpct();
-        const u64 wait_timeout = 24ULL * 1000 * 1000 * 30;
+        const u64 wait_timeout = 24ULL * 1000 * 1000 * 15 / 10;
         while (g_a72_baseline.done_flag == 0) {
             if (read_cntpct() - wait_t0 > wait_timeout) break;
             asm volatile("yield");
+        }
+        if (g_a72_baseline.done_flag == 0) {
+            uart_puts(&console, "[BASELINE_A72] TIMEOUT waiting for done (A72 did not pick up the job)\r\n");
         }
         asm volatile("dmb ish" ::: "memory");
 

@@ -1177,6 +1177,9 @@ static void smp_emit_a72_fail_verdict(uart_t *uart) {
     }
 }
 
+extern volatile u64 g_gic_snap[6][2][GICV3_SNAP_SLOTS];
+extern volatile u8  g_gic_snap_b_done[6];
+
 void smp_dump_diagnostics(uart_t *uart) {
     volatile u64 *fb = (volatile u64 *)SMP_BEACON_ADDR;
     // CRITICAL: Invalidate Core 0's stale cache lines before reading DRAM

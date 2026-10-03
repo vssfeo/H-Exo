@@ -6,6 +6,9 @@ wq_slot_t wq_slots[SMP_MAX_CORES];
 static volatile u64 wq_submit_cycles[SMP_MAX_CORES];
 static volatile u64 wq_complete_cycles[SMP_MAX_CORES];
 static volatile u32 wq_dispatch_counts[SMP_MAX_CORES];
+// Bounded-wait bailouts: dispatches dropped because the target's slot never
+// freed (A72 parked in pipeit_worker_idle_hidden). Diagnostic only.
+static volatile u32 wq_stuck_dispatch_counts[SMP_MAX_CORES];
 static volatile u32 wq_complete_counts[SMP_MAX_CORES];
 
 static inline u64 wq_read_cycles(void) {
@@ -23,6 +26,7 @@ void wq_init(void) {
         wq_submit_cycles[i] = 0;
         wq_complete_cycles[i] = 0;
         wq_dispatch_counts[i] = 0;
+        wq_stuck_dispatch_counts[i] = 0;
         wq_complete_counts[i] = 0;
     }
     asm volatile("dmb ish" ::: "memory");
@@ -32,8 +36,25 @@ void wq_init(void) {
 void wq_dispatch(u32 dst_core, wq_fn_t fn, u64 arg) {
     if (dst_core == 0 || dst_core >= SMP_MAX_CORES) return;
     wq_slot_t* s = &wq_slots[dst_core];
-    // Wait for slot to be free (previous job done)
-    while (!s->done) asm volatile("yield");
+    // Wait for the slot to be free (previous job done) - BOUNDED.
+    //
+    // This used to spin forever. On this board that is fatal: an A72 core parked
+    // in pipeit_worker_idle_hidden() never clears its slot, so the initiator
+    // wedged INSIDE this loop, before any timeout the caller could set. That is
+    // why the boot log always stopped at "[BASELINE_A72] Dispatching baseline
+    // to A72 core 4" with no TIMEOUT line: the caller never regained control.
+    u64 wait0 = wq_read_cycles();
+    const u64 wq_wait_max = 2400000ULL * 5;   /* 5 s at the 24 MHz CNTPCT */
+    while (!s->done) {
+        if (wq_read_cycles() - wait0 > wq_wait_max) break;
+        asm volatile("yield");
+    }
+    if (!s->done) {
+        /* Report and reclaim the slot: the previous owner is wedged. Doing
+         * nothing drops the job AND leaves the caller hanging. */
+        wq_stuck_dispatch_counts[dst_core]++;
+        s->done = 1;
+    }
     s->done  = 0;
     s->fn    = fn;
     s->arg   = arg;

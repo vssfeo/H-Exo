@@ -222,6 +222,34 @@ result_t gicv3_init(void) {
     gicd_write(GICD_CTLR, ctrl);
     gicd_wait_for_rwp();
 
+    /*
+     * Disable Security (GICD_CTLR.DS, bit 6) - MANDATORY on RK3399.
+     *
+     * Linux carries a quirk entry for this exact SoC:
+     *   gic_enable_quirk_rk3399() -> FLAGS_WORKAROUND_INSECURE -> "rockchip,rk3399"
+     * and gic_prio_init() then does:
+     *   val = readl_relaxed(dist_base + GICD_CTLR);
+     *   val |= GICD_CTLR_DS;
+     *   writel_relaxed(val, dist_base + GICD_CTLR);
+     *   pr_warn("Broken GIC integration, security disabled\n");
+     *
+     * The rationale (Marc Zyngier, "[PATCH] irqchip/gic-v3: Work around insecure
+     * GIC integrations"): RK3399 exposes the GIC's *secure* programming interface
+     * to non-secure, so priorities programmed through the NS view behave wrongly
+     * and the machine can die. DS puts the GIC in a single-security-state mode
+     * where every interrupt is Group 1 NS and the register views match.
+     *
+     * Measured on this board: Armbian prints exactly
+     *   "GICv3: Broken GIC integration, security disabled"
+     *   "GICv3: GICD_CTLR.DS=1, SCR_EL3.FIQ=1"
+     * and all six cores then take interrupts. H-Exo never set DS: its GICD_CTLR
+     * read 0x33/0x35, bit 6 always clear, and cores 4/5 never took an interrupt.
+     */
+    ctrl = gicd_read(GICD_CTLR);
+    ctrl |= (1u << 6);          // DS - see the RK3399 insecure-integration quirk
+    gicd_write(GICD_CTLR, ctrl);
+    gicd_wait_for_rwp();
+
     ctrl = gicd_read(GICD_CTLR);
     ctrl |= (1 << 4) | (1 << 5); // ARE_S and ARE_NS
     gicd_write(GICD_CTLR, ctrl);
@@ -273,6 +301,119 @@ volatile u64 __attribute__((aligned(64))) gicv3_core_diag2[6][17];
 // same core during smp_secondary_main(). Without this there is no way to tell
 // which statement wedges it.
 volatile u64 __attribute__((aligned(64))) gicv3_cpu_iface_stage[6];
+
+/*
+ * H-Exo: two-moment GIC snapshot, taken by the PE itself.
+ *
+ * Motivation. Everything reachable from software compares identical between the
+ * working A53s and the dead A72s, the A72 completes gicv3_init_cpu_iface()
+ * (cpuiface_stage reaches 99), and every clock on the A72 interrupt path reads
+ * enabled. Yet an SGI or a locally injected PPI latches and is never forwarded.
+ * Register-by-register elimination has run out of candidates, so compare the A72
+ * against itself at two moments instead: A, immediately after its CPU interface
+ * init returns, and B, on its first pass through the idle loop.
+ *
+ * Both moments are captured by the PE itself, because six of the slots are system
+ * registers (ICC_*) that only that PE can read. Taking both from core 0 would
+ * measure core 0 twice.
+ *
+ * Slot map is in gicv3.c near this comment; the names are printed by main_neuro.c.
+ */
+#define GICV3_SNAP_SLOTS 30
+volatile u64 __attribute__((aligned(64))) g_gic_snap[6][2][GICV3_SNAP_SLOTS];
+volatile u8  g_gic_snap_b_done[6];
+
+/*
+ * Memory-mapped half of the snapshot only, and safe to call from core 0.
+ *
+ * Deliberately NOT called from the secondary idle loops. The A72 cores are the
+ * fragile ones - an MMIO or system-register read that faults there wedges them
+ * before the runtime console exists - and there is no remote recovery from that.
+ * The moment-A snapshot stays inside gicv3_init_cpu_iface(), which is already
+ * proven to run to completion on the A72.
+ */
+void gicv3_take_snapshot_mmio(u32 core, u32 moment) {
+    if (core >= 6u || moment >= 2u) return;
+    volatile u64 *snap = g_gic_snap[core][moment];
+    uintptr_t rd  = GICR_BASE + (uintptr_t)core * 0x20000u;
+    uintptr_t sgi = rd + GICR_SGI_OFFSET;
+    snap[0]  = *(volatile u32 *)(rd + 0x00);
+    snap[1]  = *(volatile u32 *)(rd + 0x04);
+    snap[2]  = *(volatile u32 *)(rd + 0x08);
+    snap[3]  = *(volatile u32 *)(rd + 0x0C);
+    snap[4]  = *(volatile u32 *)(rd + 0x10);
+    snap[5]  = *(volatile u32 *)(rd + 0x14);
+    snap[6]  = *(volatile u32 *)(sgi + 0x080);
+    snap[7]  = *(volatile u32 *)(sgi + 0x100);
+    snap[8]  = *(volatile u32 *)(sgi + 0x180);
+    snap[9]  = *(volatile u32 *)(sgi + 0x200);
+    snap[10] = *(volatile u32 *)(sgi + 0x280);
+    snap[11] = *(volatile u32 *)(sgi + 0x400);
+    snap[12] = *(volatile u32 *)(sgi + 0xC00);
+    snap[13] = *(volatile u32 *)(sgi + 0xD00);
+    snap[14] = *(volatile u32 *)(sgi + 0xE00);
+    snap[15] = gicd_read(0x000);
+    snap[16] = gicd_read(0x008);
+    snap[17] = gicd_read(0x080);
+    for (u32 k = 18u; k < GICV3_SNAP_SLOTS; k++) snap[k] = 0;  /* not readable off-PE */
+    snap[29] = 0xA72A72A72A72A72ULL;
+    for (u32 off = 0; off < (GICV3_SNAP_SLOTS * 8u); off += 64u) {
+        asm volatile("dc civac, %0" :: "r"((volatile u64 *)((uintptr_t)snap + off)) : "memory");
+    }
+    asm volatile("dsb sy" ::: "memory");
+    if (moment == 1u) g_gic_snap_b_done[core] = 1;
+}
+
+void gicv3_take_snapshot(u32 core, u32 moment) {
+    if (core >= 6u || moment >= 2u) return;
+    volatile u64 *snap = g_gic_snap[core][moment];
+    uintptr_t rd  = GICR_BASE + (uintptr_t)core * 0x20000u;
+    uintptr_t sgi = rd + GICR_SGI_OFFSET;
+    u64 v;
+
+    /* RD frame */
+    snap[0]  = *(volatile u32 *)(rd + 0x00);   /* GICR_CTLR   */
+    snap[1]  = *(volatile u32 *)(rd + 0x04);   /* GICR_IIDR   */
+    snap[2]  = *(volatile u32 *)(rd + 0x08);   /* GICR_TYPER  */
+    snap[3]  = *(volatile u32 *)(rd + 0x0C);
+    snap[4]  = *(volatile u32 *)(rd + 0x10);
+    snap[5]  = *(volatile u32 *)(rd + 0x14);   /* GICR_WAKER */
+    /* SGI frame */
+    snap[6]  = *(volatile u32 *)(sgi + 0x080); /* IGROUPR0    */
+    snap[7]  = *(volatile u32 *)(sgi + 0x100); /* ISENABLER0  */
+    snap[8]  = *(volatile u32 *)(sgi + 0x180); /* ICENABLER0  */
+    snap[9]  = *(volatile u32 *)(sgi + 0x200); /* ISPENDR0   */
+    snap[10] = *(volatile u32 *)(sgi + 0x280); /* ICPENDR0   */
+    snap[11] = *(volatile u32 *)(sgi + 0x400); /* IPRIORITYR0 */
+    snap[12] = *(volatile u32 *)(sgi + 0xC00); /* ICFGR0     */
+    snap[13] = *(volatile u32 *)(sgi + 0xD00); /* IGRPMODR0  */
+    snap[14] = *(volatile u32 *)(sgi + 0xE00); /* NSACR      */
+    /* Distributor, shared */
+    snap[15] = gicd_read(0x000);              /* GICD_CTLR   */
+    snap[16] = gicd_read(0x008);              /* GICD_TYPER  */
+    snap[17] = gicd_read(0x080);              /* GICD_IGROUPR */
+    /* CPU interface system registers - only valid on the capturing PE */
+    asm volatile("mrs %0, ICC_SRE_EL1"     : "=r"(v)); snap[18] = v;
+    asm volatile("mrs %0, ICC_PMR_EL1"     : "=r"(v)); snap[19] = v;
+    asm volatile("mrs %0, ICC_IGRPEN0_EL1" : "=r"(v)); snap[20] = v;
+    asm volatile("mrs %0, ICC_IGRPEN1_EL1" : "=r"(v)); snap[21] = v;
+    asm volatile("mrs %0, ICC_HPPIR1_EL1"  : "=r"(v)); snap[22] = v;
+    asm volatile("mrs %0, ICC_RPR_EL1"    : "=r"(v)); snap[23] = v;
+    asm volatile("mrs %0, ICC_AP1R0_EL1"  : "=r"(v)); snap[24] = v;
+    asm volatile("mrs %0, daif"           : "=r"(v)); snap[25] = v;
+    asm volatile("mrs %0, sctlr_el2"      : "=r"(v)); snap[26] = v;
+    asm volatile("mrs %0, hcr_el2"        : "=r"(v)); snap[27] = v;
+    asm volatile("mrs %0, cntfrq_el0"     : "=r"(v)); snap[28] = v;
+    snap[29] = 0xA72A72A72A72A72ULL;          /* end marker */
+
+    /* Clean every cache line: the A72 cluster does not snoop A53 stores, and
+     * core 0 has to be able to read what this PE just published. */
+    for (u32 off = 0; off < (GICV3_SNAP_SLOTS * 8u); off += 64u) {
+        asm volatile("dc civac, %0" :: "r"((volatile u64 *)((uintptr_t)snap + off)) : "memory");
+    }
+    asm volatile("dsb sy" ::: "memory");
+    if (moment == 1u) g_gic_snap_b_done[core] = 1;
+}
 
 static inline void gicv3_stage(u32 core, u32 v) {
     if (core >= 6u) return;
@@ -387,6 +528,7 @@ static void gicv3_probe_local_irq_path(u32 core) {
         u64 hppir_final;
         asm volatile("mrs %0, S3_0_C12_C12_2" : "=r"(hppir_final));  /* ICC_HPPIR1_EL1 */
         gicv3_stage(core, 99u);   /* returned normally */
+    gicv3_take_snapshot(core, 0u);
     gicv3_core_diag2[core][16] = (u64)(hppir_final & 0x3FFu);
     }
     asm volatile("dc civac, %0" :: "r"(&gicv3_core_diag2[core][0]) : "memory");
@@ -419,6 +561,7 @@ void gicv3_init_cpu_iface(void) {
     asm volatile("isb");
     
     gicv3_stage(core, 3u);
+    // 3. priority mask + EOImode
     // 3. Set priority mask
     u64 pmr = 0xFF;
     asm volatile("msr ICC_PMR_EL1, %0" :: "r"(pmr));
@@ -519,8 +662,20 @@ void gicv3_init_cpu_iface(void) {
     asm volatile("dc civac, %0" :: "r"(&gicv3_core_diag2[core][0]) : "memory");
     asm volatile("dsb sy" ::: "memory");
 
-    // EXPERIMENT-3: self-tests, A72 only (cores 0-3 already work).
-    if (core >= 4u && core < 6u) {
+    // EXPERIMENT-3 self-tests DISABLED (2026-10-03).
+    //
+    // These inject a PPI into the calling core's own redistributor
+    // (gicv3_probe_local_irq_path). With GICD_CTLR.DS now set, interrupt
+    // delivery on the A72 apparently WORKS, the injected PPI is actually
+    // delivered, and it evicts core 4 from baseline_runner_a72 - the boot
+    // wedges right at "[BASELINE_A72] Dispatching baseline". The probes were
+    // written when delivery was dead and the injection was harmless; with DS set
+    // they are actively destructive. Disabled rather than deleted so the
+    // telemetry stays available under a future no-DS build.
+    //
+    // THE DECISIVE TEST IS NOW THE SGI_TEST BELOW: if c4 irq_cnt goes 0x0->0x1
+    // we can finally conclude the DS quirk was the missing piece.
+    if (0 && core >= 4u && core < 6u) {
         gicv3_probe_local_wake(core);
         gicv3_probe_local_irq_path(core);
     }

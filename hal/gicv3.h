@@ -47,6 +47,12 @@ u32      gicv3_read_waker(u32 core);
 u32      gicv3_force_wake_core(u32 core, u32 retries);
 result_t gicv3_init(void);
 void     gicv3_init_cpu_iface(void);  // Phase 2: per-core CPU interface init
+extern volatile u64 gicv3_cpu_iface_stage[6];
+#define GICV3_SNAP_SLOTS 30
+extern volatile u64 g_gic_snap[6][2][GICV3_SNAP_SLOTS];
+extern volatile u8  g_gic_snap_b_done[6];
+void gicv3_take_snapshot(u32 core, u32 moment);
+void gicv3_take_snapshot_mmio(u32 core, u32 moment); // last step reached per PE, 99 = returned
 void gicv3_enable_irq(u32 irq);
 void gicv3_route_irq(u32 irq, u64 affinity);  // set GICD_IROUTER
 void gicv3_set_priority(u32 irq, u8 prio);    // set GICD_IPRIORITYR
