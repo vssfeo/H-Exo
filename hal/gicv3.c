@@ -959,13 +959,25 @@ u32 gicv3_read_ispendr0(u32 core) {
 
 u32 gicv3_read_gicd_ctlr(void) { return gicd_read(GICD_CTLR); }
 u64 gicv3_read_gicd_typer(void) {
-    // Was: *(volatile u64*)((uintptr_t)GICD_BASE + 0x0008).
-    // 0x0008 is GICD_IIDR, not GICD_TYPER. gicv3.h has defined GICD_TYPER as
-    // 0x0004 all along; the literal 0x0008 was read straight from the register
-    // table without checking the header. The value it produced, 0x0041143B, is
-    // the textbook ARM GICv3 IIDR (implementer 0x43 'C'), which is how the
-    // mistake stayed invisible: the number looked completely plausible.
-    return *(volatile u64*)((uintptr_t)GICD_BASE + GICD_TYPER);
+    // Two bugs stacked here, and fixing only the visible one broke the boot.
+    //
+    // 1. The old code read offset 0x0008. That is GICD_IIDR, not GICD_TYPER -
+    //    gicv3.h has defined GICD_TYPER as 0x0004 all along. What it produced,
+    //    0x0041143B, is the textbook ARM GICv3 IIDR, which is why it looked
+    //    plausible and every "gicd_typer=" line in SGI_TEST had been reporting
+    //    IIDR.
+    //
+    // 2. Changing the literal to GICD_TYPER without changing the width made it
+    //    WORSE: a 64-bit load at GICD_BASE+0x0004 is not naturally aligned
+    //    (0xFEE00004), and this GIC takes a synchronous data abort at EL2 on it:
+    //        [EL2] ESR: 0x96000021   FAR: 0xFEE00004
+    //    The 0x0008 it replaced WAS 8-byte aligned, which is why the original
+    //    worked at all. GICD_TYPER is a 32-bit register and must be read as one;
+    //    reading it as u32 at the same address is fine.
+    //
+    // Kept returning u64 because the caller stores it in a u64 and prints it in
+    // hex; widening a u32 read is not the same as an unaligned u64 load.
+    return (u64)gicd_read(GICD_TYPER);
 }
 
 // Optimized SGI send to list of cores using cluster-based TargetList.

@@ -122,6 +122,52 @@ Measured, not assumed. On the same source:
 ~160 call sites, almost all passing negative literals, and the project's previous
 build flags could not see it.
 
+### Stack depth is a safety check, measured on the linked image
+
+`-fstack-usage` reports one frame. What breaks bare metal is the sum of a chain,
+and there is no MMU fault to catch an overflow here — it corrupts memory and the
+symptom surfaces later as unrelated nonsense. `tools/stackchain.ps1` measures the
+worst case on the image that actually ships:
+
+```sh
+pwsh -File tools/stackchain.ps1
+```
+
+Three things it gets right that a naive `-fstack-usage` reading does not:
+
+| trap | what it would report | what is true |
+|---|---|---|
+| compare against the pool | 2144 of 32768 B, "fits easily" | `boot.s` gives each core **4096 B** (`sub x1, x1, x2` with `x2 = 0x1000*(core+1)`); the pool is not the budget |
+| ignore exceptions | 1712 B | `vectors.s` branches to `exception_handler_irq` with **no SP switch**, so a handler stacks on the interrupted frame: worst case is the **sum** |
+| ignore when IRQs turn on | reachable = naive | the deepest call is emitted *before* `msr daifclr, #2`, so it cannot receive an interrupt; the gate locates the unmask by address and only counts call sites after it |
+
+Measured 2026-10-03 on `-O3 -march=armv8-a+fp+simd`, 40 sources, 308 nodes:
+
+| | bytes |
+|---|---|
+| `kmain` frame | 1264 |
+| deepest callee chain once IRQs are on (`hexo_offload_tick`) | 432 |
+| exception chain on top (one of the four 256 B stubs, `exception_handler_irq`/`fiq`/`sync`/`serror` — they tie, so the reported name varies) | 432 |
+| deepest root chain, any root (`bss_done`, no interrupt needed) | 1712 |
+| **gated figure (max of the last two)** | **2128** |
+| naive bound (ignores IRQ timing) | 2144 |
+| per-core slot | 4096 |
+| headroom | 1968 (48.0%) |
+
+`kmain`'s own frame is 59% of it and is the only lever worth pulling. The second
+largest frame, `chaos_memory_thrash` at 1024 B, is currently unreachable: the
+disassembly contains **zero** branch sites to it, and zero to `chaos_apply`. If
+chaos is ever wired up the figure becomes 1264 + 1024 + 432 = 2720 B, which still
+fits but eats most of the margin.
+
+Known limits, recorded so the number is not read as a proof: indirect calls are not
+followed (there is exactly one `blr` today, the workqueue dispatch, and its target
+is treated as its own root); a fault taken inside an interrupt handler is not
+modelled (+432 B, and that still fits); it is static analysis of the linked image,
+not runtime behaviour; and where two translation units define the same function
+name the larger frame is taken, so `pipeit_sgi_hidden` at 144 B is an
+over-estimate — the figure errs toward safe.
+
 ## Coding rules promoted from `.rules`
 
 `.rules` and `.manifesto` sit in the repo root and are **not** `AGENTS.md`, so

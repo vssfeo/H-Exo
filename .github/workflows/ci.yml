@@ -41,6 +41,22 @@ jobs:
       - name: Verify (strict compile, -fanalyzer, cppcheck, link, baseline)
         run: pwsh -File tools/verify.ps1 -OutBin kernel_neuro.bin
 
+      # Worst-case call-chain stack depth against the per-core slot. Kept as its
+      # own script on purpose: it needs a second build with -fstack-usage, and a
+      # depth regression is a different failure from a byte regression, so the two
+      # must be readable separately.
+      #
+      # continue-on-error for the first runs, deliberately. Frame sizes are
+      # compiler-dependent and CI uses a different GCC than the local pinned
+      # toolchain, so the number CI reports may differ from the local 2128 B.
+      # Read what CI actually prints, confirm the budget against THAT number, then
+      # delete this line to make it blocking. Making it blocking before the number
+      # is known is a gate that fails for unknown reasons, which is the failure
+      # mode this project has already paid for once.
+      - name: Stack depth (worst-case call chain)
+        continue-on-error: true
+        run: pwsh -File tools/stackchain.ps1
+
       - name: Upload kernel artifact
         uses: actions/upload-artifact@v4
         with:

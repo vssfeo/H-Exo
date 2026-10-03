@@ -503,7 +503,31 @@ if (-not (Test-Path $bin)) {
     }
 }
 
-# ------------------------------------------------------- 7. golden log markers
+# ------------------------------------------------------- 7. worst-case stack depth
+# Run as its own script and its own build on purpose: it needs -fstack-usage, and a
+# depth regression is a different failure from a byte regression, so the two must
+# stay separately readable. But it is invoked FROM here, because a safety gate that
+# only runs if someone remembers a second command line is not a gate.
+Step 'worst-case call-chain stack depth'
+$stackScript = Join-Path $PSScriptRoot 'stackchain.ps1'
+if (-not (Test-Path $stackScript)) {
+    Bad 'tools/stackchain.ps1 missing'
+} else {
+    $sout = & pwsh -NoProfile -ExecutionPolicy Bypass -File $stackScript -Repo $Repo -GCC $GCC 2>&1
+    $scode = $LASTEXITCODE
+    $sout | Where-Object { $_ -match 'GATED|HEADROOM|per-core slot|headroom|FAIL|WARN|report:' } |
+        ForEach-Object { Write-Host "   $($_.ToString().Trim())" }
+    if ($scode -ne 0) {
+        Bad "stack depth gate failed (see the detail above; report: $env:TEMP\hexo_stackchain\stackchain.json)"
+        $sout | Select-String 'FAIL' | Select-Object -First 6 | ForEach-Object {
+            Write-Host "          $($_.Line.Trim())" -ForegroundColor Red
+        }
+    } else {
+        Ok 'stack depth within the per-core slot'
+    }
+}
+
+# ------------------------------------------------------- 8. golden log markers
 if ($Log) {
     Step 'golden log markers (offline)'
     $markerFile = Join-Path $Repo 'docs\expected\markers.txt'
