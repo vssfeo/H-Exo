@@ -173,9 +173,9 @@ before the per-core `gicv3_init_cpu_iface()`).
 
 | # | Hypothesis | Evidence it is wrong |
 |---|---|---|
-| 1 | `ChildrenAsleep=1` blocks delivery | The **working** A53 cores report it too. From U-Boot: core0 `0x00`, cores 1-5 all `0x06`. After H-Exo's own prewake: cores 1-5 all `0x04`. IHI 0069: only `ProcessorSleep=1` withholds interrupts; `PS=0,CA=1` is the architecturally expected "PE coming online" state. |
+| 1 | `ChildrenAsleep=1` blocks delivery | **REVERSED 2026-10-03 - THIS WAS THE ROOT CAUSE. See §Resolution.** The elimination compared measurements taken at different moments: the A53 `0x04` was read while those cores were still OFF (before CPU_ON); by delivery time the working A53 frames read `0x0` while the dead A72 frames still read `0x4`. At the instant of delivery, CA is the only measured difference between the two clusters. |
 | 2 | `CPUECTLR_EL1.SMPEN` never set | Measured `=1` on both A72 cores via the `RK_SIP_SMPEN_GET` SiP SMC (`[SMPEN_DIAG] core4=1 core5=1`). |
-| 3 | GICR_WAKER handshake is a software sequencing bug | `RK_SIP_GICR_WAKE_TRY`, driven from EL3, performs the full two-phase handshake and still times out: `flags=0x2` ("timeout while waiting for ChildrenAsleep transition"), `before=0x4 after=0x4`. |
+| 3 | GICR_WAKER handshake is a software sequencing bug | **PARTIALLY REVERSED 2026-10-03.** The SiP handshake timing out was real, but it proved too much: once a wake transition is wedged, `ProcessorSleep` writes are ignored from NS *and* EL3, so no software handshake can repair it. It WAS a sequencing bug - ours: the prewake wrote PS=0 on the A72 frames while the cores were off. See §Resolution. |
 | 4 | Redistributor register state differs between clusters | RD and SGI frames byte-identical between a working A53 and a dead A72, apart from `GICR_TYPER.CPU_Number`. |
 | 5 | `GICR_CTLR` is never written | Measured `0x0` on **all six** cores including the working ones. |
 | 6 | CCI-500 snooping is off for the A72 during bring-up | A real TF-A ordering defect exists - `plat_cci_enable()` uses `read_mpidr()`, so a cluster's CCI node can only be enabled by a PE inside that cluster. But IHI 0069H contains **zero** occurrences of "snoop": GIC MMIO is Device memory with in-order arrival, and the Redistributor-to-CPU-interface link is AXI4-Stream packets. No causal path to SGI delivery. |
@@ -304,3 +304,62 @@ Two things remain anomalous and are the only live leads:
    it removes may well exceed that, but that is a measurement, not a certainty.
 3. If the A72 cluster is pursued further: investigate why `iter=5`, i.e. why the
    A72 idle loop barely runs. Nothing else in this log is unexplained.
+
+
+---
+
+## Resolution (2026-10-03): the wedged wake transition, and who wedged it
+
+**Root cause.** `gicv3_prewake_redistributors()` wrote `GICR_WAKER.ProcessorSleep=0`
+on the A72 frames *before* `PSCI CPU_ON`, while those PEs were powered off. That
+started a redistributor wake transition that could not complete (no PE to
+acknowledge). In that state:
+
+* `ChildrenAsleep` stays 1 forever - the redistributor is "not communicating with
+  the PE" (IHI 0069), so pending interrupts are held in the RD and never
+  presented. This is the whole failure: `GICR_ISPENDR0` latches the SGI
+  (measured, residue-free via a pre/post test), while `ICC_HPPIR1_EL1` and
+  `ICC_IAR1_EL1` read `0x3FF` with `RPR=0xFF`, `AP*=0`, `PMR=0xF8` - an idle,
+  correctly configured CPU interface that is simply never signalled.
+* Further `ProcessorSleep` writes are ignored mid-transition, from NS
+  (`ps1_ignored`, WAKER_TRACE `flags=0x6` on cores 4/5, `0x0` on cores 0-3) and
+  from EL3 (SiP `WAKE_TRY` `flags=0x2` timeout, `before=after=0x4`).
+* TF-A's `gicv3_rdistif_mark_core_awake()` returns immediately when PS is
+  already 0, so BL31's CPU_ON path could not restart the handshake either.
+
+**Fix.** Stop writing the A72 frames from NS: prewake now covers cores 0-3 only,
+`gicv3_init_cpu_iface()` step 1 is read-only on cores 4/5, the post-SMP re-wake
+writes are gone, and the SiP `WAKE_TRY` calls are removed (a certification must
+not mutate what it certifies). With the frames left at their boot state
+(`PS=1, CA=1` - measured for the first time by extending the before-PSCI print
+to all six), BL31's own `mark_core_awake()` runs the documented handshake during
+power-up and completes it.
+
+**Measured after the fix, same board, same BL31:**
+
+| | before | after |
+|---|---|---|
+| A72 `GICR_WAKER` at delivery time | `0x4` (CA=1) | `0x0` |
+| `[SGI_TEST] c4 irq_cnt` | `0x0 -> 0x0` | `0x0 -> 0x1` |
+| boundary probe B1 (pending->HPPIR) | FAIL on 4/5, PASS on 1-3 | **PASS on all five** |
+| pipeline SGIs handled by core 4 | 0 | **292** (`sgi_irq core=4 hidden=0x124`) |
+| `[PIPEIT] A72 SGI mode` | 0 (never selectable) | capability certified |
+
+**What is NOT yet done.** The SGI-driven pipeline mode, selectable for the first
+time ever, completed only 317/1000 frames in 34 s on its first live run
+(`sgi_sent output=0 done=0` - the hidden->output->done chain was never wired end
+to end because this code had never executed). The selector therefore reports the
+capability and stays in polling mode (proven 1000/1000, ~10.9 µs/frame) until
+the chain completes a bench with zero timeouts.
+
+**Also established en route, so nobody redoes it:** PSCI `CPU_OFF` returns
+`NOT_SUPPORTED (-1)` on rkbin BL31 v1.36, so a power-cycle recovery from NS is
+impossible; `ICC_AP0R1..R3`/`ICC_AP1R1` trap on this GIC despite being declared
+in Linux `sysreg.h`; writing `0xFFFFFFFF` to `GICR_WAKER` returns `0x400`
+(RES0-region garbage) - never probe this register with all-ones writes.
+
+**Methodological note.** Hypothesis 1 was eliminated by comparing an A53 value
+measured while the core was off against an A72 value measured at delivery time.
+Every hypothesis elimination in this log should state *when* each side of the
+comparison was measured. The reversal was found by re-reading the WAKER values
+at the delivery instant from both clusters in one run.

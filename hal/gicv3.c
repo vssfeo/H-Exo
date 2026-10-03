@@ -172,8 +172,19 @@ u32 gicv3_force_wake_core(u32 core, u32 retries) {
 // Call this ONCE before smp_init() so the redistributors are ready.
 void gicv3_prewake_redistributors(void) {
     // GICR stride = 0x20000 (LPI frame 64KB + SGI frame 64KB per core)
-    // RK3399 has 6 CPU interfaces total, so prewake all redistributors.
-    for (u32 cpu = 0; cpu < 6; cpu++) {
+    // RK3399 has 6 CPU interfaces total; prewake covers the A53 frames only.
+    /* Cores 4/5 deliberately excluded - this prewake WAS the A72 interrupt bug.
+     * Writing PS=0 on a frame whose PE is powered off starts a redistributor
+     * wake transition that cannot complete; the frame is then stuck at PS=0/CA=1,
+     * further PS writes are ignored from NS and EL3 alike, and BL31's
+     * mark_core_awake() no-ops because PS is already 0. CA=1 means the RD never
+     * presents anything to the CPU interface, which was the entire "A72 takes no
+     * interrupts" failure. Left untouched, the frames stay at PS=1/CA=1 and
+     * BL31's own handshake during CPU_ON completes normally (measured 2026-10-03:
+     * frames come up 0x0, SGI_TEST c4 irq_cnt 0->1). smp_a72_wake_guard() in
+     * core/smp.c verifies the outcome, read-only. See A72_INVESTIGATION_LOG.md
+     * Resolution. */
+    for (u32 cpu = 0; cpu < 4; cpu++) {
         (void)gicv3_force_wake_core(cpu, 4);
     }
     asm volatile("dsb sy\n isb" ::: "memory");
@@ -526,9 +537,99 @@ static void gicv3_probe_local_wake(u32 core) {
  *  7 HPPIR1 pre-inject          8 ISPENDR0 readback
  *  9 HPPIR1 post-inject  <-- BOUNDARY 1     10 IAR1 / DEAD  <-- BOUNDARY 2
  * 11 handler entry delta    <-- BOUNDARY 3   12 handler magic
- * 13 ICC_CTLR_EL1  14 ICC_PMR_EL1  15 SCTLR_EL1  16 DAIF_EL1
+ * 13 ICC_CTLR_EL1  14 ICC_IGRPEN1 before  15 ICC_IGRPEN1 after  16 DAIF_EL1
+ * 17 ICC_PMR_EL1 at p2 (after the SGI fired)  18 ICC_RPR_EL1
+ * 19 ICC_PMR_EL1 at p1 (before this probe's IGRPEN1 write)
+ * 20 GICR_IGROUPR0 readback   21 GICR_IGRPMODR0 readback
+ * 22 GICR_ISENABLER0 readback  23 GICR_IPRIORITYR0 readback
+ *  5 GICR_ISPENDR0 BEFORE the SGI (residue test)   6 SCTLR_EL1   7 ICC_SRE_EL2
+ *
+ * Slots 17/19 answered a question that measurement closed: p1 = p2 = 0xF8 on all six
+ * cores, so the PMR = 0 seen on core 4 in one run was a one-off, not a property of
+ * the hardware, and the "interrupts are masked" explanation for HPPIR = 0x3FF was
+ * wrong. With PMR = 0xF8, RPR = 0xFF and IGRPEN1 = 1 on every core, the CPU interface
+ * is fully configured and idle; SGI priority is 0xA0 = 160 < 248, so the delivery
+ * condition is satisfied. The break is therefore INSIDE the redistributor, between
+ * GICR_ISPENDR0 (which does latch) and ICC_HPPIR1_EL1 (which never shows it).
+ *
+ * Slots 20..23 read back the redistributor's own view of the interrupt: which group
+ * it is in, which security modifier, whether it is enabled, and at what priority.
+ * Every one of those is written by gicv3_init_cpu_iface and none was ever read back,
+ * so a write that silently failed on the A72 frames would have been invisible.
  */
-volatile u64 __attribute__((aligned(64))) g_icr_boundary[6][18];
+volatile u64 __attribute__((aligned(64))) g_icr_boundary[6][56];
+
+/*
+ * CPU-interface snapshot, taken twice: once in phase A strictly before the probe
+ * SGI is sent, once in phase B after it has latched. This is the one measurement
+ * that can distinguish "the redistributor holds a pending interrupt that the CPU
+ * interface refuses to present" from "something is already running at a priority
+ * that outranks it".
+ *
+ * ICC_RPR_EL1 is the running priority. If it is not 0xFF, an interrupt is already
+ * active on this PE, and per IHI 0069 section 4.2.2 a new interrupt is only
+ * signalled when its priority is higher (numerically lower) than RPR. Our SGI is
+ * programmed at 0xA0 = 160, so an RPR of, say, 0x80 would block it forever while
+ * leaving GICR_ISPENDR0 set - which is exactly the measured signature.
+ *
+ * The APnRn registers hold one priority per implemented priority bit and show
+ * which priorities are currently active. Non-zero AP entries on the A72 would be
+ * direct evidence of leftover active state.
+ *
+ * HPPIR0 is read alongside HPPIR1 as a control. Our SGIs are Group 1, so a normal
+ * run shows HPPIR0 = 1023 and HPPIR1 = the INTID. If the A72 showed the INTID in
+ * HPPIR0 instead, the interrupt was being routed as Group 0.
+ *
+ * Every encoding below is taken from Linux arch/arm64/include/asm/sysreg.h:
+ *   ICC_PMR_EL1       (3,0, 4, 6,0)  ICC_RPR_EL1     (3,0,12,11,3)
+ *   ICC_BPR0_EL1      (3,0,12, 8,3)  ICC_BPR1_EL1    (3,0,12,12,3)
+ *   ICC_HPPIR0_EL1    (3,0,12, 8,2)  ICC_HPPIR1_EL1  (3,0,12,12,2)
+ *   ICC_IAR0_EL1      (3,0,12, 8,0)  ICC_IAR1_EL1    (3,0,12,12,0)
+ *   ICC_AP0R0_EL1     (3,0,12, 8,4)   ICC_AP1R0_EL1     (3,0,12, 9,0)
+ *   ICC_IGRPEN0_EL1   (3,0,12,12,6)   ICC_IGRPEN1_EL1   (3,0,12,12,7)
+ * sys_reg(op0,op1,CRn,CRm,op2) maps to S3_<op1>_C<CRn>_C<CRm>_<op2>, and for the
+ * APnR family the varying field is op2, NOT CRm.
+ *
+ * AP0R1/AP0R2/AP0R3/AP1R1 are declared in sysreg.h but NOT implemented on this
+ * GIC: reading them traps. Only the 12 registers below are read, so the snapshot
+ * has 12 slots, not 16.
+ */
+#define HExO_SNAP_PRE   24   /* 24..35 */
+#define HExO_SNAP_POST  36   /* 36..47 */
+#define HExO_SNAP_N        12
+
+static inline void gicv3_ciface_snapshot(volatile u64 *d) {
+    u64 v;
+    asm volatile("mrs %0, S3_0_C4_C6_0"   : "=r"(v)); d[0]  = v;  /* PMR       */
+    asm volatile("mrs %0, S3_0_C12_C11_3" : "=r"(v)); d[1]  = v;  /* RPR       */
+    asm volatile("mrs %0, S3_0_C12_C8_3"  : "=r"(v)); d[2]  = v;  /* BPR0      */
+    asm volatile("mrs %0, S3_0_C12_C12_3" : "=r"(v)); d[3]  = v;  /* BPR1      */
+    asm volatile("mrs %0, S3_0_C12_C8_2"  : "=r"(v)); d[4]  = v;  /* HPPIR0    */
+    asm volatile("mrs %0, S3_0_C12_C12_2" : "=r"(v)); d[5]  = v;  /* HPPIR1    */
+    asm volatile("mrs %0, S3_0_C12_C8_0"  : "=r"(v)); d[6]  = v;  /* IAR0      */
+    asm volatile("mrs %0, S3_0_C12_C12_0" : "=r"(v)); d[7]  = v;  /* IAR1      */
+    asm volatile("mrs %0, S3_0_C12_C12_6" : "=r"(v)); d[8]  = v;  /* IGRPEN0   */
+    asm volatile("mrs %0, S3_0_C12_C12_7" : "=r"(v)); d[9]  = v;  /* IGRPEN1   */
+    /* AP0R0 and AP1R0 only, and deliberately not the rest.
+     *
+     * Linux sysreg.h declares AP0R0..R3 and AP1R0..R3, but this GIC does not
+     * implement AP0R1, AP0R2, AP0R3 or AP1R1. Reading them raises a synchronous
+     * exception from a lower EL:
+     *
+     *   [EL2] ELR -> gicv3_probe_local_irq_path   ESR 0x20000000 (EC=0)   FAR 0
+     *
+     * Confirmed against the assembler rather than the header: S3_0_C12_C8_5
+     * assembles to d538c8a1 (icc_ap0r1_el1), while the faulting instruction was
+     * d538c8a0 - one encoding off, because the register name encodes
+     * CRn=12 CRm=8 with op2=4+n, and the extra bit belongs in op2, not CRm.
+     * So the specification lists registers this part does not have, and only
+     * executing them distinguishes "declared" from "implemented".
+     *
+     * AP0R0 and AP1R0 are the only two that are real, and they are what would
+     * show leftover active priority state. */
+    asm volatile("mrs %0, S3_0_C12_C8_4"  : "=r"(v)); d[10] = v;  /* AP0R0     */
+    asm volatile("mrs %0, S3_0_C12_C9_0"  : "=r"(v)); d[11] = v;  /* AP1R0     */
+}
 
 /* Core 0 sets this after every target reports ARMED, then sends the SGI. */
 volatile u64 g_icr_go[6];
@@ -582,6 +683,82 @@ void gicv3_probe_local_irq_path(u32 core) {
     b[1] = *(volatile u32 *)(rd + GICR_CTLR);          /* GICR_CTLR as inherited */
     b[2] = *(volatile u32 *)(rd + GICR_ISENABLER0);    /* reads as ICENABLER0 */
     b[3] = *(volatile u32 *)(rd + GICR_WAKER);
+
+    /* The redistributor's own view of SGI 0. All four are written by
+     * gicv3_init_cpu_iface and none was ever read back, so a write that did not
+     * stick on the A72 frames would look identical to a working one. ISENABLER0
+     * reads as ICENABLER0, so 0 in the nibbles means "enabled". */
+    b[20] = *(volatile u32 *)(rd + GICR_IGROUPR0);
+    b[21] = *(volatile u32 *)(rd + GICR_IGRPMODR0);
+    b[22] = *(volatile u32 *)(rd + GICR_ISENABLER0);
+    b[23] = *(volatile u32 *)(rd + GICR_IPRIORITYR0);
+
+    /* RESIDUE TEST. b[8] is GICR_ISPENDR0 read in phase B, AFTER core 0 has fired
+     * the probe SGI. It reads 1 on cores 4 and 5 and 0 on cores 1-3, and that has
+     * been read as "the SGI reached the A72 redistributor and latched". The
+     * alternative has never been excluded: the bit is ALREADY set from earlier
+     * boot activity (the SMPEN/GICR_WAKER work touches these frames), and our SGI
+     * never arrived at all. The two are indistinguishable from b[8] alone.
+     *
+     * This read happens at the top of phase A, strictly before b[0] is set to 5
+     * (ARMED), which is the signal core 0 waits for before sending anything. So
+     *   b[5] == 0  -> the SGI really did arrive; latching is proven.
+     *   b[5] == 1  -> the bit is residue; our SGI never reached the redistributor,
+     *                 and "it latches but is not presented" is the wrong model.
+     * That inverts the conclusion, which is why it is worth a slot. */
+    b[5] = *(volatile u32 *)(rd + GICR_ISPENDR0);
+
+    /* PRE snapshot. Taken before b[0] is set to ARMED, so before core 0 can have
+     * sent anything: this is the CPU interface's baseline state. */
+    gicv3_ciface_snapshot(&b[HExO_SNAP_PRE]);
+    gicv3_bclean(b, HExO_SNAP_PRE, HExO_SNAP_PRE + HExO_SNAP_N - 1);
+
+    /* Read-only frame registers nobody has ever sampled:
+     *   GICR_STATUSR (+0x10) - the redistributor's own log of invalid accesses.
+     *     If the ignored PS writes were rejected as writes-to-read-only, the
+     *     WROD/RWOD bits here say so, distinguishing "mid-transition lockout"
+     *     from "the bit is RO on this implementation".
+     *   GICR_PWRR (+0x24) - redistributor power state (GIC-600 family; U-Boot
+     *     gates its USE on CONFIG_GICV3_SUPPORT_GIC600, the read itself is
+     *     harmless and a nonzero value here would be news). */
+    b[48] = *(volatile u32 *)(rd + 0x10);
+    b[49] = *(volatile u32 *)(rd + 0x24);
+    gicv3_bclean(b, 48, 49);
+
+    /* L2ACTLR_EL1 CONTROL. The per-PE probe at core/smp.c:1016 is gated to
+     * core >= 4 because S3_1_C15_C0_0 is the A72-specific encoding and would
+     * fault in EL3 on an A53. That leaves the A53 cluster with no control at all,
+     * so a zero L2ACTLR reading on cores 4 and 5 cannot be attributed: it might
+     * mean the clock really is off, or that the probe never ran. Core 0 is alive
+     * and the SMC is serviced in EL3 regardless of the calling PE, so the same
+     * request issued from core 0 measures the same A72 L2 block and gives the
+     * control the per-PE probe could not.
+     *
+     * Stored in b[22], which was free, and printed on its own line so it is never
+     * confused with the per-PE probe. It deliberately does NOT reuse b[5]: that
+     * slot holds the pre-injection GICR_ISPENDR0 residue test a few lines above,
+     * and overwriting it silently destroyed the residue reading.
+     *
+     * This reads only. It does not attempt to enable any clock: L2ACTLR_EL1 is
+     * EL3-only and this runs at EL2, so a write here would fault rather than help.
+     * Its only job is to make the existing reading interpretable. */
+    {
+        register u64 x0 asm("x0") = 0xC200009BUL;   /* RK_SIP_L2ACTLR_GET_64 */
+        register u64 x1 asm("x1") = 0;
+        register u64 x2 asm("x2") = 0;
+        register u64 x3 asm("x3") = 0;
+        asm volatile("smc #0"
+                     : "+r"(x0)
+                     : "r"(x1), "r"(x2), "r"(x3)
+                     : "memory",
+                       "x4", "x5", "x6", "x7", "x8", "x9",
+                       "x10", "x11", "x12", "x13", "x14", "x15",
+                       "x16", "x17");
+        b[22] = x0;                                 /* raw L2ACTLR_EL1   */
+    }
+
+    asm volatile("mrs %0, sctlr_el1"      : "=r"(v));  b[6] = v;   /* SCTLR_EL1 */
+    asm volatile("mrs %0, S3_4_C12_C9_5"      : "=r"(v));  b[7] = v;   /* ICC_SRE_EL2 */
     asm volatile("mrs %0, S3_0_C12_C12_2" : "=r"(v));  b[4] = v;   /* HPPIR idle */
     asm volatile("mrs %0, S3_0_C12_C12_4" : "=r"(b[13]));          /* ICC_CTLR_EL1 */
     asm volatile("mrs %0, S3_0_C12_C12_7" : "=r"(b[14]));          /* ICC_IGRPEN1_EL1 */
@@ -589,12 +766,24 @@ void gicv3_probe_local_irq_path(u32 core) {
     gicv3_bclean(b, 1, 4);
     gicv3_bclean(b, 13, 14);
     gicv3_bclean(b, 16, 16);
+    gicv3_bclean(b, 20, 23);
+    gicv3_bclean(b, 5, 7);
 
-    /* The one register that differed between the A72 that failed and the A53s
-     * that worked: ICC_IGRPEN1_EL1 was 0 on core 5 and 1 on cores 1-3. Bit 0 is
-     * EnableGrp1S, bit 1 EnableGrp1NS; at 0 no Group 1 interrupt can be presented
-     * at all, whatever else is right. Align it with the working cores and read
-     * it back, so the next run says whether that was the whole story for core 5. */
+    /* p1: PMR BEFORE the IGRPEN1 write below. The point of this probe is to find
+     * out who zeroes ICC_PMR_EL1 on core 4, and the only difference between the
+     * two measurement points is the write at L598. gicv3_core_diag[core][2],
+     * sampled at stage 9 of gicv3_init_cpu_iface, already reads 0xF8 on all six
+     * cores, so the register is NOT left at 0 by init. If p1 reads 0xF8 and the
+     * later read in phase B reads 0, this probe caused it. If p1 already reads
+     * 0, something between stage 9 and here did it and this probe is innocent. */
+    asm volatile("mrs %0, S3_0_C4_C6_0" : "=r"(v));      /* ICC_PMR_EL1 */
+    b[19] = v;
+    gicv3_bclean(b, 19, 19);
+
+    /* ICC_IGRPEN1_EL1 was 0 on core 5 and 1 on cores 1-3 in an earlier run. Bit 0
+     * is EnableGrp1S, bit 1 is EnableGrp1NS. Align with the working cores and read
+     * back. Note this write is the suspected cause of the PMR change above, which
+     * is precisely what p1/p2 is there to test. */
     asm volatile("msr S3_0_C12_C12_7, %0" :: "r"(1ULL));
     asm volatile("isb" ::: "memory");
     asm volatile("mrs %0, S3_0_C12_C12_7" : "=r"(v));
@@ -611,6 +800,10 @@ void gicv3_probe_local_irq_path(u32 core) {
 
     /* Wait for core 0 to arm us and fire. Bounded: on timeout the step marker
      * says so instead of spinning forever into an unrecoverable early hang. */
+    /* The PSCI CPU_OFF self-power-cycle hook that lived here was removed the
+     * same day it was added: rkbin BL31 v1.36 returns NOT_SUPPORTED (-1) for
+     * CPU_OFF (measured), and it turned out to be unnecessary - the A72 frames
+     * are healthy once H-Exo stops writing their GICR_WAKER before CPU_ON. */
     u32 t = 0;
     for (; t < 100000000u; t++) {
         asm volatile("dc ivac, %0" :: "r"(&g_icr_go[core]) : "memory");
@@ -626,8 +819,54 @@ void gicv3_probe_local_irq_path(u32 core) {
 
     asm volatile("mrs %0, S3_0_C12_C12_2" : "=r"(v));
     b[9] = v;                                             /* BOUNDARY 1 */
+
+    /* ICC_IAR1_EL1 is read UNCONDITIONALLY, which is the point of this revision.
+     * The previous version gated the read on HPPIR != 1023, so when the interface
+     * reported spurious it never asked the only question that separates the two
+     * remaining hypotheses:
+     *
+     *   IAR1 == 1023  -> the CPU interface is not offering an INTID at all, so the
+     *                     break is inside the interface / priority-presentation path.
+     *   IAR1 == SGI   -> the redistributor did its job and the break is further
+     *                     out: exception routing, VBAR, vector, handler.
+     *
+     * Reading it with nothing pending is harmless - it returns 1023. Only the EOI
+     * stays conditional, because EOIR with a spurious value means nothing.
+     * Encodings verified against Linux arch/arm64/include/asm/sysreg.h:
+     *   ICC_IAR1_EL1  = sys_reg(3,0,12,12,0) -> S3_0_C12_C12_0
+     *   ICC_EOIR1_EL1 = sys_reg(3,0,12,12,1) -> S3_0_C12_C12_1
+     *
+     * ICC_RPR_EL1 is deliberately NOT read: it is a GICv2 register, and guessing
+     * an encoding is what produced two wrong conclusions earlier in this project.
+     * ICC_PMR_EL1 = sys_reg(3,0,4,6,0) is used instead, verified the same way.
+     */
+    asm volatile("mrs %0, S3_0_C12_C12_0" : "=r"(v));       /* ICC_IAR1_EL1 */
+    b[10] = v;
+    if ((v & 0x3FFu) != 0x3FFu) {
+        asm volatile("msr S3_0_C12_C12_1, %0" :: "r"(v));   /* ICC_EOIR1_EL1 */
+    }
+    asm volatile("mrs %0, S3_0_C4_C6_0" : "=r"(v));         /* ICC_PMR_EL1 = p2 */
+    b[17] = v;
+    /* ICC_RPR_EL1, the running priority. An earlier note in this file claimed
+     * this register does not exist in GICv3. That was wrong: it is defined both
+     * by U-Boot (ICC_RPR_EL1 = S3_0_C12_C11_3, gic.h) and by Linux
+     * (SYS_ICC_RPR_EL1 = sys_reg(3,0,12,11,3)). It is worth reading here: RPR
+     * returns 0xFF when nothing is active and 0x00 when a priority-0 interrupt is
+     * running, so it distinguishes "the interface is idle" from "the interface has
+     * something and is not offering it". */
+    asm volatile("mrs %0, S3_0_C12_C11_3" : "=r"(v));      /* ICC_RPR_EL1 */
+    b[18] = v;
+
+    /* POST snapshot: the same CPU interface after the SGI has latched in
+     * GICR_ISPENDR0. Comparing it against HExO_SNAP_PRE is what separates
+     * "pending and starved by a running priority" from "pending and simply not
+     * presented". Read-only: IAR1 appears in both snapshots but reading it with
+     * nothing acceptable pending just returns 1023 and changes no state. */
+    gicv3_ciface_snapshot(&b[HExO_SNAP_POST]);
+    gicv3_bclean(b, HExO_SNAP_POST, HExO_SNAP_POST + HExO_SNAP_N - 1);
     b[8] = *(volatile u32 *)(rd + GICR_ISPENDR0);         /* did it latch locally too */
-    gicv3_bclean(b, 8, 9);
+    gicv3_bclean(b, 8, 10);
+    gicv3_bclean(b, 17, 18);
     gicv3_bmark(b, 6ULL);                                 /* HPPIR captured */
 }
 
@@ -665,7 +904,14 @@ void gicv3_boundary_probe_send(void) {
 }
 
 void gicv3_init_cpu_iface(void) {
-    // 1. Wake this core's redistributor (ProcessorSleep clear)
+    // 1. Wake this core's redistributor (ProcessorSleep clear) - A53 ONLY.
+    //    Measured: on the A72 frames every ProcessorSleep write is ignored, from
+    //    NS (ps1_ignored in gicv3_force_wake_core) and from EL3 (SiP wake_try
+    //    flags=0x2 timeout). The frames arrive from the bootloader already at
+    //    PS=0/CA=1 - a wake transition started while the PE was off and never
+    //    completed - and GIC-500 ignores PS writes while a transition is in
+    //    progress. Writing more cannot restart it, and could re-stick a frame
+    //    that the PSCI power-cycle test just freed. A72 path is READ-ONLY.
     u64 mpidr;
     asm volatile("mrs %0, mpidr_el1" : "=r"(mpidr));
     // RK3399 redistributor layout: 6 frames at GICR_BASE + N*0x20000.
@@ -680,7 +926,20 @@ void gicv3_init_cpu_iface(void) {
     u32 core = (aff1 ? (aff0 + 4) : aff0);
     if (core >= 6) return;
     gicv3_stage(core, 1u);
-    u32 waker_after = gicv3_force_wake_core(core, 16);
+    u32 waker_after;
+    if (core < 4u) {
+        waker_after = gicv3_force_wake_core(core, 16);
+    } else {
+        /* READ-ONLY on A72 - see the step-1 comment. Record the frame state so
+         * A72_PROBE_A still reports something meaningful; flags 0x80 marks
+         * "skipped by design", distinct from any real handshake outcome. */
+        waker_after = gicv3_read_waker(core);
+        gicv3_waker_trace[core][0] = waker_after;
+        gicv3_waker_trace[core][3] = waker_after;
+        gicv3_waker_trace[core][5] = 0x80u;
+        asm volatile("dc civac, %0" :: "r"(&gicv3_waker_trace[core][0]) : "memory");
+        asm volatile("dsb sy" ::: "memory");
+    }
 
     gicv3_stage(core, 2u);
     // 2. Enable system register access (ICC_SRE_EL2)

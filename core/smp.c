@@ -1367,3 +1367,44 @@ void smp_dump_diagnostics(uart_t *uart) {
         uart_puts(uart, "\r\n");
     }
 }
+
+
+/* ============================================================================
+ * A72 GIC wake guard (2026-10-03).
+ *
+ * History, because the fix looks like "do nothing" and will be tempting to
+ * undo: A72 cores 4/5 never received interrupts. The frames were found at
+ * GICR_WAKER = PS=0/CA=1 - a wake transition started while the PE was powered
+ * off and never completed. In that state ChildrenAsleep=1 means the
+ * redistributor is not communicating with the PE: SGIs latch in GICR_ISPENDR0
+ * but are never presented (HPPIR/IAR read 0x3FF), which is exactly what was
+ * measured for months. ProcessorSleep writes are ignored mid-transition, from
+ * NS (ps1_ignored) and from EL3 (SiP wake_try timeout), and TF-A's
+ * mark_core_awake() no-ops when PS is already 0 - so nothing could restart the
+ * handshake. The transition had been started by H-Exo's own
+ * gicv3_prewake_redistributors(), which wrote PS=0 on frames 4/5 BEFORE
+ * CPU_ON. Removing that write lets BL31 run the documented handshake itself
+ * during power-up; the frames then come up at WAKER=0x0 and SGIs are delivered
+ * (measured: SGI_TEST c4 irq_cnt 0->1, B1 PASS on cores 4 and 5).
+ *
+ * This guard replaces the earlier PSCI power-cycle attempt. It is READ-ONLY:
+ * a certification must not mutate what it certifies. The power cycle cannot
+ * work anyway - rkbin BL31 v1.36 returns NOT_SUPPORTED (-1) for CPU_OFF,
+ * measured 2026-10-03.
+ * ========================================================================= */
+void smp_a72_wake_guard(void) {
+    extern u32 gicv3_read_waker(u32 core);
+    u32 w4 = gicv3_read_waker(4);
+    u32 w5 = gicv3_read_waker(5);
+    uart_puts(&console, "[A72WAKE] w4=0x");
+    uart_put_hex(&console, w4);
+    uart_puts(&console, " w5=0x");
+    uart_put_hex(&console, w5);
+    if (((w4 | w5) & (1u << 2)) == 0u) {
+        uart_puts(&console, " | AWAKE: BL31 completed the wake handshake (prewake stays off these frames)\r\n");
+    } else {
+        uart_puts(&console, " | STUCK CA=1: handshake did not complete this boot; SGI mode will refuse.\r\n");
+        uart_puts(&console, "[A72WAKE] no NS-side recovery exists: PS writes are ignored mid-transition\r\n");
+        uart_puts(&console, "[A72WAKE] and PSCI CPU_OFF returns NOT_SUPPORTED on this BL31. Reboot cold.\r\n");
+    }
+}

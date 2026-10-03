@@ -46,7 +46,8 @@ void     gicv3_prewake_redistributors(void);
 u32      gicv3_read_waker(u32 core);
 u32      gicv3_force_wake_core(u32 core, u32 retries);
 result_t gicv3_init(void);
-void     gicv3_init_cpu_iface(void);  // Phase 2: per-core CPU interface init
+void     gicv3_init_cpu_iface(void);
+
 /* Two-phase A72 interrupt boundary probe; phase B must run after daifclr. */
 void gicv3_probe_local_irq_path(u32 core);
 void gicv3_probe_local_irq_path_b(u32 core);

@@ -38,4 +38,5 @@ ONLINE after
 @ [L2ACTLR_DIAG]
 @ [ADB400]
 @ A72_PROBE_A
+@ [A72WAKE]
 

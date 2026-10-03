@@ -561,7 +561,7 @@ void kmain(void) {
     // Log GICR_WAKER after pre-wake to confirm state (ProcessorSleep=bit1, ChildrenAsleep=bit2)
     {
         uart_puts(&console, "[GIC] GICR_WAKER before PSCI:");
-        for (u32 cpu = 0; cpu < 4; cpu++) {
+        for (u32 cpu = 0; cpu < 6; cpu++) {
             volatile u32 *waker = (volatile u32*)(0xFEF00014UL + (uintptr_t)cpu * 0x20000);
             uart_puts(&console, " C");
             uart_put_hex(&console, cpu);
@@ -613,23 +613,14 @@ void kmain(void) {
 
     smp_init();
 
-    // Post-PSCI re-wake for A72 redistributors: on some RK3399 boots,
-    // cores 4/5 can come online while GICR_WAKER.ChildrenAsleep remains set.
-    // This pass forces ProcessorSleep=0 again after CPU_ON completion.
+    // Post-PSCI A72 check, READ-ONLY. The old "re-wake" pass wrote
+    // ProcessorSleep on frames 4/5; every such write from NS and EL3 is
+    // measured-ignored while a wake transition is in progress, and H-Exo's own
+    // prewake used to BE the thing wedging that transition. See the history
+    // block on smp_a72_wake_guard() in core/smp.c.
     {
-        u32 w4_before = gicv3_read_waker(4);
-        u32 w5_before = gicv3_read_waker(5);
-        u32 w4_after = gicv3_force_wake_core(4, 8);
-        u32 w5_after = gicv3_force_wake_core(5, 8);
-        uart_puts(&console, "[GIC] post-SMP re-wake w4:");
-        uart_put_hex(&console, w4_before);
-        uart_puts(&console, "->");
-        uart_put_hex(&console, w4_after);
-        uart_puts(&console, " w5:");
-        uart_put_hex(&console, w5_before);
-        uart_puts(&console, "->");
-        uart_put_hex(&console, w5_after);
-        uart_puts(&console, "\r\n");
+        extern void smp_a72_wake_guard(void);
+        smp_a72_wake_guard();
     }
 
     // Reverted to running AFTER smp_init(). With gicd_wait_for_rwp() in place,
@@ -844,7 +835,7 @@ void kmain(void) {
                 // the vector actually ran is then answered separately after
                 // daifclr (phase C). Cores 1-3 are the control.
                 {
-                    extern volatile u64 g_icr_boundary[6][18];
+                    extern volatile u64 g_icr_boundary[6][56];
                     extern void gicv3_boundary_probe_send(void);
                     u32 armed = 0;
                     for (u32 t = 0; t < 3000000u && armed < 5u; t++) {
@@ -876,7 +867,7 @@ void kmain(void) {
                     uart_puts(&console, "\r\n");
 
                     for (u32 ci = 1; ci < 6u; ci++) {
-                        for (u32 k = 0; k < 18u; k++)
+                        for (u32 k = 0; k < 56u; k++)
                             asm volatile("dc ivac, %0" :: "r"(&g_icr_boundary[ci][k]) : "memory");
                         asm volatile("dsb sy" ::: "memory");
                         volatile u64 *b = g_icr_boundary[ci];
@@ -905,7 +896,101 @@ void kmain(void) {
                             uart_puts(&console, "PASS intid=0x");
                             uart_put_hex(&console, b[9] & 0x3FFULL);
                         } else {
-                            uart_puts(&console, "FAIL");
+                            uart_puts(&console, "FAIL(spurious)");
+                        }
+                        // Read unconditionally in phase B, so this is the
+                        // discriminator that was missing before: 0x3FF means the
+                        // CPU interface offers no INTID at all.
+                        uart_puts(&console, " IAR1=0x");
+                        uart_put_hex(&console, b[10] & 0x3FFULL);
+                        uart_puts(&console, "(3FF=no intid)");
+                        // p1 vs p2 decides whether THIS probe zeroed PMR or
+                        // something between init and the probe did.
+                        uart_puts(&console, " PMR_p1=0x");
+                        uart_put_hex(&console, b[19]);
+                        uart_puts(&console, " PMR_p2=0x");
+                        uart_put_hex(&console, b[17]);
+                        uart_puts(&console, " RPR=0x");
+                        uart_put_hex(&console, b[18]);
+                        uart_puts(&console, "\r\n      RD view: IGROUPR=0x");
+                        uart_put_hex(&console, b[20]);
+                        uart_puts(&console, " IGRPMODR=0x");
+                        uart_put_hex(&console, b[21]);
+                        uart_puts(&console, " ICENABLER=0x");
+                        uart_put_hex(&console, b[22]);
+                        uart_puts(&console, " IPRIO=0x");
+                        uart_put_hex(&console, b[23]);
+                        uart_puts(&console, "\r\n      ISPENDR0_pre=0x");
+                        uart_put_hex(&console, b[5]);
+                        uart_puts(&console, " ISPENDR0_post=0x");
+                        uart_put_hex(&console, b[8]);
+                        uart_puts(&console, " SCTLR=0x");
+                        uart_put_hex(&console, b[6]);
+                        uart_puts(&console, " SRE2=0x");
+                        uart_put_hex(&console, b[7]);
+                        /* GICR_WAKER writability. PS and CA are the only
+                         * implemented bits (TF-A gicv3.h: WAKER_PS_SHIFT 1,
+                         * WAKER_CA_SHIFT 2). An accepted all-ones write reads
+                         * back 0x6; a rejected one reads back unchanged. */
+                        /* One read, one write of (pre & ~ProcessorSleep), one bounded
+                         * poll for ChildrenAsleep = 0 - what Linux and TF-A both
+                         * do, run on the PE that owns the redistributor. No
+                         * all-ones write: bits 30:3 are RES0 and setting them is
+                         * UNPREDICTABLE, which invalidated the earlier attempt. */
+                        /* L2ACTLR_EL1 issued from core 0 through the same SiP SMC the
+                         * per-PE probe uses. This is the control the per-PE probe
+                         * cannot provide: that one only runs on cores 4 and 5, so
+                         * without this there is no working baseline to compare a
+                         * zero reading against. Read-only; nothing is enabled. */
+                        /* Only the raw value fits in a free slot. The per-PE probe at
+                         * core/smp.c already decodes the bits, and the question
+                         * here is only whether the SMC returns anything at all
+                         * from core 0 - a non-zero raw means the control exists. */
+                        if (b[22] != 0) {
+                            uart_puts(&console, "\r\n      L2ACTLR from core0: raw=0x");
+                            uart_put_hex(&console, b[22]);
+                            uart_puts(&console, " (control: SMC works from core 0)");
+                        } else {
+                            uart_puts(&console, "\r\n      L2ACTLR from core0: raw=0 (SMC unavailable)");
+                        }
+                        /* Read-only frame registers. The write-based WAKER probe that
+                         * used to live here was removed: writing PS on the A72 frames
+                         * is measured-ignored from both NS and EL3, and any write risks
+                         * re-sticking a frame the power-cycle test just freed.
+                         *   GICR_STATUSR (+0x10): logs invalid register accesses - if
+                         *     the WAKER PS writes were rejected as writes-to-RO, the
+                         *     WROD/RWOD bits say so. Never read before.
+                         *   GICR_PWRR (+0x24): redistributor power state (U-Boot uses
+                         *     it for GIC-600 power-on). Never read before. */
+                        uart_puts(&console, "\r\n      RD statusr=0x");
+                        uart_put_hex(&console, b[48]);
+                        uart_puts(&console, " pwrr=0x");
+                        uart_put_hex(&console, b[49]);
+                        {
+                            /* CPU interface, before vs after the SGI latched.
+                             * RPR is the one that decides: 0xFF means nothing is
+                             * running, anything else means a pending interrupt at
+                             * 0xA0 cannot be presented. AP1R0/AP0R0 non-zero would
+                             * be leftover active priority state. HPPIR0 is a
+                             * control - our SGI is Group 1, so HPPIR0 must be 0x3FF
+                             * and HPPIR1 must carry the INTID. */
+                            /* AP0R1..R3 and AP1R1 are absent from this list on
+                             * purpose: Linux declares them, this GIC does not
+                             * implement them, and reading one raises a synchronous
+                             * exception. Verified by executing it. */
+                            static const char *nm[12] = {
+                                "PMR","RPR","BPR0","BPR1","HPPIR0","HPPIR1",
+                                "IAR0","IAR1","IGRPEN0","IGRPEN1","AP0R0","AP1R0" };
+                            uart_puts(&console, "\r\n      CPU interface   PRE        POST");
+                            for (u32 k = 0; k < 12u; k++) {
+                                uart_puts(&console, "\r\n        ");
+                                uart_puts(&console, nm[k]);
+                                uart_puts(&console, "           ");
+                                uart_put_hex(&console, b[24 + k]);
+                                uart_puts(&console, "   ");
+                                uart_put_hex(&console, b[36 + k]);
+                            }
+                            uart_puts(&console, "\r\n");
                         }
                         uart_puts(&console, " | B3 vector entries=");
                         uart_put_hex(&console, b[11]);
@@ -932,12 +1017,15 @@ void kmain(void) {
                     {
                         u64 gicd_typer = *(volatile u32 *)0xFEE00004ULL;
                         u32 gicd_iidr  = *(volatile u32 *)0xFEE00008ULL;
-                        u32 idbits = gicd_typer & 0x1Fu;
-                        u32 probes = 0, iidr_hits = 0, typer_hits = 0, printed = 0;
+                        u32 probes = 0, iidr_hits = 0, printed = 0;
                         uart_puts(&console, "\r\n[RSWEEP] GICD_TYPER=0x");
                         uart_put_hex(&console, gicd_typer);
-                        uart_puts(&console, " IDbits=");
-                        uart_put_hex(&console, idbits);
+                        uart_puts(&console, " ID_BITS=");
+                        // GICD_TYPER_ID_BITS(typer) = ((typer >> 19) & 0x1f) + 1
+                        uart_put_hex(&console, (u32)(((gicd_typer >> 19) & 0x1Fu) + 1u));
+                        uart_puts(&console, " IRQS=");
+                        // GICD_TYPER_IRQS(typer) = ((typer & 0x1f) + 1) * 32
+                        uart_put_hex(&console, (u32)((((gicd_typer & 0x1Fu) + 1u) * 32u)));
                         uart_puts(&console, " GICD_IIDR=0x");
                         uart_put_hex(&console, gicd_iidr);
                         uart_puts(&console, "\r\n");
@@ -951,14 +1039,10 @@ void kmain(void) {
                             u32 lo   = (u32)t;
                             u64 aff  = t >> 32;
                             probes++;
-                            u32 idb = lo & 0x1Fu;
-                            u32 cap = (lo >> 10) & 1u;
-                            u32 sgi = (lo >> 8) & 1u;
                             u32 iidrok = (iidr == gicd_iidr) ? 1u : 0u;
-                            u32 look = iidrok | cap | (aff != 0u ? 1u : 0u);
+                            u32 look = iidrok | ((aff != 0u) ? 1u : 0u);
                             if (look == 0u) continue;       /* silent: not a frame */
                             if (iidrok) iidr_hits++;
-                            if (cap && sgi) typer_hits++;
                             if (printed >= 48u) continue;   /* cap the log, keep counting */
                             printed++;
                             uart_puts(&console, "  +0x");
@@ -968,12 +1052,19 @@ void kmain(void) {
                             uart_puts(&console, iidrok ? "*" : " ");
                             uart_puts(&console, " typer=0x");
                             uart_put_hex(&console, t);
-                            uart_puts(&console, " idb=");
-                            uart_put_hex(&console, idb);
-                            uart_puts(&console, " cap=");
-                            uart_put_hex(&console, cap);
-                            uart_puts(&console, " sgi=");
-                            uart_put_hex(&console, sgi);
+                            // Field names come from U-Boot's GICv3 definitions in
+                            // this repository (u-boot/arch/arm/include/asm/gic-v3.h):
+                            //     GICR_TYPER_CPU_NUMBER(r) = ((r) >> 8) & 0xffff
+                            // An earlier version of this probe printed its own
+                            // invented labels - IDbits from bits[4:0], CAP from
+                            // bit10, SGI from bit8. Bits [23:8] are Processor_Number,
+                            // so those labels were reading structure out of a
+                            // Processor_Number field and every one was wrong. The
+                            // raw low half is printed so nothing is hidden.
+                            uart_puts(&console, " lo=0x");
+                            uart_put_hex(&console, lo);
+                            uart_puts(&console, " cpuno=");
+                            uart_put_hex(&console, (lo >> 8) & 0xFFFFu);
                             uart_puts(&console, " aff=0x");
                             uart_put_hex(&console, aff);
                             uart_puts(&console, " (a1=");
@@ -986,8 +1077,6 @@ void kmain(void) {
                         uart_put_hex(&console, probes);
                         uart_puts(&console, " IIDR-matches=");
                         uart_put_hex(&console, iidr_hits);
-                        uart_puts(&console, " CAP&SGI=");
-                        uart_put_hex(&console, typer_hits);
                         uart_puts(&console, "\r\n");
                     }
                     /* MPIDR of each PE, for a like-for-like comparison against the

@@ -391,6 +391,7 @@ The following telemetry is permanently wired and survives across SMP failures:
 | 2026-10-02 | A72 cores 4,5 come up ONLINE and execute code, but never take an interrupt - defect recorded here for the first time || 2026-10-02 | `wq_dispatch()` had an unbounded `while (!s->done)` - it wedged the initiator itself, which is why every log stopped at `[BASELINE_A72] Dispatching`. Now bounded to 5 s |
 | 2026-10-03 | `GICD_CTLR.DS=1` (the RK3399 insecure-integration quirk Linux applies) tested and **refuted**: `c4 irq_cnt 0x0 -> 0x0` with `gicd_ctlr=0x53` |
 | 2026-10-03 | Full investigation log written to `docs/rk3399/A72_INVESTIGATION_LOG.md` |
+| **2026-10-03** | **A72 INTERRUPT ROOT CAUSE FOUND AND FIXED: H-Exo's own `gicv3_prewake_redistributors()` wrote `GICR_WAKER.PS=0` on frames 4/5 before CPU_ON, wedging the RD wake transition (`CA=1` forever, PS writes ignored from NS and EL3, BL31 `mark_core_awake` no-ops at PS=0). Prewake removed for A72, all NS/EL3 WAKER writes to frames 4/5 deleted. Measured: `SGI_TEST c4 irq_cnt 0x0->0x1`, boundary B1 PASS on all cores, core 4 handled 292 pipeline SGIs. SGI pipeline mode stays OFF (chain hidden->output->done incomplete: 317/1000, output/done sends=0); polling mode ships (1000/1000 @ ~10.9 µs)** |
 
 | 2026-10-02 | `CPUECTLR_EL1.SMPEN` measured = 1 on both A72 via a new SiP SMC; SMPEN hypothesis eliminated (see ADL-006) |
 | 2026-10-02 | RK_SIP_GICR_WAKE_TRY driven from EL3: status flag 0x2 timeout; ChildrenAsleep is normal on working A53s too |
@@ -459,7 +460,7 @@ they never join the dispatch rotation. That defect was not recorded until now.
 
 | Hypothesis | Why eliminated |
 |---|---|
-| `ChildrenAsleep=1` blocks delivery | Working A53s report it too. Per IHI 0069 only `ProcessorSleep=1` withholds interrupts, and `PS=0,CA=1` is the architecturally expected "PE coming online" state |
+| `ChildrenAsleep=1` blocks delivery | **REVERSED 2026-10-03 - root cause.** The A53 comparison value was measured while the cores were off; at delivery time working A53 frames read `0x0` and dead A72 frames `0x4`. Wedged by H-Exo's own prewake writing PS=0 before CPU_ON; fix = stop writing A72 frames, BL31's handshake then completes. See A72_INVESTIGATION_LOG.md §Resolution |
 | `CPUECTLR_EL1.SMPEN` never set | Measured `=1` on both A72 cores |
 | GICR_WAKER handshake is a software sequencing bug | `RK_SIP_GICR_WAKE_TRY` drives the full two-phase handshake from EL3 and still times out |
 | Redistributor register state differs | RD and SGI frames are identical between a working A53 and a dead A72 apart from the TYPER CPU_Number field |
