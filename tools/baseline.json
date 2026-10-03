@@ -9,6 +9,6 @@
   "generated_by": "tools/verify.ps1 -Update",
   "toolchain": "aarch64-none-elf-gcc.exe 15.2.1",
   "size_bytes": 176552,
-  "crc32": "083ef9af",
-  "sha256": "f49525a6b03007a3cfe01c0ac66c6043f044864435565d60e0b1ceb98f5dc7d0"
+  "crc32": "7b4e05de",
+  "sha256": "59c52afe25a7d0cdffafc73e4bf7a186cb33ef107e6b75f1e1318850a05ed539"
 }
