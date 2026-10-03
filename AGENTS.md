@@ -5,6 +5,59 @@
 > into any session. This file is a faithful, loadable summary of the rules that
 > must never be violated. It is not a replacement.
 
+---
+
+## 1. Read the documentation FIRST
+
+**Before writing a line of code, forming a hypothesis, or asserting any
+architectural fact: find and read the authoritative documentation for the exact
+register, opcode, field, ABI or protocol involved. Every time.**
+
+Concretely, in this project that means, before touching anything:
+
+| Question | Where the answer actually lives |
+|---|---|
+| a GIC/Mali/CPU register field | `third_party/trusted-firmware-a/`, `docs/vendor/panfrost/`, `u-boot/arch/arm/include/asm/` — all already vendored in-tree |
+| a system-register encoding | Linux `arch/arm64/include/asm/sysreg.h` (fetch and read it) |
+| what the project's firmware did before | `git log`, `git show`, `docs/rk3399/*` |
+| how upstream Linux packs a descriptor | the vendored `linux_panfrost_*.c`, `docs/vendor/panfrost/mesa_v*.xml` |
+
+**In-tree documentation beats the network. The network beats memory. Memory is not
+a source.**
+
+### Why this is rule 1
+
+Every architectural error made on 2026-10-03 had the same cause: a field, opcode or
+encoding taken from memory instead of from a document, and a conclusion built on it
+before the field was checked.
+
+| Claim taken from memory | What the document said | Cost |
+|---|---|---|
+| `ICC_SGI1R_EL1` at `S3_0_C12_C11_5` | correct by luck, wrong reasoning; field widths unverified | a false "we found an encoding bug" |
+| `GICD_TYPER.IDbits` = bits[4:0] | it is **bits[19:24]**, real value **16** not 8 | a fabricated "Aff0 width = 0" root cause |
+| `ICC_RPR_EL1` does not exist in GICv3 | it exists, `S3_0_C12_C11_3` | wrote it off as unimplemented |
+| `GICR_WAKER.ChildrenAsleep=1` blocks delivery | it describes the PE's children, not interface delivery | a retracted hypothesis that had to be re-opened |
+| `GICD_CTLR.DS` must be set | already set, `0x53` bit 6 | a whole A/B cycle proving a non-cause |
+| invocation packing in `w8` | never read | still unresolved today |
+
+Six errors, one cause. Every one was caught **after** a conclusion had been stated,
+costing roughly a boot cycle and a chunk of the session each.
+
+### What counts as having read it
+
+Not: recalling a layout, or trusting a comment in our own source. A vendor header, a
+spec XML, an upstream implementation, or the assembler itself. If the document and
+the code disagree, the document wins and the code is the bug.
+
+**If the documentation cannot be found, say so explicitly and mark the claim as
+unverified.** Do not fill the gap from memory and do not build on it.
+
+### The compiler is documentation too
+
+When an encoding is disputed, assemble it and read the disassembly
+(`aarch64-none-elf-objdump -d`). That is how `AP0R1..R3`/`AP1R1` were proven
+*declared but not implemented* on this GIC — they trap, and no header says so.
+
 ## Mission
 
 A forensic engineering audit of the H-Exo bare-metal RK3399 system. Reconstruct the
