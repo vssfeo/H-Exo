@@ -1,0 +1,17 @@
+# Logs that are NOT expected to satisfy docs/expected/markers.txt.
+#
+# The marker contract describes the CURRENT firmware. Logs captured before a
+# feature existed cannot contain its markers, and that is not a regression. Listing
+# them here keeps `check_markers.ps1 -Dir log` green without weakening the contract
+# for anything captured from now on.
+#
+# Format: <filename>  <reason>
+#
+# Re-capture a log and delete its line here once the contract should hold for it.
+
+# Captured 2026-05-03. Predates the [RUNTIME] inference marker and the whole
+# GIC boundary-probe instrumentation. Kept as evidence for the A72 investigation
+# in docs/rk3399/A72_INVESTIGATION_LOG.md, including the "c4 irq_cnt 0x0 -> 0x0"
+# measurement quoted there.
+1.txt
+2.txt

@@ -1,0 +1,67 @@
+# cppcheck baseline for H-Exo - reviewed findings that must not fail the build.
+#
+# Format: <cppcheck-id>|<path relative to repo root>|<severity>|<count in that file>
+#
+# The severity is part of the key on purpose. tools/verify.ps1 gates a finding if
+# cppcheck called it "error" OR if its id is in the gated set. A finding already
+# baselined as "style" that later becomes "error" keeps the same id and the same
+# count, so without severity in the key that escalation would slip through.
+#
+# The count is part of the key too. Keying on (id, path, severity) alone would
+# collapse the two uninitvar findings in hal/gicv3.c into one entry, and a third
+# would then pass unnoticed.
+#
+# The key is a count, not a line number: line-keyed baselines rot on every
+# unrelated edit, and a baseline that must be regenerated constantly is a
+# baseline nobody reads.
+#
+# Only findings whose id is in the gated set appear here. Everything else cppcheck
+# reports (constVariablePointer, variableScope, unusedStructMember,
+# badBitmaskCheck, knownConditionTrueFalse, unreadVariable) is counted and printed
+# but does not fail, because on this tree it is almost entirely cosmetic and
+# gating on it would bury the classes that matter.
+#
+# ---------------------------------------------------------------------------
+# Every entry below was checked by reading the code, not by pattern-matching the
+# tool's message. All four are false positives.
+# ---------------------------------------------------------------------------
+#
+# uninitvar|hal/gicv3.c|error|2
+#   gicv3.c:10  loaded  - written by ldaxr through an asm output constraint at
+#                         gicv3.c:14-17, read at :18 and :21. cppcheck does not
+#                         model asm output operands, so the variable looks unset.
+#   gicv3.c:11  status  - written by stxr through an asm output constraint at
+#                         gicv3.c:23-26, read at :27. Same reason.
+#
+# uninitvar|hal/pmu.c|error|1
+#   pmu.c:581    t_now   - written by mrs at pmu.c:583, read at :584. It is a
+#                         do/while, so the body always executes once before the
+#                         test. Same asm-output limitation.
+#
+# unassignedVariable|hal/mali_compute.c|style|1
+#   mali_compute.c:1582  d_storage[64] - a GPU storage buffer. Its ADDRESS is
+#                         passed into the shader descriptor at :1585
+#                         (build_probe_shader_v2(..., storage_addr)); the GPU
+#                         populates it. It is deliberately never written by the
+#                         CPU, and cppcheck cannot follow the indirection.
+#
+# arrayIndexThenCheck|hal/hexo_l2.c|style|1
+#   hexo_l2.c:217 - reported because g_l2_stats.rx_by_type[i] is read before the
+#                         bound test. Both accesses are in range:
+#                           * rx_by_type is declared [256] (hexo_l2.h:99) and the
+#                             loop runs i < 256.
+#                           * type_names has designated initialisers up to
+#                             [HEXO_MSG_PTP_FOLLOWUP] = 0x21, so it has 34
+#                             elements, and sizeof(type_names)/sizeof(*type_names)
+#                             evaluates to exactly 34 - which is what guards
+#                             type_names[i].
+#                         The ordering is worth tidying, but it is not a defect, so
+#                         the code was left alone rather than churned to silence a
+#                         tool.
+#
+# Do NOT add a finding here to make the build green without saying why in the
+# commit message. The purpose of this file is that the exceptions stay visible.
+uninitvar|hal/gicv3.c|error|2
+uninitvar|hal/pmu.c|error|1
+unassignedVariable|hal/mali_compute.c|style|1
+arrayIndexThenCheck|hal/hexo_l2.c|style|1

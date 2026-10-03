@@ -1,0 +1,18 @@
+# Portable tool binaries live here and are NOT committed: cppcheck is 54 MB and is
+# a third-party build, so it does not belong in the object history.
+#
+# Produced by extracting the official upstream MSI without installing it, so
+# nothing is registered on the machine and nothing has to be uninstalled:
+#
+#   curl -L -o cppcheck.msi https://github.com/cppcheck-opensource/cppcheck/releases/download/2.22.0/cppcheck-2.22.0-x64-Setup.msi
+#   msiexec /a cppcheck.msi TARGETDIR=extract /qn
+#   xcopy extract\PFiles\Cppcheck tools\bin /E /I
+#
+# Upstream publishes no portable zip for any recent release - only the MSI - so
+# the administrative-install extraction above is the no-install route.
+#
+# tools/verify.ps1 degrades honestly when this is absent: it warns, and it says
+# which defect classes only cppcheck covers.
+*
+!.gitignore
+!README.md

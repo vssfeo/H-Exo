@@ -47,6 +47,10 @@ u32      gicv3_read_waker(u32 core);
 u32      gicv3_force_wake_core(u32 core, u32 retries);
 result_t gicv3_init(void);
 void     gicv3_init_cpu_iface(void);  // Phase 2: per-core CPU interface init
+/* Two-phase A72 interrupt boundary probe; phase B must run after daifclr. */
+void gicv3_probe_local_irq_path(u32 core);
+void gicv3_probe_local_irq_path_b(u32 core);
+void gicv3_boundary_probe_send(void);
 extern volatile u64 gicv3_cpu_iface_stage[6];
 #define GICV3_SNAP_SLOTS 30
 extern volatile u64 g_gic_snap[6][2][GICV3_SNAP_SLOTS];

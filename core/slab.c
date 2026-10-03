@@ -45,7 +45,9 @@ static u32 slab_count_used_blocks(void) {
 }
 
 void slab_init(void) {
-    for (int i = 0; i < sizeof(slab_bitmap); i++) {
+    // usize, not int: sizeof is size_t, and comparing it against a signed int
+    // is the -Wsign-compare diagnostic.
+    for (usize i = 0; i < sizeof(slab_bitmap); i++) {
         slab_bitmap[i] = 0;
     }
 }

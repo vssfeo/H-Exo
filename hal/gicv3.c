@@ -390,7 +390,7 @@ void gicv3_take_snapshot(u32 core, u32 moment) {
     snap[14] = *(volatile u32 *)(sgi + 0xE00); /* NSACR      */
     /* Distributor, shared */
     snap[15] = gicd_read(0x000);              /* GICD_CTLR   */
-    snap[16] = gicd_read(0x008);              /* GICD_TYPER  */
+    snap[16] = gicd_read(GICD_TYPER);        /* was 0x008, which is GICD_IIDR */
     snap[17] = gicd_read(0x080);              /* GICD_IGROUPR */
     /* CPU interface system registers - only valid on the capturing PE */
     asm volatile("mrs %0, ICC_SRE_EL1"     : "=r"(v)); snap[18] = v;
@@ -490,50 +490,180 @@ static void gicv3_probe_local_wake(u32 core) {
     gicv3_core_diag2[core][12] = fin;
 }
 
-static void gicv3_probe_local_irq_path(u32 core) {
-    volatile u32 *ispendr = (volatile u32 *)(
-        (uintptr_t)GICR_BASE + (uintptr_t)core * 0x20000u + GICR_ISPENDR0);
-    volatile u32 *icpendr = (volatile u32 *)(
-        (uintptr_t)GICR_BASE + (uintptr_t)core * 0x20000u + GICR_ICPENDR0);
-    const u32 PPI_BIT = 1u << 29;   // PPI 29 = ARM_IRQ_SEC_PHY_TIMER, per-PE, pre-enabled
-    u64 hppir_before, hppir_after, iar;
+/*
+ * H-Exo: staged boundary probe - WHERE does an interrupt die?
+ *
+ * Everything up to the pending bit is verified correct for the A72: it reaches
+ * GICR_ISPENDR0 and stays there. The chain from there is
+ *
+ *     GICR_ISPENDR0  ->  ICC_HPPIR1_EL1  ->  ICC_IAR1_EL1  ->  exception vector
+ *
+ * and every stage is recorded separately, so the result is binary rather than
+ * another theory: whichever stage first fails to advance names the boundary.
+ *
+ * Run ON the A72 itself, so the ICC_* system registers read are the ones that
+ * belong to this PE. PPI 29 is per-PE and pre-enabled.
+ *
+ * Slots: 0 hppir before | 1 ispendr after write | 2 hppir after  <-- boundary 1
+ *        3 iar value   | 4 handler magic       | 5 handler count
+ *        6 last intid  | 7 ENDMARK
+ */
+/*
+ * H-Exo: two-phase boundary probe - WHERE does the interrupt die on this PE?
+ *
+ * Split in two because of ordering, not convenience. Phase A runs inside
+ * gicv3_init_cpu_iface(), which is BEFORE "msr daifclr, #3" in
+ * smp_secondary_main(); at that point PSTATE.I is still 1, so no exception can
+ * possibly be taken and the "did the vector run" stage would be unanswerable.
+ * Phase B therefore runs immediately after daifclr.
+ *
+ * Slot 0 is a step marker cleaned at every stage, so a probe that wedges still
+ * reports where it stopped. Slot 1 holds the pre-daif phase so a B-side stop is
+ * distinguishable from "phase A never ran".
+ *
+ *  0 step  1 GICR_CTLR inherited  2 ICENABLER0 inherited  3 GICR_WAKER
+ *  4 HPPIR1 idle   5 GICR_CTLR after enable  6 ICENABLER0 after SGI-15 enable
+ *  7 HPPIR1 pre-inject          8 ISPENDR0 readback
+ *  9 HPPIR1 post-inject  <-- BOUNDARY 1     10 IAR1 / DEAD  <-- BOUNDARY 2
+ * 11 handler entry delta    <-- BOUNDARY 3   12 handler magic
+ * 13 ICC_CTLR_EL1  14 ICC_PMR_EL1  15 SCTLR_EL1  16 DAIF_EL1
+ */
+volatile u64 __attribute__((aligned(64))) g_icr_boundary[6][18];
 
-    asm volatile("mrs %0, S3_0_C12_C12_2" : "=r"(hppir_before));  // ICC_HPPIR1_EL1
-    *ispendr = PPI_BIT;
-    asm volatile("dsb sy" ::: "memory");
-    asm volatile("isb");
-    asm volatile("mrs %0, S3_0_C12_C12_2" : "=r"(hppir_after));
+/* Core 0 sets this after every target reports ARMED, then sends the SGI. */
+volatile u64 g_icr_go[6];
 
-    if ((hppir_after & 0x3FFu) != 0x3FFu) {
-        // A real INTID reached the CPU interface: consume it so we do not
-        // leave a stray interrupt pending.
-        asm volatile("mrs %0, S3_0_C12_C12_0" : "=r"(iar));   // ICC_IAR1_EL1
-        asm volatile("msr S3_0_C12_C12_1, %0" :: "r"(iar));   // ICC_EOIR1_EL1
-    }
-    *icpendr = PPI_BIT;
-    asm volatile("dsb sy" ::: "memory");
-    asm volatile("isb" ::: "memory");
+/* g_irq_entry_count snapshotted on each target while its IRQs are still masked,
+ * i.e. before any probe SGI can possibly arrive. Whatever shows up as a later
+ * delta was therefore caused by the probe, and a delta on a core the SGI was
+ * NOT addressed to means the distributor mis-routed it instead of dropping it. */
+volatile u64 g_icr_entry_pre[6];
 
-    /*
-     * The decisive signal is hppir_after. hppir_before is read before anything
-     * is injected, so it is trivially 0x3FF ("nothing pending") and cannot
-     * distinguish a live forward path from a dead one. Stash the AFTER value so
-     * the NS-side verdict reflects what actually reached the CPU interface.
-     */
-    gicv3_core_diag2[core][6]  |= ((u64)(hppir_after & 0x3FFu) << 32);
-    gicv3_core_diag2[core][13] = (u64)(hppir_before & 0x3FFu);
-    gicv3_core_diag2[core][14] = (u64)(hppir_after  & 0x3FFu);
-    gicv3_core_diag2[core][15] = (u64)((hppir_after & 0x3FFu) != 0x3FFu);
-    {
-        u64 hppir_final;
-        asm volatile("mrs %0, S3_0_C12_C12_2" : "=r"(hppir_final));  /* ICC_HPPIR1_EL1 */
-        gicv3_stage(core, 99u);   /* returned normally */
-    gicv3_take_snapshot(core, 0u);
-    gicv3_core_diag2[core][16] = (u64)(hppir_final & 0x3FFu);
-    }
-    asm volatile("dc civac, %0" :: "r"(&gicv3_core_diag2[core][0]) : "memory");
+static inline void gicv3_bmark(volatile u64 *b, u64 v) {
+    b[0] = v;
+    asm volatile("dc civac, %0" :: "r"(&b[0]) : "memory");
     asm volatile("dsb sy" ::: "memory");
 }
+
+static inline void gicv3_bclean(volatile u64 *b, u32 lo, u32 hi) {
+    for (u32 k = lo; k <= hi; k++)
+        asm volatile("dc civac, %0" :: "r"(&b[k]) : "memory");
+    asm volatile("dsb sy" ::: "memory");
+}
+
+/*
+ * Why SGI 0 and ICC_SGI1R_EL1, and not a local redistributor write.
+ *
+ * The previous version injected into this PE's own GICR_ISPENDR0 and then read
+ * ICC_HPPIR1_EL1. Measured: the pending bit latches (readback = 1) but HPPIR
+ * stays 0x3FF - on cores 1, 2 and 3 as well as on 4 and 5. Cores 1-3 are known to
+ * receive SGIs (irq_cnt 0x0 -> 0x1). So that instrument is invalid, and its
+ * "FAIL" said nothing about the A72. That is why the control run exists.
+ *
+ * The one path measured to deliver is the system-register interface:
+ * ICC_SGI1R_EL1, which gicv3_sgi_send() already uses and which reached core 1.
+ * Two encodings matter:
+ *   - ICC_SGI1R_EL1.SGI_ID is bits [25:24] and gicv3_sgi_send() does
+ *     "(sgi_id & 0xF) << 24", so only SGI 0..3 survive that encoding.
+ *   - SGI 0 is SGI_STAGE_INPUT, whose handler case is empty. It bumps the
+ *     entry counter at the top of handle_irq_exception and EOIs. Nothing else.
+ */
+#define HExO_PROBE_SGI_ID    0
+
+/* ---- PHASE B: BEFORE daifclr, so PSTATE.I=1 and nothing can be consumed.
+ * Reads HPPIR1 the instant core 0 has fired the SGI. ---- */
+void gicv3_probe_local_irq_path(u32 core) {
+    if (core < 1u || core > 5u) return;   /* core 0 is the sender; leave it alone */
+    uintptr_t rd = (uintptr_t)GICR_BASE + (uintptr_t)core * 0x20000u;
+    volatile u64 *b = g_icr_boundary[core];
+    extern volatile u64 g_irq_entry_count[6];
+    u64 v = 0;
+
+    b[1] = *(volatile u32 *)(rd + GICR_CTLR);          /* GICR_CTLR as inherited */
+    b[2] = *(volatile u32 *)(rd + GICR_ISENABLER0);    /* reads as ICENABLER0 */
+    b[3] = *(volatile u32 *)(rd + GICR_WAKER);
+    asm volatile("mrs %0, S3_0_C12_C12_2" : "=r"(v));  b[4] = v;   /* HPPIR idle */
+    asm volatile("mrs %0, S3_0_C12_C12_4" : "=r"(b[13]));          /* ICC_CTLR_EL1 */
+    asm volatile("mrs %0, S3_0_C12_C12_7" : "=r"(b[14]));          /* ICC_IGRPEN1_EL1 */
+    asm volatile("mrs %0, daif"           : "=r"(b[16]));
+    gicv3_bclean(b, 1, 4);
+    gicv3_bclean(b, 13, 14);
+    gicv3_bclean(b, 16, 16);
+
+    /* The one register that differed between the A72 that failed and the A53s
+     * that worked: ICC_IGRPEN1_EL1 was 0 on core 5 and 1 on cores 1-3. Bit 0 is
+     * EnableGrp1S, bit 1 EnableGrp1NS; at 0 no Group 1 interrupt can be presented
+     * at all, whatever else is right. Align it with the working cores and read
+     * it back, so the next run says whether that was the whole story for core 5. */
+    asm volatile("msr S3_0_C12_C12_7, %0" :: "r"(1ULL));
+    asm volatile("isb" ::: "memory");
+    asm volatile("mrs %0, S3_0_C12_C12_7" : "=r"(v));
+    b[15] = v;                                          /* ICC_IGRPEN1_EL1 after */
+    gicv3_bclean(b, 15, 15);
+
+    /* Clean zero point for the routing question: IRQs are still masked here, so
+     * no probe SGI can have arrived yet on this core. */
+    g_icr_entry_pre[core] = g_irq_entry_count[core];
+    asm volatile("dc civac, %0" :: "r"(&g_icr_entry_pre[core]) : "memory");
+    asm volatile("dsb sy" ::: "memory");
+
+    gicv3_bmark(b, 5ULL);                                /* ARMED */
+
+    /* Wait for core 0 to arm us and fire. Bounded: on timeout the step marker
+     * says so instead of spinning forever into an unrecoverable early hang. */
+    u32 t = 0;
+    for (; t < 100000000u; t++) {
+        asm volatile("dc ivac, %0" :: "r"(&g_icr_go[core]) : "memory");
+        asm volatile("dsb sy" ::: "memory");
+        if (g_icr_go[core] != 0ULL) break;
+        asm volatile("yield");
+    }
+    if (t >= 100000000u) { gicv3_bmark(b, 8ULL); return; }   /* go timeout */
+
+    /* Core 0 writes the flag first and the SGI after, so a plain dsb here does
+     * not order the other core's system-register write. Bounded settle delay. */
+    for (u32 w = 0; w < 200000u; w++) asm volatile("yield");
+
+    asm volatile("mrs %0, S3_0_C12_C12_2" : "=r"(v));
+    b[9] = v;                                             /* BOUNDARY 1 */
+    b[8] = *(volatile u32 *)(rd + GICR_ISPENDR0);         /* did it latch locally too */
+    gicv3_bclean(b, 8, 9);
+    gicv3_bmark(b, 6ULL);                                 /* HPPIR captured */
+}
+
+/* ---- PHASE C: immediately AFTER daifclr, IRQs unmasked. Answers BOUNDARY 3. ---- */
+void gicv3_probe_local_irq_path_b(u32 core) {
+    if (core < 1u || core > 5u) return;
+    volatile u64 *b = g_icr_boundary[core];
+    extern volatile u64 g_irq_entry_count[6];
+    extern volatile u64 g_irq_entry_magic[6];
+    u64 entry0;
+
+    if (b[0] != 6ULL) { gicv3_bmark(b, 10ULL); return; }  /* phase B never got there */
+    entry0 = g_irq_entry_count[core];
+    for (u32 w = 0; w < 2000000u; w++) {
+        asm volatile("dsb sy" ::: "memory");
+        if (g_irq_entry_count[core] != entry0) break;
+        asm volatile("yield");
+    }
+    b[11] = g_irq_entry_count[core] - entry0;              /* BOUNDARY 3 */
+    b[12] = g_irq_entry_magic[core];
+    gicv3_bclean(b, 11, 12);
+    gicv3_bmark(b, 4ULL);                                 /* COMPLETE */
+}
+
+/* Core 0 side of the boundary probe. Declared in gicv3.h so the print site in
+ * main_neuro.c can call it without duplicating the affinity encoding. */
+void gicv3_boundary_probe_send(void) {
+    for (u32 core = 1; core < 6u; core++) {
+        u64 aff = (core >= 4u) ? (0x100ULL | (u64)(core - 4u)) : (u64)(core & 3u);
+        g_icr_go[core] = 1ULL;
+        asm volatile("dc civac, %0" :: "r"(&g_icr_go[core]) : "memory");
+        asm volatile("dsb sy" ::: "memory");
+        gicv3_sgi_send(HExO_PROBE_SGI_ID, aff);
+    }
+}
+
 void gicv3_init_cpu_iface(void) {
     // 1. Wake this core's redistributor (ProcessorSleep clear)
     u64 mpidr;
@@ -675,10 +805,13 @@ void gicv3_init_cpu_iface(void) {
     //
     // THE DECISIVE TEST IS NOW THE SGI_TEST BELOW: if c4 irq_cnt goes 0x0->0x1
     // we can finally conclude the DS quirk was the missing piece.
-    if (0 && core >= 4u && core < 6u) {
+    if (core >= 4u && core < 6u) {
         gicv3_probe_local_wake(core);
-        gicv3_probe_local_irq_path(core);
     }
+    // Control: the identical probe also runs on cores 1..3, which are
+    // known to receive interrupts. A FAIL on the A72 only means something
+    // if the same probe PASSES on an A53.
+    gicv3_probe_local_irq_path(core);
 }
 
 void gicv3_enable_irq(u32 irq) {
@@ -826,7 +959,13 @@ u32 gicv3_read_ispendr0(u32 core) {
 
 u32 gicv3_read_gicd_ctlr(void) { return gicd_read(GICD_CTLR); }
 u64 gicv3_read_gicd_typer(void) {
-    return *(volatile u64*)((uintptr_t)GICD_BASE + 0x0008);
+    // Was: *(volatile u64*)((uintptr_t)GICD_BASE + 0x0008).
+    // 0x0008 is GICD_IIDR, not GICD_TYPER. gicv3.h has defined GICD_TYPER as
+    // 0x0004 all along; the literal 0x0008 was read straight from the register
+    // table without checking the header. The value it produced, 0x0041143B, is
+    // the textbook ARM GICv3 IIDR (implementer 0x43 'C'), which is how the
+    // mistake stayed invisible: the number looked completely plausible.
+    return *(volatile u64*)((uintptr_t)GICD_BASE + GICD_TYPER);
 }
 
 // Optimized SGI send to list of cores using cluster-based TargetList.

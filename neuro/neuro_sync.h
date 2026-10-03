@@ -12,8 +12,15 @@ typedef i32 fixed_t;
 #define FIXED_SHIFT 16
 #define FIXED_ONE (1 << FIXED_SHIFT)
 
-// Convert integer to fixed-point
-#define INT_TO_FIXED(x) ((x) << FIXED_SHIFT)
+// Convert integer to fixed-point.
+//
+// The shift is done on the UNSIGNED value on purpose. A left shift of a
+// negative signed value is undefined behaviour (C11 6.5.7p4), and essentially
+// every call site here passes a negative literal - the weight tables are full
+// of INT_TO_FIXED(-1). Unsigned shift is fully defined, and the conversion back
+// to fixed_t is the same two's-complement wraparound that every narrowing cast
+// in this codebase already relies on.
+#define INT_TO_FIXED(x) ((fixed_t)((u32)(x) * (u32)FIXED_ONE))
 
 // Convert fixed-point to integer
 #define FIXED_TO_INT(x) ((x) >> FIXED_SHIFT)
@@ -47,14 +54,19 @@ typedef struct {
 #define NEURO_OUTPUT_SIZE   4
 
 // Neural network weights (pre-trained, embedded in ROM)
-typedef struct {
-    // Layer 1: Input -> Hidden
+// Phase 1.3: 64-byte cache line aligned to prevent CCI-500 false sharing
+// Each neuron's weights on separate cache line for parallel access
+typedef struct __attribute__((aligned(64))) {
+    // Layer 1: Input -> Hidden (8 neurons × 6 inputs)
+    // Aligned to 64B: each neuron starts at cache line boundary
     fixed_t w1[NEURO_INPUT_SIZE][NEURO_HIDDEN_SIZE];
     fixed_t b1[NEURO_HIDDEN_SIZE];
+    u8 pad1[64 - ((NEURO_INPUT_SIZE * NEURO_HIDDEN_SIZE + NEURO_HIDDEN_SIZE) * 4) % 64]; // pad to 64B
     
-    // Layer 2: Hidden -> Output
+    // Layer 2: Hidden -> Output (4 neurons × 8 inputs)
     fixed_t w2[NEURO_HIDDEN_SIZE][NEURO_OUTPUT_SIZE];
     fixed_t b2[NEURO_OUTPUT_SIZE];
+    u8 pad2[64 - ((NEURO_HIDDEN_SIZE * NEURO_OUTPUT_SIZE + NEURO_OUTPUT_SIZE) * 4) % 64]; // pad to 64B
 } neural_weights_t;
 
 // Neural Arbitrator state
@@ -68,7 +80,9 @@ typedef struct {
 
 // API
 result_t neuro_sync_init(neuro_sync_t* ns);
+neural_weights_t* neuro_sync_get_writable_weights(void);  // Phase 5.4: gossip access
 result_t neuro_sync_inference(neuro_sync_t* ns, const telemetry_t* input, inference_result_t* output);
+result_t neuro_sync_inference_a72(neuro_sync_t* ns, const telemetry_t* input, inference_result_t* output);
 void neuro_sync_print_stats(neuro_sync_t* ns);
 
 // Activation functions (fixed-point)

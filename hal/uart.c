@@ -100,10 +100,12 @@ bool uart_tx_ready(uart_t* uart) {
 // DMA support stubs (to be implemented with DMAC driver)
 result_t uart_dma_tx(uart_t* uart, const void* data, usize len) {
     // TODO: Implement DMA transfer for high-throughput L2 mesh
+    (void)uart; (void)data; (void)len;
     return ERR_NOT_FOUND;
 }
 
 result_t uart_dma_rx(uart_t* uart, void* buffer, usize len) {
     // TODO: Implement DMA receive
+    (void)uart; (void)buffer; (void)len;
     return ERR_NOT_FOUND;
 }

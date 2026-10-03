@@ -1,5 +1,36 @@
 # H-Exo Omni-Core: Optimized Build System
-# Modular architecture with aggressive optimization
+# ============================================================
+# RETIRED. DO NOT RUN. This file is kept only as a record of why.
+#
+# Verified 2026-10-03: `make -f Makefile.optimized all` fails immediately with
+#   "No rule to make target 'boot_optimized.o'"
+# because boot_optimized.s does not exist and never has. It is not a typo. The
+# flavour is only half written: it needs a minimal boot stage that omits the SMP
+# machinery, whereas the real boot.s depends on it. Substituting the real boot.s
+# does NOT fix it (tried 2026-10-02) because this flavour compiles only
+# core/kernel.c and hal/uart.c, which cannot satisfy boot.s:
+#     undefined reference to `smp_entry_stage`   -> defined in core/smp.c
+#     undefined reference to `smp_trace_page`    -> defined in core/smp.c
+#     undefined reference to `smp_idle_counters` -> core/smp.c
+#     undefined reference to `exception_vector_table`
+# It links only via the full core, which is Makefile.neuro -- and Makefile.neuro
+# is ALSO broken (it compiles 5 of the 40 sources and fails at link).
+#
+# Its recipes also call wc, bc and rm, none of which exist on this Windows host,
+# so even the informational targets could not run.
+#
+# WHAT TO USE INSTEAD
+#   pwsh -File tools/verify.ps1
+# That is the only build in this repository that is known to link. It compiles the
+# single canonical source list (tools/sources.json), applies -Werror= per warning
+# class, runs -fanalyzer and cppcheck, links, and compares size + CRC32 + SHA256
+# against tools/baseline.json with a real exit code.
+#
+# The $(error) below makes the failure immediate and self-explanatory instead of
+# letting someone discover it from a cryptic missing-target message.
+# ============================================================
+
+$(error Makefile.optimized is retired. Run: pwsh -File tools/verify.ps1  (see the header of this file for the verified reason))
 
 CC = C:/gcc-arm/bin/aarch64-none-elf-gcc
 AS = C:/gcc-arm/bin/aarch64-none-elf-as
@@ -26,9 +57,22 @@ ASFLAGS = -march=armv8-a+crc+crypto
 LDFLAGS = -T linker_optimized.ld \
           -nostdlib \
           -nostartfiles \
-          --gc-sections
+          -Wl,--gc-sections \
+          -Wl,-Map,$(MAP)
 
 # Source files
+# KNOWN-BROKEN, DO NOT RUN (verified 2026-10-02). This flavour is INCOMPLETE:
+# `boot_optimized.s` does not exist and never has. It is not a typo - the
+# flavour is only half written. It needs a *minimal* boot stage that omits the
+# SMP machinery, whereas the existing boot.s depends on it:
+#     undefined reference to `smp_entry_stage`       -> defined in core/smp.c
+#     undefined reference to `smp_trace_page`        -> defined in core/smp.c
+#     undefined reference to `smp_idle_counters`     -> core/smp.c
+#     undefined reference to `exception_vector_table`
+# Substituting the real boot.s (tried 2026-10-02) does NOT fix it: this flavour
+# compiles only core/kernel.c and hal/uart.c, which cannot satisfy boot.s.
+# It links only via Makefile.neuro, which builds the full core.
+# To complete this flavour someone must actually write boot_optimized.s.
 ASM_SOURCES = boot_optimized.s mmu_optimized.s
 C_SOURCES = core/kernel.c hal/uart.c
 
@@ -61,7 +105,7 @@ all: $(BIN) info
 # Linking
 $(ELF): $(ALL_OBJECTS)
 	@echo "[LD] $@"
-	@$(LD) $(LDFLAGS) -Map=$(MAP) $(ALL_OBJECTS) -o $@
+	@$(CC) $(LDFLAGS) $(ALL_OBJECTS) -o $@
 	@echo "[OBJDUMP] Generating disassembly..."
 	@$(OBJDUMP) -D $@ > $(LST)
 

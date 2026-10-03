@@ -7,7 +7,12 @@ on:
     branches: [master, main]
 
 jobs:
-  build-kernel:
+  # The gate is tools/verify.ps1. It used to be `make -f Makefile.neuro`, which
+  # cannot link: Makefile.neuro compiles 5 of the 40 sources and then fails with
+  # undefined references to cru_set_a72_freq_mhz, cru_get_last_pmic_diag,
+  # mmu_install_nc_region, cru_set_a53_freq_mhz, mali_power_on. A gate that always
+  # fails is a gate nobody reads.
+  verify:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -17,12 +22,24 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
 
-      - name: Build kernel (Makefile.neuro)
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # The cppcheck gate is optional here: tools/bin/cppcheck.exe is a Windows
+      # binary and the portable Linux build is not vendored. The step below runs
+      # when cppcheck is present and is skipped otherwise, so the rest of the gate
+      # still has teeth. Do NOT let this become a permanent silent skip - see the
+      # note in tools/verify.ps1 about which defect classes only cppcheck covers.
+      - name: Fetch cppcheck (optional)
+        id: cppcheck
         run: |
-          make -f Makefile.neuro \
-            CC=aarch64-linux-gnu-gcc \
-            OBJCOPY=aarch64-linux-gnu-objcopy \
-            all
+          set -e
+          sudo apt-get install -y cppcheck
+          cppcheck --version
+
+      - name: Verify (strict compile, -fanalyzer, cppcheck, link, baseline)
+        run: pwsh -File tools/verify.ps1 -OutBin kernel_neuro.bin
 
       - name: Upload kernel artifact
         uses: actions/upload-artifact@v4
@@ -30,3 +47,14 @@ jobs:
           name: kernel_neuro
           path: kernel_neuro.bin
           if-no-files-found: error
+
+  # Offline golden-log contract. Markers live in docs/expected/markers.txt and are
+  # checked with Select-String against logs committed alongside the change, so this
+  # needs no board and no serial port. Populate log/ when a real boot log changes.
+  golden-log:
+    runs-on: ubuntu-latest
+    if: false   # enable once log/ contains a captured run to check
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check every captured log against the marker contract
+        run: pwsh -File tools/check_markers.ps1 -Dir log

@@ -836,7 +836,171 @@ void kmain(void) {
         volatile u32 *cru_gates33 = (volatile u32 *)0xFF760384UL;
         u32 g12 = *cru_gates12;
         u32 g33 = *cru_gates33;
-        uart_puts(&console, " [GICCLK] CON12=0x"); uart_put_hex(&console, g12);
+                // ---- WHERE DOES THE INTERRUPT DIE? ----
+                // The SGI is fired through ICC_SGI1R_EL1, the one path measured
+                // to deliver. Reading HPPIR1 happens on the target while its
+                // IRQs are still masked (phase B, before daifclr), so the read
+                // cannot lose a race against the exception being taken; whether
+                // the vector actually ran is then answered separately after
+                // daifclr (phase C). Cores 1-3 are the control.
+                {
+                    extern volatile u64 g_icr_boundary[6][18];
+                    extern void gicv3_boundary_probe_send(void);
+                    u32 armed = 0;
+                    for (u32 t = 0; t < 3000000u && armed < 5u; t++) {
+                        armed = 0;
+                        for (u32 ci = 1; ci < 6u; ci++) {
+                            asm volatile("dc ivac, %0" :: "r"(&g_icr_boundary[ci][0]) : "memory");
+                            asm volatile("dsb sy" ::: "memory");
+                            if (g_icr_boundary[ci][0] >= 4ULL) armed++;
+                        }
+                        asm volatile("yield");
+                    }
+                    uart_puts(&console, "\r\n[BND] armed=");
+                    uart_put_hex(&console, armed);
+                    gicv3_boundary_probe_send();
+
+                    u32 done = 0;
+                    for (u32 t = 0; t < 6000000u && done < 5u; t++) {
+                        done = 0;
+                        for (u32 ci = 1; ci < 6u; ci++) {
+                            asm volatile("dc ivac, %0" :: "r"(&g_icr_boundary[ci][0]) : "memory");
+                            asm volatile("dsb sy" ::: "memory");
+                            u64 st = g_icr_boundary[ci][0];
+                            if (st == 4ULL || st == 8ULL || st == 10ULL) done++;
+                        }
+                        asm volatile("yield");
+                    }
+                    uart_puts(&console, " done=");
+                    uart_put_hex(&console, done);
+                    uart_puts(&console, "\r\n");
+
+                    for (u32 ci = 1; ci < 6u; ci++) {
+                        for (u32 k = 0; k < 18u; k++)
+                            asm volatile("dc ivac, %0" :: "r"(&g_icr_boundary[ci][k]) : "memory");
+                        asm volatile("dsb sy" ::: "memory");
+                        volatile u64 *b = g_icr_boundary[ci];
+                        uart_puts(&console, "[BND] core");
+                        uart_put_hex(&console, ci);
+                        uart_puts(&console, " step=");
+                        uart_put_hex(&console, b[0]);
+                        if (b[0] != 4ULL) {
+                            uart_puts(&console, (b[0] == 8ULL) ? " (go timeout)" : " (phase B incomplete)");
+                            uart_puts(&console, "\r\n");
+                            continue;
+                        }
+                        uart_puts(&console, " gicr_ctlr=0x");  uart_put_hex(&console, b[1]);
+                        uart_puts(&console, " icenabler=0x"); uart_put_hex(&console, b[2]);
+                        uart_puts(&console, " waker=0x");     uart_put_hex(&console, b[3]);
+                        uart_puts(&console, " icc_ctlr=0x");  uart_put_hex(&console, b[13]);
+                        uart_puts(&console, " icc_igrpen1_pre=0x"); uart_put_hex(&console, b[14]);
+                        uart_puts(&console, " post=0x"); uart_put_hex(&console, b[15]);
+                        uart_puts(&console, " daif=0x");      uart_put_hex(&console, b[16]);
+                        uart_puts(&console, "\r\n      sgi0: hppir_idle=0x");
+                        uart_put_hex(&console, b[4] & 0x3FFULL);
+                        uart_puts(&console, " -> hppir_now=0x");
+                        uart_put_hex(&console, b[9] & 0x3FFULL);
+                        uart_puts(&console, " | B1 pending->HPPIR: ");
+                        if ((b[9] & 0x3FFULL) != 0x3FFULL) {
+                            uart_puts(&console, "PASS intid=0x");
+                            uart_put_hex(&console, b[9] & 0x3FFULL);
+                        } else {
+                            uart_puts(&console, "FAIL");
+                        }
+                        uart_puts(&console, " | B3 vector entries=");
+                        uart_put_hex(&console, b[11]);
+                        uart_puts(&console, " magic=0x");
+                        uart_put_hex(&console, b[12]);
+                        uart_puts(&console, "\r\n");
+                    }
+                    /* Can the distributor even address the A72 cluster?
+                     * GICR_TYPER.Affinity_Value is what software uses to build the
+                     * frame -> PE map. If the frames at index 4 and 5 do not report
+                     * Aff1 = 1, then an SGI addressed to Aff1=1 has no frame to
+                     * deliver into and is dropped - which is exactly what the
+                     * per-core handler deltas above show. Read-only, run on core 0,
+                     * so it cannot perturb the measurement. */
+                    {
+                        volatile u64 *typer_rd = (volatile u64 *)(0xFEF00000ULL + 0x0008ULL);
+                        u64 gicd_typer = *(volatile u32 *)0xFEE00004ULL;
+                        u32 idbits = gicd_typer & 0x1Fu;
+                        uart_puts(&console, "\r\n[RTYPER] GICD_TYPER=0x");
+                        uart_put_hex(&console, gicd_typer);
+                        uart_puts(&console, " IDbits=");
+                        uart_put_hex(&console, idbits);
+                        uart_puts(&console, " Aff0w=");
+                        uart_put_hex(&console, idbits & 7u);
+                        uart_puts(&console, " Aff1w=");
+                        uart_put_hex(&console, (idbits >> 3) & 7u);
+                        uart_puts(&console, "\r\n");
+                        for (u32 f = 0; f < 6u; f++) {
+                            u64 t = typer_rd[f * (0x20000 / 8)];
+                            u32 lo = (u32)t;
+                            u64 aff = t >> 32;
+                            uart_puts(&console, "  frame");
+                            uart_put_hex(&console, f);
+                            uart_puts(&console, " typer=0x");
+                            uart_put_hex(&console, t);
+                            uart_puts(&console, " IDbits=");
+                            uart_put_hex(&console, lo & 0x1Fu);
+                            uart_puts(&console, " CAP=");
+                            uart_put_hex(&console, (lo >> 10) & 1u);
+                            uart_puts(&console, " SGI=");
+                            uart_put_hex(&console, (lo >> 8) & 1u);
+                            uart_puts(&console, " aff=");
+                            uart_put_hex(&console, aff);
+                            // Affinity_Value is bits [63:32] of GICR_TYPER, and inside
+                            // that 32-bit field Aff3/Aff2/Aff1/Aff0 sit at bit offsets
+                            // 24/16/8/0. Shifting `aff` by 32 again (as this did
+                            // before) made all four print zero.
+                            uart_puts(&console, " (a3=");
+                            uart_put_hex(&console, (u32)((aff >> 24) & 0xFFULL));
+                            uart_puts(&console, " a2=");
+                            uart_put_hex(&console, (u32)((aff >> 16) & 0xFFULL));
+                            uart_puts(&console, " a1=");
+                            uart_put_hex(&console, (u32)((aff >> 8) & 0xFFULL));
+                            uart_puts(&console, " a0=");
+                            uart_put_hex(&console, (u32)(aff & 0xFFULL));
+                            uart_puts(&console, ")\r\n");
+                        }
+                    }
+                    /* MPIDR of each PE, for a like-for-like comparison against the
+                     * Affinity_Value above. */
+                    {
+                        extern volatile u64 g_smp_pe_diag[6][8];
+                        uart_puts(&console, "[RTYPER] MPIDR per PE:\r\n");
+                        for (u32 f = 0; f < 6u; f++) {
+                            asm volatile("dc ivac, %0" :: "r"(&g_smp_pe_diag[f][0]) : "memory");
+                            asm volatile("dsb sy" ::: "memory");
+                            uart_puts(&console, "  pe");
+                            uart_put_hex(&console, f);
+                            uart_puts(&console, " mpidr=0x");
+                            uart_put_hex(&console, g_smp_pe_diag[f][3]);
+                            uart_puts(&console, "\r\n");
+                        }
+                    }
+
+                    /* Where did each SGI actually land? The pre-send snapshot was
+                     * taken on every target while its IRQs were masked, so any
+                     * delta below is attributable to the probe. A delta on a core
+                     * the SGI was not addressed to means the distributor routed it
+                     * somewhere wrong rather than dropping it. */
+                    extern volatile u64 g_irq_entry_count[6];
+                    extern volatile u64 g_icr_entry_pre[6];
+                    uart_puts(&console, "\r\n[BND] handler-entry delta per core (SGI0 sent to 1,2,3,4,5):\r\n");
+                    for (u32 ci = 0; ci < 6u; ci++) {
+                        asm volatile("dc ivac, %0" :: "r"(&g_irq_entry_count[ci]) : "memory");
+                        asm volatile("dc ivac, %0" :: "r"(&g_icr_entry_pre[ci]) : "memory");
+                        asm volatile("dsb sy" ::: "memory");
+                        uart_puts(&console, "   core");
+                        uart_put_hex(&console, ci);
+                        uart_puts(&console, " delta=");
+                        uart_put_hex(&console, g_irq_entry_count[ci] - g_icr_entry_pre[ci]);
+                        uart_puts(&console, "\r\n");
+                    }
+                }
+
+uart_puts(&console, " [GICCLK] CON12=0x"); uart_put_hex(&console, g12);
         uart_puts(&console, " | A72 b2g="); uart_put_hex(&console, (g12 >> 4) & 1u);
         uart_puts(&console, " g2b=");        uart_put_hex(&console, (g12 >> 3) & 1u);
         uart_puts(&console, " | A53 b2g="); uart_put_hex(&console, (g12 >> 11) & 1u);

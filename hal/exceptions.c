@@ -6,6 +6,14 @@
 // Set by IRQ handler; cleared + drained by main loop.
 volatile u32 gmac_rx_pending = 0;
 
+// Phase 2: SGI counters per core (cache-line aligned)
+volatile u64 __attribute__((aligned(64))) sgi_counters[6][4];  // 6 cores, 4 SGI types
+
+// Phase 2: Pipe-it stage handlers (weak - linked from pipeit.c if present)
+__attribute__((weak)) void pipeit_sgi_hidden(u64 arg)  { (void)arg; }
+__attribute__((weak)) void pipeit_sgi_output(u64 arg) { (void)arg; }
+__attribute__((weak)) void pipeit_sgi_done(u64 arg)   { (void)arg; }
+
 // Context structure saved by vectors.s
 // CRITICAL: Must match SAVE_CONTEXT layout exactly!
 // Layout: x0-x30 (31 regs * 8 = 248 bytes) in 256-byte frame
@@ -95,12 +103,81 @@ void handle_sync_exception(exception_context_t* ctx) {
     extern uart_t console;
     uart_puts(&console, "\r\n[FATAL] Synchronous Exception!\r\n");
     dump_regs(ctx);
-    while(1);
+    // Deliberate panic halt, not a bug and not an accidental spin. A
+    // synchronous exception or an SError on this PE leaves nothing sane to
+    // return to: the register frame has already been dumped, and continuing
+    // would execute whatever happens to follow a fault we did not expect.
+    // The wfi is a real instruction with side effects, which is also what stops
+    // -fanalyzer from reporting this loop as an unintentional infinite loop.
+    for (;;) { asm volatile("wfi"); }
 }
+
+/*
+ * H-Exo: witness that the IRQ vector was actually entered, on this PE.
+ *
+ * The A72 investigation reached a hard boundary: an SGI latches in the A72's own
+ * GICR_ISPENDR0 and is never delivered. Everything up to the pending bit is
+ * verified correct. These counters are the first witness past the Distributor -
+ * they are written from inside the exception handler, BEFORE anything is
+ * acknowledged, so a non-zero value proves the vector was reached and a zero
+ * value proves the interrupt died somewhere between ISPENDR and the vector.
+ *
+ * Deliberately independent of gicv3_ack_irq(): if the ack itself faulted we would
+ * otherwise never know the handler had run at all.
+ */
+volatile u64 g_irq_entry_count[6];
+volatile u64 g_irq_entry_magic[6];
+volatile u64 g_irq_last_intid[6];
 
 void handle_irq_exception(exception_context_t* ctx) {
     (void)ctx;
+    u64 mp;
+    asm volatile("mrs %0, mpidr_el1" : "=r"(mp));
+    u32 a0 = (u32)(mp & 0xFF);
+    u32 a1 = (u32)((mp >> 8) & 0xFF);
+    u32 c  = a1 ? (a0 + 4u) : a0;
+    if (c < 6u) {
+        g_irq_entry_count[c]++;
+        g_irq_entry_magic[c] = 0x495251454E54524FULL;  /* "IRQENTR" */
+        /* Clean to DRAM: the A72 cluster does not snoop A53 stores, so core 0
+         * would otherwise read back a stale zero and conclude the vector was
+         * never entered. Same defect as the workqueue slot - do not repeat it. */
+        asm volatile("dc civac, %0" :: "r"(&g_irq_entry_count[c]) : "memory");
+        asm volatile("dc civac, %0" :: "r"(&g_irq_entry_magic[c]) : "memory");
+        asm volatile("dsb sy" ::: "memory");
+    }
     u32 intid = gicv3_ack_irq();
+    if (c < 6u) g_irq_last_intid[c] = (u64)intid;
+    
+    // Phase 2: SGI dispatch (INTIDs 0-15)
+    if (intid < 16) {
+        u64 mpidr;
+        asm volatile("mrs %0, mpidr_el1" : "=r"(mpidr));
+        u32 aff0 = (u32)(mpidr & 0xFF);
+        u32 aff1 = (u32)((mpidr >> 8) & 0xFF);
+        u32 core = (aff1 ? (aff0 + 4u) : aff0);
+        if (core < 6 && intid < 4) sgi_counters[core][intid]++;
+        
+        switch (intid) {
+            case SGI_STAGE_INPUT:
+                // Input stage is now inline on Core 0 (submit_frame)
+                break;
+            case SGI_STAGE_HIDDEN:
+                pipeit_sgi_hidden(0);
+                break;
+            case SGI_STAGE_OUTPUT:
+                pipeit_sgi_output(0);
+                break;
+            case SGI_STAGE_DONE:
+                pipeit_sgi_done(0);
+                break;
+            default:
+                break;
+        }
+        gicv3_eoi_irq(intid);
+        return;
+    }
+    
     if (intid == GMAC_GIC_INTID) {
         gmac_clear_irq();
         gmac_rx_pending = 1;
@@ -112,13 +189,53 @@ void handle_irq_exception(exception_context_t* ctx) {
 }
 
 void handle_fiq_exception(exception_context_t* ctx) {
-    extern uart_t console;
-    uart_puts(&console, "[FIQ]\r\n");
+    (void)ctx;
+    // Fallback path: some firmware/security configurations can expose SGI as
+    // Group0 (FIQ path) instead of Group1 IRQ. Drain IAR0 and dispatch SGIs
+    // exactly like IRQ handler.
+    u64 iar0;
+    asm volatile("mrs %0, S3_0_C12_C8_0" : "=r"(iar0));   // ICC_IAR0_EL1
+    u32 intid = (u32)iar0;
+
+    if (intid < 16) {
+        u64 mpidr;
+        asm volatile("mrs %0, mpidr_el1" : "=r"(mpidr));
+        u32 aff0 = (u32)(mpidr & 0xFF);
+        u32 aff1 = (u32)((mpidr >> 8) & 0xFF);
+        u32 core = (aff1 ? (aff0 + 4u) : aff0);
+        if (core < 6 && intid < 4) sgi_counters[core][intid]++;
+
+        switch (intid) {
+            case SGI_STAGE_INPUT:
+                break;
+            case SGI_STAGE_HIDDEN:
+                pipeit_sgi_hidden(0);
+                break;
+            case SGI_STAGE_OUTPUT:
+                pipeit_sgi_output(0);
+                break;
+            case SGI_STAGE_DONE:
+                pipeit_sgi_done(0);
+                break;
+            default:
+                break;
+        }
+    }
+    if (intid != 1023u) {
+        asm volatile("msr S3_0_C12_C8_1, %0" :: "r"((u64)intid)); // ICC_EOIR0_EL1
+        asm volatile("isb");
+    }
 }
 
 void handle_serror_exception(exception_context_t* ctx) {
     extern uart_t console;
     uart_puts(&console, "[FATAL] SError Exception!\r\n");
     dump_regs(ctx);
-    while(1);
+    // Deliberate panic halt, not a bug and not an accidental spin. A
+    // synchronous exception or an SError on this PE leaves nothing sane to
+    // return to: the register frame has already been dumped, and continuing
+    // would execute whatever happens to follow a fault we did not expect.
+    // The wfi is a real instruction with side effects, which is also what stops
+    // -fanalyzer from reporting this loop as an unintentional infinite loop.
+    for (;;) { asm volatile("wfi"); }
 }

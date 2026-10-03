@@ -594,7 +594,24 @@ result_t smp_init(void) {
     {
         u8 *dst = (u8 *)TRAMP_PA;
         u8 *src = (u8 *)(uintptr_t)smp_trampoline;
-        u32 sz  = (u32)((u8 *)(uintptr_t)smp_trampoline_end - src);
+        // CWE-469: the two symbols are unrelated objects, so subtracting the
+        // pointers is undefined. If the linker ever placed them the other way
+        // round the difference went negative, wrapped to a huge u32, and the
+        // loop below wrote an arbitrary length over DRAM at TRAMP_PA.
+        // smp_trampoline is .align 12 and smp_trampoline_end sits exactly one
+        // page later (see the layout comment in boot.s), so anything outside
+        // (0, 0x1000] means the symbols are not what this code assumes.
+        u32 sz  = (u32)((uintptr_t)smp_trampoline_end - (uintptr_t)smp_trampoline);
+        if (sz == 0u || sz > 0x1000u) {
+            // Deliberately NOT a halt: this runs before the secondaries are
+            // started, and a hang here would need a physical reset. Report it,
+            // copy nothing, and let boot continue so the failure is visible in
+            // the log next to the secondary-online count.
+            uart_puts(&console, "[SMP] FATAL trampoline size=");
+            uart_put_hex(&console, sz);
+            uart_puts(&console, " (expected 1..4096), copying nothing\r\n");
+            sz = 0u;
+        }
         for (u32 b = 0; b < sz; b++) dst[b] = src[b];
         // Clean copied code from dcache to DRAM, then invalidate icache.
         for (u32 b = 0; b < sz; b += 64)
@@ -1031,6 +1048,13 @@ void smp_secondary_main(u64 core_idx) {
     // Some firmware/security setups may expose SGI on Group0/FIQ path.
     asm volatile("msr daifclr, #3" ::: "memory");
     asm volatile("isb");
+
+    // Boundary probe phase B. It has to be here and not inside
+    // gicv3_init_cpu_iface(): before this instruction PSTATE.I is still 1, so
+    // no exception can be taken and "did the vector run" is unanswerable.
+    // Bounded internally and runs after the console is up, so a wedge here
+    // would still be recoverable over UART.
+    gicv3_probe_local_irq_path_b((u32)core_idx);
     u32 core_u32 = (u32)core_idx;
     { u64 _t0, _tnow; asm volatile("mrs %0, cntpct_el0" : "=r"(_t0)); do { asm volatile("mrs %0, cntpct_el0" : "=r"(_tnow)); } while (_tnow - _t0 < 12000ULL); }
     u32 waker_post = gicv3_read_waker(core_u32);

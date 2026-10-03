@@ -1,0 +1,14 @@
+{
+  "_comment": [
+    "Golden values for tools/verify.ps1. Regenerate with -Update and REVIEW",
+    "the diff: this file is the only thing standing between a change and",
+    "a silent behavioural difference. An unexplained change here is a bug",
+    "These bytes describe ONE compiler. If toolchain does not match,",
+    "verify skips the byte comparison and says so, instead of failing."
+  ],
+  "generated_by": "tools/verify.ps1 -Update",
+  "toolchain": "aarch64-none-elf-gcc.exe 15.2.1",
+  "size_bytes": 168360,
+  "crc32": "7cbfa9b5",
+  "sha256": "24529cc9a4d4d2ed3b51e4f4a9f7350a0e50a9926a5dda5c4bf3231fba04a099"
+}

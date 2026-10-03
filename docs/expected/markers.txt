@@ -1,0 +1,41 @@
+# Golden-log contract for H-Exo.
+#
+# One structural marker per line. tools/check_markers.ps1 checks a captured UART
+# log against this file with Select-String, so it runs offline: no board, no
+# serial port, no flashing. tools/verify.ps1 does the same when given -Log.
+#
+# Why this exists: verify_phases.ps1 needs a COM port, so the only previous check
+# of boot behaviour was "someone had the board". A log that silently loses a phase
+# used to be invisible until it showed up as a mysterious throughput number.
+#
+# These markers are deliberately STRUCTURAL, not numeric. Cycle counts, iteration
+# counts and timings change run to run; pinning them would make the contract a
+# noise generator and people would start skipping it.
+#
+# Lines starting with '#' are comments. Lines starting with '@' are INFORMATIONAL:
+# printed in the report but a miss does NOT fail the run. Use '@' for diagnostic
+# blocks that a given experiment may legitimately remove.
+#
+# ---------------------------------------------------------------------------
+
+# --- core boot chain: a healthy run must reach all of these -------------------
+[SMP] entry(_start)=
+[SMP] trampoline @0x
+[SMP] CPU_ON core
+ONLINE after
+[GIC_DIAG2]
+[PE_DIAG]
+[PIPE_DIAG]
+[BASELINE_A72]
+[PIPE_BENCH]
+[RUNTIME] inference
+
+# --- informational: expected today, but removable without failing -------------
+@ [SGI_TEST]
+@ [BND]
+@ [RTYPER]
+@ [GICCLK]
+@ [L2ACTLR_DIAG]
+@ [ADB400]
+@ A72_PROBE_A
+
