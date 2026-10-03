@@ -913,56 +913,82 @@ void kmain(void) {
                         uart_put_hex(&console, b[12]);
                         uart_puts(&console, "\r\n");
                     }
-                    /* Can the distributor even address the A72 cluster?
-                     * GICR_TYPER.Affinity_Value is what software uses to build the
-                     * frame -> PE map. If the frames at index 4 and 5 do not report
-                     * Aff1 = 1, then an SGI addressed to Aff1=1 has no frame to
-                     * deliver into and is dropped - which is exactly what the
-                     * per-core handler deltas above show. Read-only, run on core 0,
-                     * so it cannot perturb the measurement. */
+                    /* Dense sweep of the whole redistributor region.
+                     *
+                     * Reading six frames at a 0x20000 stride produced GICR_TYPER
+                     * values that cannot all be real: IDbits of 1 for five frames and
+                     * 17 for the sixth, CAP alternating 0/1, SGI alternating, while
+                     * GICD_TYPER.IDbits is 8 and no frame agrees with it. Either the
+                     * stride is wrong, or we are not reading TYPER at all.
+                     *
+                     * The discriminator is GICR_IIDR, not TYPER. Every redistributor
+                     * in an implementation reports the same implementer/revision as
+                     * the distributor, and we have already measured GICD_IIDR as
+                     * 0x0041143B. An offset where IIDR reads back that value IS a
+                     * redistributor RD_base frame, whatever else lives nearby.
+                     *
+                     * Read-only, on core 0, before interrupts are unmasked, so it
+                     * cannot perturb the delivery measurement it exists to explain. */
                     {
-                        volatile u64 *typer_rd = (volatile u64 *)(0xFEF00000ULL + 0x0008ULL);
                         u64 gicd_typer = *(volatile u32 *)0xFEE00004ULL;
+                        u32 gicd_iidr  = *(volatile u32 *)0xFEE00008ULL;
                         u32 idbits = gicd_typer & 0x1Fu;
-                        uart_puts(&console, "\r\n[RTYPER] GICD_TYPER=0x");
+                        u32 probes = 0, iidr_hits = 0, typer_hits = 0, printed = 0;
+                        uart_puts(&console, "\r\n[RSWEEP] GICD_TYPER=0x");
                         uart_put_hex(&console, gicd_typer);
                         uart_puts(&console, " IDbits=");
                         uart_put_hex(&console, idbits);
-                        uart_puts(&console, " Aff0w=");
-                        uart_put_hex(&console, idbits & 7u);
-                        uart_puts(&console, " Aff1w=");
-                        uart_put_hex(&console, (idbits >> 3) & 7u);
+                        uart_puts(&console, " GICD_IIDR=0x");
+                        uart_put_hex(&console, gicd_iidr);
                         uart_puts(&console, "\r\n");
-                        for (u32 f = 0; f < 6u; f++) {
-                            u64 t = typer_rd[f * (0x20000 / 8)];
-                            u32 lo = (u32)t;
-                            u64 aff = t >> 32;
-                            uart_puts(&console, "  frame");
-                            uart_put_hex(&console, f);
+                        /* 0x1000 granularity over 768 KiB: if the real frames are
+                         * 64 KiB (RD_base only) or 128 KiB (RD_base + SGI), they are
+                         * 4 KiB aligned and cannot hide between samples. */
+                        for (u32 off = 0; off < 0xC0000u; off += 0x1000u) {
+                            uintptr_t base = 0xFEF00000ULL + (uintptr_t)off;
+                            u32 iidr = *(volatile u32 *)(base + 0x04);
+                            u64 t    = *(volatile u64 *)(base + 0x08);
+                            u32 lo   = (u32)t;
+                            u64 aff  = t >> 32;
+                            probes++;
+                            u32 idb = lo & 0x1Fu;
+                            u32 cap = (lo >> 10) & 1u;
+                            u32 sgi = (lo >> 8) & 1u;
+                            u32 iidrok = (iidr == gicd_iidr) ? 1u : 0u;
+                            u32 look = iidrok | cap | (aff != 0u ? 1u : 0u);
+                            if (look == 0u) continue;       /* silent: not a frame */
+                            if (iidrok) iidr_hits++;
+                            if (cap && sgi) typer_hits++;
+                            if (printed >= 48u) continue;   /* cap the log, keep counting */
+                            printed++;
+                            uart_puts(&console, "  +0x");
+                            uart_put_hex(&console, off);
+                            uart_puts(&console, " iidr=0x");
+                            uart_put_hex(&console, iidr);
+                            uart_puts(&console, iidrok ? "*" : " ");
                             uart_puts(&console, " typer=0x");
                             uart_put_hex(&console, t);
-                            uart_puts(&console, " IDbits=");
-                            uart_put_hex(&console, lo & 0x1Fu);
-                            uart_puts(&console, " CAP=");
-                            uart_put_hex(&console, (lo >> 10) & 1u);
-                            uart_puts(&console, " SGI=");
-                            uart_put_hex(&console, (lo >> 8) & 1u);
-                            uart_puts(&console, " aff=");
+                            uart_puts(&console, " idb=");
+                            uart_put_hex(&console, idb);
+                            uart_puts(&console, " cap=");
+                            uart_put_hex(&console, cap);
+                            uart_puts(&console, " sgi=");
+                            uart_put_hex(&console, sgi);
+                            uart_puts(&console, " aff=0x");
                             uart_put_hex(&console, aff);
-                            // Affinity_Value is bits [63:32] of GICR_TYPER, and inside
-                            // that 32-bit field Aff3/Aff2/Aff1/Aff0 sit at bit offsets
-                            // 24/16/8/0. Shifting `aff` by 32 again (as this did
-                            // before) made all four print zero.
-                            uart_puts(&console, " (a3=");
-                            uart_put_hex(&console, (u32)((aff >> 24) & 0xFFULL));
-                            uart_puts(&console, " a2=");
-                            uart_put_hex(&console, (u32)((aff >> 16) & 0xFFULL));
-                            uart_puts(&console, " a1=");
+                            uart_puts(&console, " (a1=");
                             uart_put_hex(&console, (u32)((aff >> 8) & 0xFFULL));
                             uart_puts(&console, " a0=");
                             uart_put_hex(&console, (u32)(aff & 0xFFULL));
                             uart_puts(&console, ")\r\n");
                         }
+                        uart_puts(&console, "[RSWEEP] probed=");
+                        uart_put_hex(&console, probes);
+                        uart_puts(&console, " IIDR-matches=");
+                        uart_put_hex(&console, iidr_hits);
+                        uart_puts(&console, " CAP&SGI=");
+                        uart_put_hex(&console, typer_hits);
+                        uart_puts(&console, "\r\n");
                     }
                     /* MPIDR of each PE, for a like-for-like comparison against the
                      * Affinity_Value above. */
