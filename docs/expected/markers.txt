@@ -39,4 +39,5 @@ ONLINE after
 @ [ADB400]
 @ A72_PROBE_A
 @ [A72WAKE]
+@ [LOADTEST]
 

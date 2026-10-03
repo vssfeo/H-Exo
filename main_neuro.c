@@ -1761,7 +1761,12 @@ uart_puts(&console, " [GICCLK] CON12=0x"); uart_put_hex(&console, g12);
     // Now that IRQ is unmasked, SGI can reach core 4/5.
     // Submit frames and measure end-to-end latency + per-stage cycles.
     {
-        const u32 PIPE_BENCH_COUNT = 1000;
+        // 10000 frames: at ~10.6us/frame the run is ~106 ms, still trivial
+        // against the boot budget, but gives 10x the tail-latency samples.
+        // Progress prints thinned to every 2500 so UART stays out of the
+        // measurement (100 lines of UART inside the window was itself a
+        // perturbation at the old cadence).
+        const u32 PIPE_BENCH_COUNT = 10000;
         telemetry_t bench_tel;
         bench_tel.cpu_load = 0x10000;
         bench_tel.l2_latency_us = 0x20000;
@@ -1784,6 +1789,20 @@ uart_puts(&console, " [GICCLK] CON12=0x"); uart_put_hex(&console, g12);
 
         u64 t_pipe_start = read_cntpct();
 
+        // [LOADTEST] per-phase accounting. The bench is closed-loop (submit ->
+        // wait completion -> submit), so its number is single-frame LATENCY,
+        // not a throughput ceiling. cntpct_el0 (24 MHz) is a system counter
+        // common to every PE, so cross-core deltas are valid. Phases:
+        //   P1 submit   core 0: submit call incl. cvac/dsb/sev
+        //   P2 wake     submit exit -> worker sees the bell (detect or WFE wake)
+        //   P3 compute  fused hidden+output on core 4
+        //   P4 complete completion publication (cvac + dsb + bell)
+        //   P5 done     bell published -> producer's spin observes it
+        u64 p1s=0,p1n=~0ULL,p1x=0, p2s=0,p2n=~0ULL,p2x=0;
+        u64 p3s=0,p3n=~0ULL,p3x=0, p4s=0,p4n=~0ULL,p4x=0;
+        u64 p5s=0,p5n=~0ULL,p5x=0, pts=0,ptn=~0ULL,ptx=0;
+        u64 lt_valid=0, lt_raced=0, lt_overlap=0;
+
         u32 timeout_frames = 0;
         u32 submit_invalid = 0;
         u32 submit_oom = 0;
@@ -1791,6 +1810,7 @@ uart_puts(&console, " [GICCLK] CON12=0x"); uart_put_hex(&console, g12);
         u32 submit_ok = 0;
         for (u32 i = 0; i < PIPE_BENCH_COUNT; i++) {
             u32 frame_id;
+            u64 t_se = read_cntpct() & 0xFFFFFFFFFFFFULL;
             result_t sub = pipeit_submit_frame(&g_pipeit, &bench_tel, &frame_id);
             if (sub == ERR_OUT_OF_MEMORY) {
                 u64 t_retry = read_cntpct();
@@ -1799,6 +1819,7 @@ uart_puts(&console, " [GICCLK] CON12=0x"); uart_put_hex(&console, g12);
                 }
                 sub = pipeit_submit_frame(&g_pipeit, &bench_tel, &frame_id);
             }
+            u64 t_sx = read_cntpct() & 0xFFFFFFFFFFFFULL;
 
             if (sub != OK) {
                 if (sub == ERR_INVALID_PARAM) submit_invalid++;
@@ -1818,7 +1839,45 @@ uart_puts(&console, " [GICCLK] CON12=0x"); uart_put_hex(&console, g12);
             }
             if (timed_out) timeout_frames++;
 
-            if (((i + 1) % 100) == 0) {
+            // [LOADTEST] harvest the frame's timestamps. Tag = low 16 bits of
+            // the hidden_pending counter; all three slots must carry it or the
+            // frame is excluded (raced) rather than skewing the averages.
+            {
+                u64 t_ds = read_cntpct() & 0xFFFFFFFFFFFFULL;
+                u64 tag = ((u64)(g_pipeit_hidden_pending & 0xFFFFULL)) << 48;
+                u64 ts1 = PIPEIT_NC_TS_PICKUP;
+                u64 ts2 = PIPEIT_NC_TS_COMPUTE;
+                u64 ts3 = PIPEIT_NC_TS_BELL;
+                if (!timed_out && tag != 0 &&
+                    (ts1 & 0xFFFF000000000000ULL) == tag &&
+                    (ts2 & 0xFFFF000000000000ULL) == tag &&
+                    (ts3 & 0xFFFF000000000000ULL) == tag) {
+                    u64 q1 = ts1 & 0xFFFFFFFFFFFFULL;
+                    u64 q2 = ts2 & 0xFFFFFFFFFFFFULL;
+                    u64 q3 = ts3 & 0xFFFFFFFFFFFFULL;
+                    u64 v;
+                    v = t_sx - t_se; p1s+=v; if(v<p1n)p1n=v; if(v>p1x)p1x=v;
+                    // The worker can see the NC bell BEFORE submit returns:
+                    // hidden_pending++ lands in DRAM mid-submit, ahead of the
+                    // dsb sy that drains the data cvacs. q1 < t_sx is therefore
+                    // legitimate pipeline overlap, not a negative latency -
+                    // clamp to 0 and count it instead of wrapping unsigned.
+                    if (q1 >= t_sx) {
+                        v = q1 - t_sx; p2s+=v; if(v<p2n)p2n=v; if(v>p2x)p2x=v;
+                    } else {
+                        lt_overlap++;
+                    }
+                    v = q2 - q1;     p3s+=v; if(v<p3n)p3n=v; if(v>p3x)p3x=v;
+                    v = q3 - q2;     p4s+=v; if(v<p4n)p4n=v; if(v>p4x)p4x=v;
+                    v = t_ds - q3;   p5s+=v; if(v<p5n)p5n=v; if(v>p5x)p5x=v;
+                    v = t_ds - t_se; pts+=v; if(v<ptn)ptn=v; if(v>ptx)ptx=v;
+                    lt_valid++;
+                } else {
+                    lt_raced++;
+                }
+            }
+
+            if (((i + 1) % 2500) == 0) {
                 uart_puts(&console, "[PIPE_BENCH] progress=0x");
                 uart_put_hex(&console, i + 1);
                 uart_puts(&console, " completed=0x");
@@ -1836,6 +1895,66 @@ uart_puts(&console, " [GICCLK] CON12=0x"); uart_put_hex(&console, g12);
         u64 pipe_avg_ns = completed_frames ?
             ((pipe_elapsed_ticks * 125) / (completed_frames * 3)) : 0;
         
+        // [LOADTEST] report: per-phase avg/min/max in ns (24 MHz ticks * 125/3),
+        // throughput, and the single-core A72 reference from BASELINE_A72 in the
+        // same boot. The ratio answers "why microseconds when the compute is
+        // nanoseconds" with a measured split instead of an argument.
+        {
+            #define LT_NS(t)  (((t) * 125ULL) / 3ULL)
+            #define LT_AVG(sum,cnt) ((cnt) ? LT_NS((sum)/(cnt)) : 0ULL)
+            #define LT_MIN(mn,cnt)  ((cnt) ? LT_NS((mn)==~0ULL?0ULL:(mn)) : 0ULL)
+            #define LT_ROW(label, sm, mn, mx) \
+                do { \
+                    uart_puts(&console, "[LOADTEST] " label " avg_ns=0x"); \
+                    uart_put_hex(&console, LT_AVG(sm, lt_valid)); \
+                    uart_puts(&console, " min_ns=0x"); \
+                    uart_put_hex(&console, LT_MIN(mn, lt_valid)); \
+                    uart_puts(&console, " max_ns=0x"); \
+                    uart_put_hex(&console, LT_NS(mx)); \
+                    uart_puts(&console, "\r\n"); \
+                } while (0)
+            uart_puts(&console, "\r\n[LOADTEST] n=0x");
+            uart_put_hex(&console, (u64)PIPE_BENCH_COUNT);
+            uart_puts(&console, " valid=0x");
+            uart_put_hex(&console, lt_valid);
+            uart_puts(&console, " raced=0x");
+            uart_put_hex(&console, lt_raced);
+            uart_puts(&console, " overlap=0x");
+            uart_put_hex(&console, lt_overlap);
+            uart_puts(&console, " timeouts=0x");
+            uart_put_hex(&console, (u64)timeout_frames);
+            uart_puts(&console, "\r\n");
+            LT_ROW("P1 submit   (core0 cvac/dsb/sev)", p1s, p1n, p1x);
+            {
+                u64 p2c = lt_valid - lt_overlap;
+                uart_puts(&console, "[LOADTEST] P2 wake     (bell -> worker sees) avg_ns=0x");
+                uart_put_hex(&console, p2c ? (((p2s / p2c) * 125ULL) / 3ULL) : 0ULL);
+                uart_puts(&console, " min_ns=0x");
+                uart_put_hex(&console, (p2c && p2n != ~0ULL) ? ((p2n * 125ULL) / 3ULL) : 0ULL);
+                uart_puts(&console, " max_ns=0x");
+                uart_put_hex(&console, p2c ? ((p2x * 125ULL) / 3ULL) : 0ULL);
+                uart_puts(&console, " (overlapped frames excluded)\r\n");
+            }
+            LT_ROW("P3 compute  (fused hidden+out) ", p3s, p3n, p3x);
+            LT_ROW("P4 complete (cvac/dsb/bell)    ", p4s, p4n, p4x);
+            LT_ROW("P5 done     (bell -> producer) ", p5s, p5n, p5x);
+            LT_ROW("TOTAL per frame              ", pts, ptn, ptx);
+            #undef LT_ROW
+            #undef LT_MIN
+            #undef LT_AVG
+            #undef LT_NS
+            u64 fps = pipe_elapsed_ticks ? (((u64)PIPE_BENCH_COUNT) * 24000000ULL) / pipe_elapsed_ticks : 0;
+            uart_puts(&console, "[LOADTEST] throughput_fps=0x");
+            uart_put_hex(&console, fps);
+            uart_puts(&console, " a72_single_ns=0x");
+            uart_put_hex(&console, g_a72_baseline.avg_ns);
+            u64 tot_avg = lt_valid ? ((pts / lt_valid) * 125ULL) / 3ULL : 0;
+            u64 ratio = g_a72_baseline.avg_ns ? (tot_avg * 1000ULL) / g_a72_baseline.avg_ns : 0;
+            uart_puts(&console, " latency_ratio_x1000=0x");
+            uart_put_hex(&console, ratio);
+            uart_puts(&console, "\r\n");
+        }
+
         u64 avg_hidden_cyc = g_pipeit.hidden_count ? 
             g_pipeit.hidden_cycles_sum / g_pipeit.hidden_count : 0;
         u64 avg_output_cyc = g_pipeit.output_count ? 

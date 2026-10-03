@@ -161,6 +161,16 @@ static u32 pipeit_select_a72_sgi_mode(void)
 // Exported for smp_secondary_main to check if pipeline is active
 volatile u32 g_pipeit_active = 0;
 
+// [LOADTEST] timestamp plumbing - see pipeit.h for the slot format.
+static inline u64 pipeit_cntpct(void) {
+    u64 t;
+    asm volatile("mrs %0, cntpct_el0" : "=r"(t));
+    return t;
+}
+static u32 g_pipeit_ts_tag;
+#define PIPEIT_TS() \
+    ((pipeit_cntpct() & 0xFFFFFFFFFFFFULL) | ((u64)g_pipeit_ts_tag << 48))
+
 // Diagnostic counters: SGI send count per stage (producer side, core 0)
 volatile u64 g_pipeit_sgi_sent[4] = {0, 0, 0, 0};
 // Wake mode diagnostic: 0 = mailbox(SEV/WFE) only, 1 = mailbox + SGI assist.
@@ -446,8 +456,15 @@ void pipeit_sgi_hidden(u64 arg) {
     if (frame->result.migration_hint > 2) frame->result.migration_hint = 2;
     if (frame->result.power_state > 3) frame->result.power_state = 3;
     
+    // [LOADTEST] t_compute: fused hidden+output math done, before the
+    // completion publication (whose cvac+dsb cost is phase 4, measured next).
+    PIPEIT_NC_TS_COMPUTE = PIPEIT_TS();
     // Retire frame: signal OUTPUT (advances read_idx + SGI to core 0).
     pipeit_signal_stage(g_pipe, frame_idx, PIPE_STAGE_OUTPUT);
+    // [LOADTEST] t_bell: completion is published. Written a few ns after the
+    // bell itself; the producer's tag check discards the frame if it ever reads
+    // this slot before the store lands.
+    PIPEIT_NC_TS_BELL = PIPEIT_TS();
     g_pipeit_hidden_handler_exit++;
     g_pipeit_output_handler_enter++;
     g_pipeit_output_handler_exit++;
@@ -566,7 +583,11 @@ static inline u64 read_rpr(void) {
 }
 
 // Lock-free WFE/SEV mailbox workers (Level-2 design).
-// SGI on A72 is broken on RK3399 (GICR.ChildrenAsleep stuck), but the WFE/SEV
+// HISTORY: SGI on A72 was believed broken on RK3399 (GICR.ChildrenAsleep stuck).
+// Root-caused 2026-10-03 to H-Exo's own prewake writing GICR_WAKER.PS=0 before
+// CPU_ON; with that removed, SGI delivery works (see A72_INVESTIGATION_LOG.md
+// Resolution). The mailbox remains the shipping path until the SGI stage chain
+// (hidden->output->done) completes a full bench; the WFE/SEV
 // event mechanism uses a separate event register, NOT the GIC. SEV is broadcast
 // across the system (including across the CCI bridge between A53 and A72).
 // Strategy: adaptive spin (a few cycles of cheap polling for low-latency case),
@@ -615,6 +636,11 @@ void pipeit_worker_idle_hidden(void) {
             spin--;
         }
         last_seen = now;
+        // [LOADTEST] t_pickup: the instant the worker saw the bell, before the
+        // dispatch_idx invalidation - so the producer-side delta includes the
+        // full detection/wake latency, which is the phase under suspicion.
+        g_pipeit_ts_tag = (u32)(now & 0xFFFFu);
+        PIPEIT_NC_TS_PICKUP = PIPEIT_TS();
         g_pipeit_poll_hits_hidden += 1;
         // dispatch_idx is cacheable — invalidate before reading.
         asm volatile("dc ivac, %0" :: "r"(&g_pipe->buffer->dispatch_idx) : "memory");
