@@ -58,6 +58,24 @@ static u64 __attribute__((unused)) pipeit_sip_gicr_wake_try(u64 core, u64* befor
     return x0;
 }
 
+// Cross-cluster freshness for the SGI-chain IRQ path. The A72 cluster does
+// not snoop A53 stores and slot lines are reused across frames, so an ISR that
+// picks the frame MUST invalidate dispatch_idx + the frame slot before reading
+// them (workqueue lesson 2.1 in A72_INVESTIGATION_LOG.md: dmb orders but does
+// not write back). Bounded: sizeof(pipe_frame_t) fixed at build time.
+static inline void pipeit_ivac_frame_pickup(void) {
+    if (!g_buffer) return;
+    asm volatile("dc ivac, %0" :: "r"((void*)&g_buffer->dispatch_idx) : "memory");
+    uintptr_t base = (uintptr_t)g_buffer->frames;
+    uintptr_t end  = base + PIPE_BUF_COUNT * sizeof(pipe_frame_t);
+    for (; base < end; base += 64u) {
+        asm volatile("dc ivac, %0" :: "r"((void*)base) : "memory");
+    }
+    /* mode flag is written by core 0 (A53): invalidate before reading it */
+    asm volatile("dc ivac, %0" :: "r"((void*)&g_pipeit_use_sgi_a72) : "memory");
+    asm volatile("dsb sy" ::: "memory");
+}
+
 // Phase 2.1 (Plan v3.2 §2.1): Dual-path IPC primitive.
 //
 // Primary wake: SEV (system event). RK3399 SEV is broadcast across the CCI
@@ -142,16 +160,24 @@ static u32 pipeit_select_a72_sgi_mode(void)
     // prewake off those frames, BL31 completes the handshake by itself.)
     if (get4_st == 0 && get5_st == 0 &&
         (get4_w & (1ULL << 2)) == 0 && (get5_w & (1ULL << 2)) == 0) {
-        /* Delivery IS certified. But enabling the SGI-driven pipeline on the
-         * strength of that alone was measured premature (2026-10-03, first live
-         * run with mode=1): 317/1000 frames completed in 34 s against 1000/1000
-         * in ~11 ms for polling, with sgi_sent output=0 done=0 - the stage chain
-         * hidden->output->done is not wired end to end and had never executed
-         * before, because CA=1 made this selector return 0 on every prior boot.
-         * Polling stays the shipped mode until the chain completes a bench with
-         * zero timeouts. The capability is reported so the log shows why. */
-        uart_puts(&console, "[PIPEIT] SGI delivery certified; chain unproven "
-                            "(output/done sends=0 on first live run) - polling mode\r\n");
+        /* Delivery IS certified (2026-10-03: WAKER 0x4->0x0 on both A72 frames,
+         * SGI_TEST c4 irq_cnt 0->1, B1 pending->HPPIR PASS 5/5, core 4 handled
+         * 292 pipeline SGIs). The stage chain hidden->output->done is now being
+         * wired end-to-end as a GATED experiment (2026-10-04): workers sleep in
+         * WFI and are woken by the architected IRQ vector (handle_irq_exception
+         * -> pipeit_sgi_*). Polling stays the shipped default until the chain
+         * bench completes with zero timeouts and sgi_sent
+         * hidden==output==done==frames (see A72_INVESTIGATION_LOG.md, "What is
+         * NOT yet done" and tonight's plan). */
+#ifndef PIPEIT_SGI_ALLOW
+#define PIPEIT_SGI_ALLOW 1u
+#endif
+        if (PIPEIT_SGI_ALLOW) {
+            uart_puts(&console, "[PIPEIT] SGI chain enabled (gated experiment)\r\n");
+            return 1u;
+        }
+        uart_puts(&console, "[PIPEIT] SGI delivery certified; chain gated "
+                            "(PIPEIT_SGI_ALLOW=0) - polling mode\r\n");
         return 0u;
     }
 
@@ -190,13 +216,18 @@ volatile u64 g_pipeit_hidden_handler_exit  = 0;
 volatile u64 g_pipeit_output_handler_enter = 0;
 volatile u64 g_pipeit_output_handler_exit  = 0;
 
+// Done-stage witness on core 0: incremented by pipeit_sgi_done when the SGI
+// chain's final SGI(DONE) reaches the producer core. Polling mode never sends
+// it; a non-zero value proves the chain's last hop, not just the counters.
+volatile u64 g_pipeit_done_irq = 0;
+
 // Get frame index from write/read idx (wraps around PIPE_BUF_COUNT)
 #define FRAME_IDX(idx) ((idx) % PIPE_BUF_COUNT)
 
 // Initialize pipe-it pipeline
 result_t pipeit_init(pipeit_t* pipe, pipe_buffer_t* buf, const neural_weights_t* weights) {
     if (!pipe || !buf || !weights) return ERR_INVALID_PARAM;
-    
+
     pipe->buffer = buf;
     pipe->weights = weights;
     pipe->active = 0;
@@ -206,7 +237,7 @@ result_t pipeit_init(pipeit_t* pipe, pipe_buffer_t* buf, const neural_weights_t*
     pipe->output_cycles_sum = 0;
     pipe->hidden_count = 0;
     pipe->output_count = 0;
-    
+
     // Clear buffer
     for (u32 i = 0; i < PIPE_BUF_COUNT; i++) {
         buf->frames[i].frame_id = 0;
@@ -217,13 +248,13 @@ result_t pipeit_init(pipeit_t* pipe, pipe_buffer_t* buf, const neural_weights_t*
     buf->write_idx = 0;
     buf->frame_counter = 0;
     buf->dispatch_idx = 0;
-    
+
     // Initialize GICv3 SGI routing
     gicv3_sgi_init();
-    
+
     g_pipe = pipe;
     g_buffer = buf;
-    
+
     return OK;
 }
 
@@ -288,21 +319,21 @@ result_t pipeit_submit_frame(pipeit_t* pipe, const telemetry_t* input, u32* fram
     // Accept either active indicator to avoid transient desync between
     // cacheable global flag and per-instance active state during start.
     if (!g_pipeit_active && !pipe->active) return ERR_INVALID_PARAM;
-    
+
     pipe_buffer_t* buf = pipe->buffer;
     u32 write_idx = buf->write_idx;
     u32 read_idx = buf->read_idx;
-    
+
     // Check for buffer full (write catches read with 1 slot gap)
     if (((write_idx + 1) % PIPE_BUF_COUNT) == (read_idx % PIPE_BUF_COUNT)) {
         pipe->dropped_frames++;
         return ERR_OUT_OF_MEMORY;
     }
-    
+
     // Get frame slot
     u32 frame_idx = FRAME_IDX(write_idx);
     pipe_frame_t* frame = &buf->frames[frame_idx];
-    
+
     // Initialize frame — clear all stage bits first (stale OUTPUT from prev frame)
     buf->frame_counter++;
     frame->frame_id = buf->frame_counter;
@@ -311,16 +342,16 @@ result_t pipeit_submit_frame(pipeit_t* pipe, const telemetry_t* input, u32* fram
     asm volatile("dmb ish" ::: "memory");
     frame->stage_complete = 1u << PIPE_STAGE_INPUT;  // Input ready
     frame->processing_core = 0;
-    
+
     if (frame_id) *frame_id = frame->frame_id;
-    
+
     // Advance write pointer
     buf->write_idx = (write_idx + 1) % PIPE_BUF_COUNT;
-    
+
     // Update dispatch index for hidden worker
     buf->dispatch_idx = frame_idx;
     asm volatile("dmb ish" ::: "memory");
-    
+
     // PRIMARY signal: lock-free WFE/SEV mailbox.
     // RK3399 CCI-500 does NOT snoop A53↔A72, so cache maintenance is mandatory:
     // we must dc cvac the data + seq so they hit DRAM, and consumer dc ivac to
@@ -349,11 +380,11 @@ result_t pipeit_submit_frame(pipeit_t* pipe, const telemetry_t* input, u32* fram
 // Signal stage completion — called from SGI IRQ handler on worker core
 void pipeit_signal_stage(pipeit_t* pipe, u32 frame_idx, u32 stage) {
     if (!pipe || frame_idx >= PIPE_BUF_COUNT) return;
-    
+
     pipe_frame_t* frame = &pipe->buffer->frames[frame_idx];
     frame->stage_complete |= (1u << stage);
     asm volatile("dmb ish" ::: "memory");
-    
+
     switch (stage) {
         case PIPE_STAGE_HIDDEN:
             // FUSED design (Idea #2): output runs inline on core 4 in
@@ -361,10 +392,10 @@ void pipeit_signal_stage(pipeit_t* pipe, u32 frame_idx, u32 stage) {
             // would just be a wasted cross-CCU IPC. Core 5 worker stays in WFE.
             // This branch is therefore a no-op kept for ABI compat.
             break;
-            
+
         case PIPE_STAGE_OUTPUT:
             pipe->total_frames++;
-            pipe->buffer->read_idx = 
+            pipe->buffer->read_idx =
                 (pipe->buffer->read_idx + 1) % PIPE_BUF_COUNT;
             // Bell increment: NC memory (see pipeit.h). No dc cvac needed.
             // total_frames and read_idx are still cacheable for diagnostic
@@ -392,20 +423,46 @@ void pipeit_sgi_hidden(u64 arg) {
     (void)arg;
     g_pipeit_hidden_handler_enter++;
     if (!g_pipe || !g_pipeit_active) return;
-    
+
+    /* SGI-chain mode runs this as an ISR: the frame was published by core 0
+     * (A53). Invalidate before reading, or the A72 reads a stale slot line and
+     * "skips" an already-pending frame, silently stopping the chain. */
+    pipeit_ivac_frame_pickup();
+
     pipe_buffer_t* buf = g_pipe->buffer;
     u32 frame_idx = buf->dispatch_idx;
     if (frame_idx >= PIPE_BUF_COUNT) return;
-    
+
     pipe_frame_t* frame = &buf->frames[frame_idx];
-    
+
     // Skip if hidden already done for this frame
     if (frame->stage_complete & (1u << PIPE_STAGE_HIDDEN)) return;
-    
+    // Root-cause guard (2026-10-04): pipeit_start kicks core 4/5 with one
+    // HIDDEN and one OUTPUT SGI before the first frame exists. The IRQ path
+    // must NOT act on a frame the producer has not dispatched (no INPUT bit),
+    // or core 5 retires a phantom frame: read_idx advances, completion_seq
+    // goes to 1 and the first real submit hits the "buffer full" check
+    // (measured: sub0=0x2 ERR_OUT_OF_MEMORY, done irq n=0 before the bench).
+    if (!(frame->stage_complete & (1u << PIPE_STAGE_INPUT))) return;
+
+    if ((g_pipeit_hidden_handler_enter & 0x3FFu) == 1u) {
+        uart_puts(&console, "[CHAIN] hidden enter f=0x");
+        uart_put_hex(&console, frame->frame_id);
+        uart_puts(&console, " mode=0x");
+        uart_put_hex(&console, g_pipeit_use_sgi_a72);
+        uart_puts(&console, "\r\n");
+    }
+
     frame->processing_core = 4;
-    
+
+    /* [LOADTEST] chain mode: PICKUP = when this ISR saw the frame (tag =
+     * hidden_pending low16, NC-fresh read). Stamped BEFORE the compute so the
+     * P2 (wake) / P3 (compute) split is attributable. */
+    g_pipeit_ts_tag = (u32)(g_pipeit_hidden_pending & 0xFFFFu);
+    PIPEIT_NC_TS_PICKUP = PIPEIT_TS();
+
     const neural_weights_t* w = g_pipe->weights;
-    
+
     // Convert telemetry to fixed_t array
     fixed_t inputs[NEURO_INPUT_SIZE];
     inputs[0] = (fixed_t)frame->input.cpu_load;
@@ -414,10 +471,10 @@ void pipeit_sgi_hidden(u64 arg) {
     inputs[3] = (fixed_t)frame->input.thermal_state;
     inputs[4] = (fixed_t)frame->input.packet_rate;
     inputs[5] = (fixed_t)frame->input.node_count;
-    
+
     asm volatile("prfm pldl1keep, [%0]" :: "r"(w->w1));
     asm volatile("prfm pldl1keep, [%0]" :: "r"(w->w2));
-    
+
     // === Stage 1: hidden layer ===
     u64 cyc_start, cyc_mid, cyc_end;
     asm volatile("mrs %0, pmccntr_el0" : "=r"(cyc_start));
@@ -433,7 +490,7 @@ void pipeit_sgi_hidden(u64 arg) {
     g_pipe->hidden_cycles_sum += (cyc_mid - cyc_start);
     g_pipe->hidden_count++;
     frame->stage_complete |= (1u << PIPE_STAGE_HIDDEN);
-    
+
     // === Stage 2: output layer (FUSED inline, hidden array hot in L1) ===
     fixed_t outputs[NEURO_OUTPUT_SIZE];
     a72_output_layer_unrolled(
@@ -445,7 +502,7 @@ void pipeit_sgi_hidden(u64 arg) {
     asm volatile("mrs %0, pmccntr_el0" : "=r"(cyc_end));
     g_pipe->output_cycles_sum += (cyc_end - cyc_mid);
     g_pipe->output_count++;
-    
+
     for (u32 i = 0; i < NEURO_OUTPUT_SIZE; i++) {
         outputs[i] = sigmoid(outputs[i]);
     }
@@ -455,7 +512,21 @@ void pipeit_sgi_hidden(u64 arg) {
     frame->result.trust_score = (u8)(FIXED_TO_INT(outputs[3] * 255));
     if (frame->result.migration_hint > 2) frame->result.migration_hint = 2;
     if (frame->result.power_state > 3) frame->result.power_state = 3;
-    
+
+    if (g_pipeit_use_sgi_a72) {
+        /* ---- SGI CHAIN: hidden done, pass result to core 5 via SGI(OUTPUT).
+         * frame->hidden was written by this core; clean it to DRAM so core 0's
+         * diagnostics and the slot-reuse path on core 5 see fresh data (A72
+         * cluster does not snoop A53, and slot lines are reused across frames).
+         * [LOADTEST] t_compute in chain mode = hidden-stage completion. */
+        PIPEIT_NC_TS_COMPUTE = PIPEIT_TS();
+        asm volatile("dc civac, %0" :: "r"(frame->hidden) : "memory");
+        asm volatile("dsb sy" ::: "memory");
+        pipeit_ipi_signal_a72(SGI_STAGE_OUTPUT, 0x101);   /* to core 5 */
+        g_pipeit_sgi_sent[SGI_STAGE_OUTPUT]++;
+        g_pipeit_hidden_handler_exit++;
+        return;
+    }
     // [LOADTEST] t_compute: fused hidden+output math done, before the
     // completion publication (whose cvac+dsb cost is phase 4, measured next).
     PIPEIT_NC_TS_COMPUTE = PIPEIT_TS();
@@ -475,26 +546,38 @@ void pipeit_sgi_output(u64 arg) {
     (void)arg;
     g_pipeit_output_handler_enter++;
     if (!g_pipe || !g_pipeit_active) return;
-    
+
+    pipeit_ivac_frame_pickup();
+
     pipe_buffer_t* buf = g_pipe->buffer;
     // Output processes the same frame that hidden just completed
     u32 frame_idx = buf->dispatch_idx;
     if (frame_idx >= PIPE_BUF_COUNT) return;
-    
+
     pipe_frame_t* frame = &buf->frames[frame_idx];
-    
+
     // Skip if output already done
     if (frame->stage_complete & (1u << PIPE_STAGE_OUTPUT)) return;
-    
+    // Chain-order guard: output must only ever follow a completed hidden
+    // stage. Without it the start-of-pipeline OUTPUT kick retires a phantom
+    // frame from core 5 (see pipeit_sgi_hidden guard for the measured damage).
+    if (!(frame->stage_complete & (1u << PIPE_STAGE_HIDDEN))) return;
+
+    if ((g_pipeit_output_handler_enter & 0x3FFu) == 1u) {
+        uart_puts(&console, "[CHAIN] output enter f=0x");
+        uart_put_hex(&console, frame->frame_id);
+        uart_puts(&console, "\r\n");
+    }
+
     frame->processing_core = 5;
-    
+
     const neural_weights_t* w = g_pipe->weights;
     fixed_t outputs[NEURO_OUTPUT_SIZE];
-    
+
     // Per-stage PMU profiling: measure output layer cycles
     u64 cyc_start, cyc_end;
     asm volatile("mrs %0, pmccntr_el0" : "=r"(cyc_start));
-    
+
     // A72 NEON output layer (SMLAL, fully unrolled)
     a72_output_layer_unrolled(
         frame->hidden,
@@ -502,33 +585,60 @@ void pipeit_sgi_output(u64 arg) {
         w->b2,
         outputs
     );
-    
+
     asm volatile("mrs %0, pmccntr_el0" : "=r"(cyc_end));
     g_pipe->output_cycles_sum += (cyc_end - cyc_start);
     g_pipe->output_count++;
-    
+
     // Apply sigmoid and store results
     for (u32 i = 0; i < NEURO_OUTPUT_SIZE; i++) {
         outputs[i] = sigmoid(outputs[i]);
     }
-    
+
     frame->result.task_priority = (u8)(FIXED_TO_INT(outputs[0] * 255));
     frame->result.migration_hint = (u8)(FIXED_TO_INT(outputs[1] * 2));
     frame->result.power_state = (u8)(FIXED_TO_INT(outputs[2] * 3));
     frame->result.trust_score = (u8)(FIXED_TO_INT(outputs[3] * 255));
-    
+
     if (frame->result.migration_hint > 2) frame->result.migration_hint = 2;
     if (frame->result.power_state > 3) frame->result.power_state = 3;
-    
+
+    if (g_pipeit_use_sgi_a72) {
+        // Slot reuse: drop any stale copy of the hidden line (written by core 4,
+        // same cluster, but the slot round-robins and core 5 may hold an old
+        // frame's copy).
+        asm volatile("dc ivac, %0" :: "r"(frame->hidden) : "memory");
+        asm volatile("dsb sy" ::: "memory");
+    }
+
     // Signal completion → frame retired
     pipeit_signal_stage(g_pipe, frame_idx, PIPE_STAGE_OUTPUT);
+
+    if (g_pipeit_use_sgi_a72) {
+        /* ---- SGI CHAIN: output done -> SGI(DONE) to core 0. The completion
+         * bell was published by pipeit_signal_stage(); core 0 polls that NC
+         * counter, and this SGI is the chain's last hop witness (counted by
+         * pipeit_sgi_done). Stamp the bench BELL slot with the same tag so the
+         * latency phases stay valid in chain mode too. */
+        PIPEIT_NC_TS_BELL = ((pipeit_cntpct() & 0xFFFFFFFFFFFFULL) |
+                             ((u64)(g_pipeit_hidden_pending & 0xFFFFULL) << 48));
+        pipeit_ipi_signal_a72(SGI_STAGE_DONE, 0x000);   /* to core 0 */
+        g_pipeit_sgi_sent[SGI_STAGE_DONE]++;
+    }
     g_pipeit_output_handler_exit++;
 }
 
 // SGI handler: Frame done (runs on Core 0)
 void pipeit_sgi_done(u64 arg) {
     (void)arg;
-    // Frame retired — nothing to do, backpressure already released
+    // SGI chain witness on core 0: the producer already polls the NC
+    // completion bell; this merely proves the DONE SGI itself was delivered.
+    g_pipeit_done_irq++;
+    if ((g_pipeit_done_irq & 0x3FFu) == 1u) {
+        uart_puts(&console, "[CHAIN] done irq n=0x");
+        uart_put_hex(&console, g_pipeit_done_irq - 1u);
+        uart_puts(&console, "\r\n");
+    }
 }
 
 // Diagnostic counters for poll-vs-vector path. If polled_hits > 0 and the
@@ -612,8 +722,22 @@ static inline u64 read_rpr(void) {
 void pipeit_worker_idle_hidden(void) {
     pmu_init_local_a72();
     u64 last_seen = 0;
+    // Mode is written by core 0 (pipeit_start); re-read from DRAM on this A72.
+    asm volatile("dc ivac, %0" :: "r"(&g_pipeit_use_sgi_a72) : "memory");
+    asm volatile("dsb sy" ::: "memory");
     u32 use_sgi_drain = g_pipeit_use_sgi_a72;
     while (g_pipe && g_pipeit_active) {
+        if (use_sgi_drain) {
+            /* SGI CHAIN: work arrives as GIC SGI -> IRQ vector ->
+             * handle_irq_exception -> pipeit_sgi_hidden. This core sleeps; it
+             * does NOT poll the NC bell and does NOT call the handler directly
+             * (which would double-process a frame). */
+            asm volatile("dc ivac, %0" :: "r"(&g_pipeit_active) : "memory");
+            asm volatile("dsb sy" ::: "memory");
+            if (!g_pipeit_active) return;
+            asm volatile("wfi" ::: "memory");
+            continue;
+        }
         g_pipeit_loop_iter_hidden += 1;
         // Adaptive spin: fast path for back-to-back submissions.
         // ivac fires every other iteration (cheap volatile read in between);
@@ -663,8 +787,17 @@ void pipeit_worker_idle_hidden(void) {
 void pipeit_worker_idle_output(void) {
     pmu_init_local_a72();
     u64 last_seen = 0;
+    asm volatile("dc ivac, %0" :: "r"(&g_pipeit_use_sgi_a72) : "memory");
+    asm volatile("dsb sy" ::: "memory");
     u32 use_sgi_drain = g_pipeit_use_sgi_a72;
     while (g_pipe && g_pipeit_active) {
+        if (use_sgi_drain) {
+            asm volatile("dc ivac, %0" :: "r"(&g_pipeit_active) : "memory");
+            asm volatile("dsb sy" ::: "memory");
+            if (!g_pipeit_active) return;
+            asm volatile("wfi" ::: "memory");
+            continue;
+        }
         g_pipeit_loop_iter_output += 1;
         // Output bell is NC. (Note: in the FUSED design this loop is
         // effectively dormant — pipeit_submit_frame never increments

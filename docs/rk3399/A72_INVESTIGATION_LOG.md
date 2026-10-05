@@ -363,3 +363,42 @@ measured while the core was off against an A72 value measured at delivery time.
 Every hypothesis elimination in this log should state *when* each side of the
 comparison was measured. The reversal was found by re-reading the WAKER values
 at the delivery instant from both clusters in one run.
+
+## SGI chain completed and certified (2026-10-04)
+
+The stage chain hidden->output->done is now wired end-to-end via SGI and passed
+the certification gate in two consecutive boots (images b7dc2687, ca1f119c):
+
+```text
+[PIPEIT] A72 SGI mode=0x1  (remote: "chain unproven - polling mode")
+[PIPE_DIAG] sgi_sent: hidden=0x2710 output=0x2710 done=0x2710 mode=0x1 done_irq=0x2710
+[PIPE_BENCH] completed=10000 timeouts=0  avg_ns=18.7 us/frame
+[LOADTEST]   valid=10000 raced=0 timeouts=0  TOTAL avg=10.0 us/frame
+[SGI_TOTAL]  core0=10064 core1=66 core2=65 core3=65 core4=10067 core5=10066
+```
+
+Design (approved): polling stays the algorithms-of-record fallback; SGI is a
+gated experiment (PIPEIT_SGI_ALLOW) using WFI-sleeping workers woken by the
+architected IRQ vector. Chain: core0 submit+bell -> SGI(HIDDEN) -> core4 hidden
+compute -> SGI(OUTPUT) -> core5 output compute -> signal_stage + SGI(DONE) ->
+core0 done IRQ. Ordering across the non-snooping A53<->A72 boundary: dc cvac
+before each hop publish, dc ivac (whole slots) before each hop read - the
+workqueue 2.1 lesson applied to the IRQ path.
+
+Defects found while wiring (all by measurement, then fixed):
+1. Start-of-pipeline kick SGIs retired a PHANTOM frame on core5 (no INPUT bit):
+   read_idx advanced, completion_seq=1, and the first real submit got
+   ERR_OUT_OF_MEMORY (sub0=0x2). Fix: chain-order guards - hidden requires
+   stage_complete&INPUT, output requires &HIDDEN.
+2. The A72 worker loops polled the NC bell and called the handler directly,
+   so the chain never used the IRQ vector; in SGI mode they now sleep in WFI
+   and the ISR path (handle_irq_exception -> pipeit_sgi_*) does the work.
+3. IRQ-path readers needed dc ivac of dispatch_idx + the slot (stale-line
+   "skips" would silently stop the chain).
+
+Performance (measured, not predicted): the full chain is ~5.8x slower than the
+polling path (10-19 us vs ~3.3 us/frame) - extra hops and IRQ entry beat the
+removed polling. Its value is the WFI-sleep workers (power) and a certified
+event-driven capability, NOT latency. Polling remains the throughput default;
+SGI mode is the certified alternate selected at runtime when delivery probes
+pass and PIPEIT_SGI_ALLOW is set.

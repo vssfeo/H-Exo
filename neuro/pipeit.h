@@ -118,6 +118,20 @@ void pipeit_worker_idle_output(void);
 // NC stores are fire-and-forget and need no cache maintenance, so the probe
 // adds no cross-cluster traffic of its own.
 #define PIPEIT_NC_TS_PICKUP   (*(volatile u64 *)(PIPEIT_NC_BASE + 0xC0))
+
+// IPC microbenchmark slots (mode 0..3 = poll/sev-wfe/sgi-wfi/sgi-spin), reused
+// across mechanisms and directions. All in the NC region: no cache ops needed.
+#define IPC_NC_ACTIVE (*(volatile u64 *)(PIPEIT_NC_BASE + 0x180))  /* phase gate   */
+#define IPC_NC_MODE   (*(volatile u64 *)(PIPEIT_NC_BASE + 0x1C0))  /* mechanism    */
+#define IPC_NC_CMD    (*(volatile u64 *)(PIPEIT_NC_BASE + 0x200))  /* command seq  */
+#define IPC_NC_ACK    (*(volatile u64 *)(PIPEIT_NC_BASE + 0x240))  /* ack seq      */
+#define IPC_NC_ROLE   (*(volatile u64 *)(PIPEIT_NC_BASE + 0x280))  /* respond core | (1<<8)=core4-init */
+#define IPC_NC_PHASE  (*(volatile u64 *)(PIPEIT_NC_BASE + 0x2C0))  /* core4-init done */
+#define IPC_NC_READY  (*(volatile u64 *)(PIPEIT_NC_BASE + 0x300))  /* target core entered phase */
+
+// SGI chain witness, incremented on core 0 by pipeit_sgi_done()
+// (see pipeit.c); poll mode never sends the DONE SGI.
+extern volatile u64 g_pipeit_done_irq;
 #define PIPEIT_NC_TS_COMPUTE  (*(volatile u64 *)(PIPEIT_NC_BASE + 0x100))
 #define PIPEIT_NC_TS_BELL     (*(volatile u64 *)(PIPEIT_NC_BASE + 0x140))
 

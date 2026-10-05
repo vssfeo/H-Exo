@@ -50,6 +50,230 @@ static thermal_guard_t g_thermal_guard;
 // Phase 4.3: WCET measurement regions
 static wcet_region_t g_wcet_inference;
 static wcet_region_t g_wcet_pipeit;
+// --- IPC bench inserted ---
+
+// ---------------------------------------------------------------------------
+// IPC microbenchmark (2026-10-04): one table, measured on the board.
+//   mechanisms  : 0 poll (receiver spins on NC cmd), 1 SEV/WFE (receiver wfe),
+//                 2 SGI+wfi (receiver sleeps, ISR acks), 3 SGI+no-wfi (receiver
+//                 spins, ISR acks - interrupt latency on a busy core)
+//   directions  : A53->A53 (core0->core1), A53->A72 (core0->core4),
+//                 A72->A72 (core4->core5, core4 runs the initiator)
+//   stats       : min / avg / p99 / max in ns over IPC_BENCH_N samples.
+// All handshake slots are Normal Non-Cacheable (PIPEIT_NC_BASE): published and
+// observed directly, no dc cvac/ivac needed; sev/sgi are the wake assist only.
+// Every wait is bounded (IPC_BENCH_TIMEOUT_TICKS) so a lost SGI cannot wedge
+// the boot; a timed-out sample is dropped and the cell reports its real count.
+static u64 read_cntpct(void);   /* defined later in this file; used by the bench */
+#define IPC_BENCH_N         1000
+#define IPC_BENCH_TIMEOUT   1200000ULL      /* ticks @24 MHz (50 ms) */
+#define IPC_MECH_POLL       0
+#define IPC_MECH_SEVWFE     1
+#define IPC_MECH_SGIWFI     2
+#define IPC_MECH_SGISPIN    3
+static u64 g_ipc_deltas[IPC_BENCH_N];
+
+static inline u64 ipc_bench_ns(u64 ticks) { return (ticks * 125ULL) / 3ULL; }
+
+// Run one phase as the INITIATOR (core 0 for A53->*, core 4 for A72->A72).
+static void ipc_bench_initiator(u32 respond_core, u32 mech, u32* ok_cnt) {
+    u64 aff = (respond_core < 4u) ? (u64)respond_core
+                                  : (0x100u + (u64)(respond_core - 4u));
+    u64 seq = 0;
+    u32 cnt = 0;
+    for (u32 k = 0; k < IPC_BENCH_N; k++) {
+        seq = (seq + 1u) & 0x7FFFFFFFULL;
+        IPC_NC_CMD = seq;
+        if (mech == IPC_MECH_SEVWFE) asm volatile("sev" ::: "memory");
+        if (mech == IPC_MECH_SGIWFI || mech == IPC_MECH_SGISPIN)
+            gicv3_sgi_send(4, aff);
+        u64 t0 = read_cntpct();
+        u64 guard = t0;
+        while (IPC_NC_ACK != seq) {
+            if ((read_cntpct() - guard) > IPC_BENCH_TIMEOUT) break;
+        }
+        if (IPC_NC_ACK != seq) continue;   /* timed out - drop the sample */
+        g_ipc_deltas[cnt++] = read_cntpct() - t0;
+    }
+    *ok_cnt = cnt;
+}
+
+// Responder on the phase's target core.
+static void ipc_bench_responder(u32 mech) {
+    u64 last = 0;
+    while (IPC_NC_ACTIVE) {
+        u64 cmd = IPC_NC_CMD;
+        if (cmd != last) {
+            last = cmd;
+            if (mech != IPC_MECH_SGIWFI && mech != IPC_MECH_SGISPIN)
+                IPC_NC_ACK = cmd;          /* poll/sev: ack from the loop */
+        }
+        if (mech == IPC_MECH_SGIWFI) {
+            asm volatile("wfi" ::: "memory");
+        } else if (mech == IPC_MECH_SEVWFE) {
+            asm volatile("wfe" ::: "memory");
+        }
+        /* POLL and SGISPIN just spin the while(IPC_NC_ACTIVE) loop */
+    }
+}
+
+// Called from smp_secondary_main when the phase gate is live.
+// core 4 with role-init runs the A72->A72 initiator (target = role respond).
+void ipc_bench_core_entry(u32 core_idx) {
+    u64 role = IPC_NC_ROLE;
+    u32 respond_core = (u32)(role & 0xFFu);
+    u32 mech = (u32)(IPC_NC_MODE & 3u);
+    if ((role & 0x100u) && core_idx == 4u) {
+        IPC_NC_READY = 1;
+        if ((g_ipc_deltas[0] == 0) /* cheap marker gate */) {}
+
+        u32 ok = 0;
+        ipc_bench_initiator(respond_core, mech, &ok);   /* one phase */
+
+        IPC_NC_PHASE = 1;
+        while (IPC_NC_ACTIVE) asm volatile("wfe" ::: "memory");
+        return;
+    }
+    if (core_idx == respond_core) {
+        IPC_NC_READY = 1;
+
+        ipc_bench_responder(mech);
+        return;
+    }
+    /* non-participating core: return immediately */
+}
+
+// One phase, orchestrated from core 0.
+static void ipc_bench_phase(u32 mech, u32 respond_core, u32 init_on_4,
+                            u64* out_min, u64* out_avg, u64* out_p99,
+                            u64* out_max, u32* out_ok) {
+    IPC_NC_MODE   = mech;
+    IPC_NC_ROLE   = (u64)respond_core | (init_on_4 ? 0x100ULL : 0ULL);
+    IPC_NC_CMD    = 0;
+    IPC_NC_ACK    = 0;
+    IPC_NC_PHASE  = 0;
+    IPC_NC_READY  = 0;
+    asm volatile("dsb sy" ::: "memory");
+    IPC_NC_ACTIVE = 1;
+    asm volatile("dsb sy" ::: "memory");
+    /* Wake everyone (sev, broadcast) and, for the core-4-initiator phases, a
+     * targeted SGI straight into core 4's IRQ - more reliable than relying on
+     * its wfe wake timing. The ISR ignores the ack when the init role is set. */
+    asm volatile("sev" ::: "memory");
+    asm volatile("sev" ::: "memory");
+
+    /* Target core confirms it entered the phase (bounded). SEV/WFE wake is
+     * racy (a core that wfe'd just before the strobe can miss it), so for the
+     * core-4 initiator phases we STROKE: repeated directed SGI + sev until
+     * READY (the core actually entered) or the bound expires. */
+    {
+        u64 guard = read_cntpct();
+        while (IPC_NC_READY == 0) {
+            if ((read_cntpct() - guard) > IPC_BENCH_TIMEOUT) {
+                uart_puts(&console, "[IPCBENCH] ready-timeout mode=0x");
+                uart_put_hex(&console, mech);
+                uart_puts(&console, " rc=0x");
+                uart_put_hex(&console, respond_core);
+                uart_puts(&console, "\r\n");
+                break;
+            }
+            if (init_on_4) gicv3_sgi_send(4, 0x100);
+            asm volatile("sev" ::: "memory");
+            for (u32 k = 0; k < 400; k++) asm volatile("yield");
+        }
+    }
+
+    u32 ok = 0;
+    if (init_on_4) {
+        u64 guard = read_cntpct();
+        while (IPC_NC_PHASE == 0) {
+            if ((read_cntpct() - guard) > IPC_BENCH_TIMEOUT) {
+                uart_puts(&console, "[IPCBENCH] phase4 timeout mode=0x");
+                uart_put_hex(&console, mech);
+                uart_puts(&console, " ready=0x");
+                uart_put_hex(&console, IPC_NC_READY);
+                uart_puts(&console, " phase=0x");
+                uart_put_hex(&console, IPC_NC_PHASE);
+                uart_puts(&console, "\r\n");
+                break;
+            }
+        }
+    } else {
+        ipc_bench_initiator(respond_core, mech, &ok);
+    }
+    IPC_NC_ACTIVE = 0;
+    asm volatile("dsb sy" ::: "memory");
+    /* Flush sleeping responders with a sev broadcast BEFORE the drain: a core
+     * parked in wfe/wfi when ACTIVE went 0 would otherwise only wake when the
+     * NEXT phase re-arms ACTIVE=1, latch on the stale mech and never return to
+     * the smp gate (the phase-to-phase poison). With the flush it wakes in the
+     * drain, sees ACTIVE==0 and exits cleanly. */
+    asm volatile("sev" ::: "memory");
+    asm volatile("sev" ::: "memory");
+    /* Drain ~2 ms (48000 ticks): responders observe ACTIVE==0 and return to
+     * the smp loop before the next phase is armed. */
+    {
+        u64 td = read_cntpct();
+        while ((read_cntpct() - td) < 48000ULL) asm volatile("yield");
+    }
+    *out_ok = ok;
+    if (ok == 0) { *out_min = 0; *out_avg = 0; *out_p99 = 0; *out_max = 0; return; }
+
+    /* stats: insertion-free selection (small N) */
+    for (u32 i = 1; i < ok; i++) {
+        u64 v = g_ipc_deltas[i];
+        u32 j = i;
+        while (j > 0 && g_ipc_deltas[j-1] > v) { g_ipc_deltas[j] = g_ipc_deltas[j-1]; j--; }
+        g_ipc_deltas[j] = v;
+    }
+    u64 sum = 0; for (u32 i = 0; i < ok; i++) sum += g_ipc_deltas[i];
+    u32 p99i = (u32)((u64)(ok - 1) * 99ULL / 100ULL);
+    *out_min = ipc_bench_ns(g_ipc_deltas[0]);
+    *out_avg = ipc_bench_ns(sum / ok);
+    *out_p99 = ipc_bench_ns(g_ipc_deltas[p99i]);
+    *out_max = ipc_bench_ns(g_ipc_deltas[ok - 1]);
+}
+
+// The interrupt-side ack for SGI modes (weak default in exceptions.c).
+void ipc_bench_sgi_isr(void) {
+    if (IPC_NC_ACTIVE) {
+        /* role bit 8 = the core-4 INITIATOR wake: that SGI must not ack the
+         * command or it would short-circuit the responder. */
+        if (IPC_NC_ROLE & 0x100ULL) return;
+        u64 m = IPC_NC_MODE & 3u;
+        if (m == IPC_MECH_SGIWFI || m == IPC_MECH_SGISPIN)
+            IPC_NC_ACK = IPC_NC_CMD;      /* NC store: no cache maint needed */
+    }
+}
+
+// Print the table. min/avg/p99/max in ns; ok = valid samples out of N.
+static void ipc_bench_run(void) {
+    uart_puts(&console, "[IPCBENCH] mech/dir:        n    min    avg    p99    max (ns)\\r\\n");
+    const u32 mechs[4] = {IPC_MECH_POLL, IPC_MECH_SEVWFE,
+                          IPC_MECH_SGIWFI, IPC_MECH_SGISPIN};
+    const char* mn[4] = {"poll   ", "sev/wfe", "sgi+wfi", "sgi-spin"};
+    /* directions: respond core, init_on_4, label */
+    const u32 rc[3] = {1u, 4u, 5u};
+    const u32 io[3] = {0u, 0u, 1u};
+    const char* dl[3] = {"A53->A53", "A53->A72", "A72->A72"};
+    for (u32 d = 0; d < 3; d++) {
+        for (u32 m = 0; m < 4; m++) {
+            u64 mn_, av, p9, mx; u32 ok;
+            ipc_bench_phase(mechs[m], rc[d], io[d], &mn_, &av, &p9, &mx, &ok);
+            uart_puts(&console, "[IPCBENCH] "); uart_puts(&console, dl[d]);
+            uart_puts(&console, " "); uart_puts(&console, mn[m]);
+            uart_puts(&console, " n=0x"); uart_put_hex(&console, ok);
+            uart_puts(&console, " min=0x"); uart_put_hex(&console, mn_);
+            uart_puts(&console, " avg=0x"); uart_put_hex(&console, av);
+            uart_puts(&console, " p99=0x"); uart_put_hex(&console, p9);
+            uart_puts(&console, " max=0x"); uart_put_hex(&console, mx);
+            uart_puts(&console, "\\r\\n");
+        }
+    }
+    uart_puts(&console, "[IPCBENCH] END\\r\\n");
+}
+
+
 
 // Phase 5.4: Gossip federated learning instance
 static gossip_t g_gossip;
@@ -214,13 +438,13 @@ static void baseline_runner_a72(u64 arg) {
     // Per-core PMU setup (A72 has its own PMCR/CNTENSET/PMCCFILTR/MDCR_EL2).
     // Use A72-specific event list with ASIMD_SPEC for NEON profiling.
     pmu_init_local_a72();
-    
+
     pmu_snapshot_t b_start, b_end, b_delta;
     u64 t_min = ~0ULL, t_max = 0, t_sum = 0, t_sum_sq = 0;
     u64 cyc_min = ~0ULL, cyc_max = 0, cyc_sum = 0;
     u64 inst_sum = 0, l1m_sum = 0, l2m_sum = 0, bus_sum = 0, br_sum = 0;
     u64 asimd_sum = 0;
-    
+
     inference_result_t r;
 
     // Phase 1.4: warmup pass — populate L1i (NEON hidden+output code) and
@@ -264,7 +488,7 @@ static void baseline_runner_a72(u64 arg) {
         asimd_sum += b_delta.asimd_spec;
     }
     u64 elapsed = read_cntpct() - t0;
-    
+
     u64 avg_ticks  = t_sum / PMU_BASELINE_COUNT;
     u64 avg_cycles = cyc_sum / PMU_BASELINE_COUNT;
     u64 avg_inst   = inst_sum / PMU_BASELINE_COUNT;
@@ -272,15 +496,15 @@ static void baseline_runner_a72(u64 arg) {
     u64 mean_sq    = avg_ticks * avg_ticks;
     u64 e_x_sq     = t_sum_sq / PMU_BASELINE_COUNT;
     u64 var_ticks  = (e_x_sq > mean_sq) ? (e_x_sq - mean_sq) : 0;
-    
+
     // DDR Bandwidth approximation: requires BUS_CYCLES on counter 4.
     // A72 uses L1D_CACHE on counter 4 instead, so DDR calc is invalid → report 0.
     // (A53 baseline still uses BUS_CYCLES and gets correct ddr_mbps.)
     u64 ddr_mbps = 0;
-    
+
     u64 mpidr;
     asm volatile("mrs %0, mpidr_el1" : "=r"(mpidr));
-    
+
     g_a72_baseline.mpidr      = mpidr & 0xFFFFFFu;
     g_a72_baseline.avg_cycles = avg_cycles;
     g_a72_baseline.min_cycles = cyc_min;
@@ -539,7 +763,7 @@ void kmain(void) {
     } else {
         LOG_WARN("CCI-500: enable timeout");
     }
-    
+
     // Read-only diagnostic: dump actual CCI snoop state. If A53/A72 snoop_ctrl
     // bits are 0, TF-A did NOT enable snoop and we have a path to fix.
     {
@@ -665,7 +889,7 @@ void kmain(void) {
         uart_put_hex(&console, x1);
         uart_puts(&console, "\r\n");
     }
-    
+
     // Idea #3: report A72 CPUECTLR.SMPEN as probed via SiP SMC RK_SIP_SMPEN_GET
     // by smp_secondary_main on cores 4/5. See docs/tfa_smpen_diag_patch.md.
     //   value 0           -> SMPEN clear (root cause confirmed!)
@@ -1366,7 +1590,7 @@ uart_puts(&console, " [GICCLK] CON12=0x"); uart_put_hex(&console, g12);
         LOG_OK("Neuro-Sync: TinyML Engine Ready");
         LOG_OK("Model: 6->8->4 Feedforward Network");
         LOG_OK("Arithmetic: Fixed-Point Q16.16");
-        
+
         u32 expected_crc = get_expected_weights_crc();
         u32 actual_crc   = compute_weights_crc32(neural_arbitrator.weights);
         if (actual_crc == expected_crc) {
@@ -1387,7 +1611,7 @@ uart_puts(&console, " [GICCLK] CON12=0x"); uart_put_hex(&console, g12);
         // Initialize parallel inference (uses all 6 cores: 4 for hidden, 1 for output)
         neuro_parallel_init(neural_arbitrator.weights);
         LOG_OK("Neuro-Parallel: 6-core inference ready (4x hidden + 1x output)");
-        
+
         // Phase 2: Initialize Pipe-it pipeline (3-stage with GICv3 SGI)
         // Don't start yet — core 4/5 must be in WFE workqueue mode for baseline.
         // Pipeline activates after baseline completes (see pipeit_start below).
@@ -1396,7 +1620,7 @@ uart_puts(&console, " [GICCLK] CON12=0x"); uart_put_hex(&console, g12);
         } else {
             LOG_WARN("Pipe-it: initialization failed");
         }
-        
+
         // Phase 5.1: L2 binary protocol
         hexo_l2_init();
         // Phase 5.2: PTP-style clock sync
@@ -1524,13 +1748,13 @@ uart_puts(&console, " [GICCLK] CON12=0x"); uart_put_hex(&console, g12);
         // Phase 0.2: authoritative freq via PMCCNTR/CNTPCT over 1 ms window.
         u32 cpu_mhz_actual = pmu_measure_cpu_freq_mhz(1000u);
         u64 ddr_mbps   = baseline_total_ticks ? (bus_sum * 64 * 24) / baseline_total_ticks : 0;
-        
+
         // Persist for legacy printers and PMU baseline status
         pmu_inference_count = PMU_BASELINE_COUNT;
         pmu_total_cycles    = cyc_sum;
         pmu_total_l1_misses = l1m_sum;
         pmu_total_l2_misses = l2m_sum;
-        
+
         uart_puts(&console, "[BASELINE] COMPLETE\r\n");
         uart_puts(&console, "[BASELINE] total_inferences=0x"); uart_put_hex(&console, PMU_BASELINE_COUNT);
         uart_puts(&console, "\r\n[BASELINE] elapsed_us=0x");   uart_put_hex(&console, baseline_us);
@@ -1574,14 +1798,14 @@ uart_puts(&console, " [GICCLK] CON12=0x"); uart_put_hex(&console, g12);
         uart_puts(&console, ",\"var_ticks\":0x");    uart_put_hex(&console, variance_ticks);
         uart_puts(&console, ",\"avg_ns\":0x");       uart_put_hex(&console, avg_ns);
         uart_puts(&console, "}\r\n[BASELINE] === BASELINE_JSON_END ===\r\n");
-        
+
         // === Phase 0.5: replay identical baseline on A72 core 4 ===
         uart_puts(&console, "\r\n[BASELINE_A72] Dispatching baseline to A72 core 4 @ 1608 MHz...\r\n");
         g_a72_warmup_tel = warmup_tel;
         g_a72_baseline.done_flag = 0;
         asm volatile("dmb ish" ::: "memory");
         wq_dispatch(4, baseline_runner_a72, 0);
-        
+
         // Wait, but NOT 30 s: a wedged A72 here would swallow the whole boot
         // capture (diagnostics that follow - SGI_TEST, the decisive delivery
         // check - would never print). 1.5 s is enough for a baseline that runs
@@ -1645,7 +1869,7 @@ uart_puts(&console, " [GICCLK] CON12=0x"); uart_put_hex(&console, g12);
         } else {
             uart_puts(&console, "[BASELINE_A72] TIMEOUT - A72 core 4 did not complete in 30s\r\n");
         }
-        
+
         // === Phase 2: Pipeline baseline benchmark ===
         // Pipeline is not yet started (g_pipeit_active=0), so we need to
         // temporarily start it, run frames, then stop for the baseline runner.
@@ -1676,16 +1900,16 @@ uart_puts(&console, " [GICCLK] CON12=0x"); uart_put_hex(&console, g12);
     runtime_last_tick_cycles = 0;
     runtime_loop_jitter_percent = 0;
     runtime_last_offload_state = false;
-    
+
     // Minimal post-baseline checks (slow tests disabled for faster iteration)
     uart_puts(&console, "[OK] Boot complete\r\n");
-    
+
     // Unmask IRQ at EL2 BEFORE pipeline start so the SGI self-test can run
     // (sgi_counters update only happens when handle_irq_exception fires, which
     // requires PSTATE.I=0 on core 0).
     asm volatile("msr daifclr, #2" ::: "memory");
     LOG_OK("IRQ: EL2 unmasked -- interrupt-driven network active");
-    
+
     // === SGI delivery self-test (BEFORE pipeit_start) ===
     // Markers placed at every link in the SGI chain so we can pinpoint the
     // break: sender MSR -> distributor -> redistributor pending -> PE IRQ.
@@ -1744,19 +1968,43 @@ uart_puts(&console, " [GICCLK] CON12=0x"); uart_put_hex(&console, g12);
         uart_puts(&console, " | irq_cnt: 0x");              uart_put_hex(&console, c4_before);
         uart_puts(&console, " -> 0x");                       uart_put_hex(&console, c4_after);
         uart_puts(&console, "\r\n");
+        // -- PER-CORE DELIVERY SWEEP (certification): fire generic SGI intid 4
+        // (counted by sgi_total[], NOT sgi_counters[] which only sees 0..3) to
+        // every one of the six cores, then let the [SGI_TOTAL] dump assert
+        // each core > 0. intid 4 is deliberately not a pipe-it stage, so a
+        // non-zero total cannot be explained by pipeline traffic alone. --
+        for (u32 c = 0; c < 6; c++) {
+            u64 aff = (c < 4u) ? (u64)c : (0x100u + (u64)(c - 4u));
+            for (u32 k = 0; k < 64; k++) {
+                gicv3_sgi_send(4, aff);
+                /* ~2us spacing so each strike is acked separately; back-to-back
+                 * SGIs coalesce into one pending bit and under-count. */
+                u64 tt = read_cntpct();
+                while ((read_cntpct() - tt) < 48ULL) asm volatile("yield");
+            }
+        }
+        asm volatile("sev" ::: "memory");
+        asm volatile("sev" ::: "memory");
+        /* 40 ms drain so every strike is serviced before the totals print */
+        u64 t_sw = read_cntpct();
+        while ((read_cntpct() - t_sw) < 960000ULL) asm volatile("yield");
+        uart_puts(&console, "[SGI_SWEEP] intid=4 x64 per core, serviced\r\n");
         // Verdict legend:
         //   ispendr_imm has bit1 set & irq_cnt+1 -> chain works
         //   ispendr_imm bit1 set & irq_cnt unchanged -> RD has SGI but PE not delivering (DAIF? VBAR?)
         //   ispendr_imm bit1 clear -> SGI never reached redistributor (sender / distributor)
     }
-    
+
+    // === IPC microbenchmark (pre-pipeline: all 6 cores idle in the smp loop) ===
+    ipc_bench_run();
+
     // Phase 2: Start pipeline now that baseline is done.
     // Core 4/5 will transition from WFE workqueue mode to WFI+SGI pipeline mode.
     pipeit_start(&g_pipeit);
     LOG_INFO("Pipeline active — A72 mailbox/SEV fallback; SGI assist only if mode=1");
-    
+
     LOG_INFO("Runtime: core0-first control loop active");
-    
+
     // === Phase 2: Pipeline baseline benchmark ===
     // Now that IRQ is unmasked, SGI can reach core 4/5.
     // Submit frames and measure end-to-end latency + per-stage cycles.
@@ -1774,7 +2022,7 @@ uart_puts(&console, " [GICCLK] CON12=0x"); uart_put_hex(&console, g12);
         bench_tel.thermal_state = 0x40000;
         bench_tel.packet_rate = 0x50000;
         bench_tel.node_count = 0x60000;
-        
+
         // Reset pipeline profiling counters
         g_pipeit.hidden_cycles_sum = 0;
         g_pipeit.output_cycles_sum = 0;
@@ -1788,6 +2036,7 @@ uart_puts(&console, " [GICCLK] CON12=0x"); uart_put_hex(&console, g12);
         asm volatile("dsb ish" ::: "memory");
 
         u64 t_pipe_start = read_cntpct();
+        uart_puts(&console, "");
 
         // [LOADTEST] per-phase accounting. The bench is closed-loop (submit ->
         // wait completion -> submit), so its number is single-frame LATENCY,
@@ -1837,7 +2086,40 @@ uart_puts(&console, " [GICCLK] CON12=0x"); uart_put_hex(&console, g12);
                 if (g_pipeit_completion_seq >= expected) break;
                 if ((read_cntpct() - t0) > 1200000ULL) { timed_out = 1; break; }
             }
-            if (timed_out) timeout_frames++;
+            if (timed_out) {
+                timeout_frames++;
+                if (timeout_frames == 1) {
+                    /* First stall: dump every chain counter once so the 90 s
+                     * capture shows which hop died even though the bench loop
+                     * itself never finishes. Bounded: one print, then continue. */
+                    extern volatile u64 g_pipeit_hidden_handler_enter;
+                    extern volatile u64 g_pipeit_output_handler_enter;
+                    extern volatile u64 g_pipeit_done_irq;
+                    extern volatile u64 g_pipeit_sgi_sent[4];
+                    extern volatile u64 g_pipeit_loop_iter_hidden;
+                    extern volatile u64 g_pipeit_loop_iter_output;
+                    extern volatile u64 g_pipeit_poll_hits_hidden;
+                    extern volatile u64 g_pipeit_poll_hits_output;
+                    extern volatile u64 g_pipeit_iar_spurious_hidden;
+                    extern volatile u64 g_pipeit_iar_spurious_output;
+                    uart_puts(&console, "[CHAIN] STALL@");
+                    uart_put_hex(&console, i);
+                    uart_puts(&console, " seq=0x"); uart_put_hex(&console, g_pipeit_completion_seq);
+                    uart_puts(&console, " hid_ent=0x"); uart_put_hex(&console, g_pipeit_hidden_handler_enter);
+                    uart_puts(&console, " out_ent=0x"); uart_put_hex(&console, g_pipeit_output_handler_enter);
+                    uart_puts(&console, " done=0x"); uart_put_hex(&console, g_pipeit_done_irq);
+                    uart_puts(&console, " sent_h=0x"); uart_put_hex(&console, g_pipeit_sgi_sent[SGI_STAGE_HIDDEN]);
+                    uart_puts(&console, " o=0x"); uart_put_hex(&console, g_pipeit_sgi_sent[SGI_STAGE_OUTPUT]);
+                    uart_puts(&console, " d=0x"); uart_put_hex(&console, g_pipeit_sgi_sent[SGI_STAGE_DONE]);
+                    uart_puts(&console, " iter_h=0x"); uart_put_hex(&console, g_pipeit_loop_iter_hidden);
+                    uart_puts(&console, " iter_o=0x"); uart_put_hex(&console, g_pipeit_loop_iter_output);
+                    uart_puts(&console, " poll_h=0x"); uart_put_hex(&console, g_pipeit_poll_hits_hidden);
+                    uart_puts(&console, " poll_o=0x"); uart_put_hex(&console, g_pipeit_poll_hits_output);
+                    uart_puts(&console, " spur_h=0x"); uart_put_hex(&console, g_pipeit_iar_spurious_hidden);
+                    uart_puts(&console, " spur_o=0x"); uart_put_hex(&console, g_pipeit_iar_spurious_output);
+                    uart_puts(&console, "\r\n");
+                }
+            }
 
             // [LOADTEST] harvest the frame's timestamps. Tag = low 16 bits of
             // the hidden_pending counter; all three slots must carry it or the
@@ -1887,14 +2169,14 @@ uart_puts(&console, " [GICCLK] CON12=0x"); uart_put_hex(&console, g12);
                 uart_puts(&console, "\r\n");
             }
         }
-        
+
         u64 t_pipe_end = read_cntpct();
         u64 pipe_elapsed_ticks = t_pipe_end - t_pipe_start;
         u64 pipe_elapsed_us = pipe_elapsed_ticks / 24;
         u64 completed_frames = (u64)g_pipeit.total_frames;
         u64 pipe_avg_ns = completed_frames ?
             ((pipe_elapsed_ticks * 125) / (completed_frames * 3)) : 0;
-        
+
         // [LOADTEST] report: per-phase avg/min/max in ns (24 MHz ticks * 125/3),
         // throughput, and the single-core A72 reference from BASELINE_A72 in the
         // same boot. The ratio answers "why microseconds when the compute is
@@ -1955,11 +2237,11 @@ uart_puts(&console, " [GICCLK] CON12=0x"); uart_put_hex(&console, g12);
             uart_puts(&console, "\r\n");
         }
 
-        u64 avg_hidden_cyc = g_pipeit.hidden_count ? 
+        u64 avg_hidden_cyc = g_pipeit.hidden_count ?
             g_pipeit.hidden_cycles_sum / g_pipeit.hidden_count : 0;
-        u64 avg_output_cyc = g_pipeit.output_count ? 
+        u64 avg_output_cyc = g_pipeit.output_count ?
             g_pipeit.output_cycles_sum / g_pipeit.output_count : 0;
-        
+
         uart_puts(&console, "\r\n[PIPE_BENCH] Pipeline baseline (");
         uart_put_hex(&console, PIPE_BENCH_COUNT);
         uart_puts(&console, " frames)\r\n");
@@ -1970,7 +2252,7 @@ uart_puts(&console, " [GICCLK] CON12=0x"); uart_put_hex(&console, g12);
         uart_puts(&console, "[PIPE_BENCH] avg_hidden_cyc=0x");   uart_put_hex(&console, avg_hidden_cyc);
         uart_puts(&console, " avg_output_cyc=0x");               uart_put_hex(&console, avg_output_cyc);
         uart_puts(&console, "\r\n");
-        
+
         // JSON output
         uart_puts(&console, "[PIPE_BENCH] === PIPE_JSON_BEGIN ===\r\n");
         uart_puts(&console, "{\"version\":\"v7\",\"mode\":\"pipeline\",\"n\":0x");  uart_put_hex(&console, PIPE_BENCH_COUNT);
@@ -1980,7 +2262,7 @@ uart_puts(&console, " [GICCLK] CON12=0x"); uart_put_hex(&console, g12);
         uart_puts(&console, ",\"avg_hidden_cyc\":0x");  uart_put_hex(&console, avg_hidden_cyc);
         uart_puts(&console, ",\"avg_output_cyc\":0x");  uart_put_hex(&console, avg_output_cyc);
         uart_puts(&console, "}\r\n[PIPE_BENCH] === PIPE_JSON_END ===\r\n");
-        
+
         // === SGI diagnostic dump ===
         // hidden_irq_count == 0 -> SGI never reaches core 4 (GIC routing/redist issue)
         // hidden_irq_count > 0 but completed == 0 -> handler runs but bug inside
@@ -2004,6 +2286,8 @@ uart_puts(&console, " [GICCLK] CON12=0x"); uart_put_hex(&console, g12);
         uart_puts(&console, " done=0x");                              uart_put_hex(&console, g_pipeit_sgi_sent[SGI_STAGE_DONE]);
         extern volatile u64 g_pipeit_sgi_a72_enabled;
         uart_puts(&console, " mode_sgi_a72=0x");                       uart_put_hex(&console, g_pipeit_sgi_a72_enabled);
+        { extern volatile u64 g_pipeit_done_irq;
+          uart_puts(&console, " done_irq=0x"); uart_put_hex(&console, g_pipeit_done_irq); }
         uart_puts(&console, "\r\n[PIPE_DIAG] handler_hidden: enter=0x"); uart_put_hex(&console, g_pipeit_hidden_handler_enter);
         uart_puts(&console, " exit=0x");                                  uart_put_hex(&console, g_pipeit_hidden_handler_exit);
         uart_puts(&console, "\r\n[PIPE_DIAG] handler_output: enter=0x"); uart_put_hex(&console, g_pipeit_output_handler_enter);
@@ -2039,9 +2323,23 @@ uart_puts(&console, " [GICCLK] CON12=0x"); uart_put_hex(&console, g12);
             uart_puts(&console, " done=0x");   uart_put_hex(&console, sgi_counters[c][SGI_STAGE_DONE]);
             uart_puts(&console, "\r\n");
         }
+        // Per-core TOTAL SGI deliveries across the whole intid 0..15 SGI space,
+        // not just the four pipe-it stages. This is the line a machine check can
+        // assert on: "every core received at least one SGI". The structural
+        // marker contract in docs/expected/markers.txt cannot express it,
+        // because all six [PIPE_DIAG] lines can be present while every counter
+        // is zero - the log would pass a grep and the SGI path would be dead.
+        {
+            extern volatile u64 sgi_total[6];
+            for (u32 c = 0; c < 6; c++) {
+                uart_puts(&console, "[SGI_TOTAL] core=0x"); uart_put_hex(&console, c);
+                uart_puts(&console, " total=0x");            uart_put_hex(&console, sgi_total[c]);
+                uart_puts(&console, "\r\n");
+            }
+        }
         // Per-core GIC state snapshot (recorded inside gicv3_init_cpu_iface).
         // init=0 -> function never ran on that core (PSCI never reached it,
-        //          or smp_secondary_main returned early). 
+        //          or smp_secondary_main returned early).
         extern volatile u64 gicv3_core_diag[6][8];
         for (u32 c = 0; c < 6; c++) {
             uart_puts(&console, "[GIC_DIAG] core=0x");      uart_put_hex(&console, c);
@@ -2226,13 +2524,13 @@ uart_puts(&console, " [GICCLK] CON12=0x"); uart_put_hex(&console, g12);
             while (gmac_recv_raw(rx_frame, &rx_len) == OK && rx_len >= 14) {
                 telemetry_note_packet(&telemetry);
                 u16 etype = ((u16)rx_frame[12] << 8) | rx_frame[13];
-                
+
                 // Phase 5.1: H-Exo L2 protocol dispatch (EtherType 0x88EE)
                 if (etype == HEXO_ETHERTYPE) {
                     hexo_l2_handle_rx(rx_frame, rx_len);
                     continue;
                 }
-                
+
                 if (net_process(rx_frame, rx_len) == OK) {
                     if (etype == 0x0806) {
                         LOG_OK("NET: ARP reply sent");
@@ -2255,7 +2553,7 @@ uart_puts(&console, " [GICCLK] CON12=0x"); uart_put_hex(&console, g12);
         gossip_tick(&g_gossip);
         peer_table_tick();
         thermal_guard_update(&g_thermal_guard);
-        
+
         // Phase 6.3: Periodic beacon broadcast (1Hz)
         u64 cyc_now = read_cntpct();
         if ((i64)(cyc_now - g_next_beacon_cyc) >= 0) {
@@ -2271,7 +2569,7 @@ uart_puts(&console, " [GICCLK] CON12=0x"); uart_put_hex(&console, g12);
             hexo_l2_send_beacon(&b);
             g_next_beacon_cyc = cyc_now + BEACON_PERIOD_CYC;
         }
-        
+
         u64 now = read_cntpct();
         if ((i64)(now - next_runtime_tick) >= 0) {
             runtime_update_loop_jitter(now);
@@ -2337,5 +2635,5 @@ uart_puts(&console, " [GICCLK] CON12=0x"); uart_put_hex(&console, g12);
             asm volatile("yield");
         }
     }
-    
+
 }

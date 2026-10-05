@@ -994,7 +994,7 @@ void smp_secondary_main(u64 core_idx) {
         g_smpen_diag[core_idx] = 0xCAFE0000UL | (u64)core_idx;
         asm volatile("dc cvac, %0" :: "r"(&g_smpen_diag[core_idx]) : "memory");
         asm volatile("dsb sy" ::: "memory");
-        
+
         register u64 x0 asm("x0") = 0xC2000099UL;
         register u64 x1 asm("x1") = 0;
         register u64 x2 asm("x2") = 0;
@@ -1040,10 +1040,10 @@ void smp_secondary_main(u64 core_idx) {
     smp_trace_or(SMP_TRACE_C_ENTRY_MASK, 1ull << core_idx);
     smp_trace_or(SMP_TRACE_WQ_MASK, 1ull << core_idx);
     smp_psci_diag[core_idx].flags |= SMP_FLAG_ENTERED_C;
-    
+
     // Phase 2: Initialize this core's GICv3 CPU interface for SGI reception
     gicv3_init_cpu_iface();
-    
+
     // Unmask IRQ+FIQ on secondary cores.
     // Some firmware/security setups may expose SGI on Group0/FIQ path.
     asm volatile("msr daifclr, #3" ::: "memory");
@@ -1090,7 +1090,7 @@ void smp_secondary_main(u64 core_idx) {
         asm volatile("dc civac, %0" :: "r"(&gicv3_core_diag[core_idx][4]) : "memory");
         asm volatile("dsb sy" ::: "memory");
     }
-    
+
     asm volatile("dmb ish" ::: "memory");
     asm volatile("dc civac, %0" :: "r"(&smp_secondary_enter_mask) : "memory");
     asm volatile("dc civac, %0" :: "r"(&smp_trace_page[SMP_TRACE_C_ENTRY_MASK]) : "memory");
@@ -1105,16 +1105,27 @@ void smp_secondary_main(u64 core_idx) {
     extern void pipeit_worker_idle_hidden(void);
     extern void pipeit_worker_idle_output(void);
     extern volatile u32 g_pipeit_active;
-    
+
     // Per-core trace of the smp idle loop:
     //   [0] iterations executed (incl. WFE wakes)
     //   [1] times we observed g_pipeit_active==1 at the gate
     //   [2] times we entered pipeit_worker_idle_* (and returned from it)
     //   [3] last seen g_pipeit_active value
     extern volatile u64 g_smp_loop_diag[6][4];
-    
+
     volatile u64 *counter = &smp_idle_counters[core_idx];
     while (1) {
+        // IPC microbenchmark responder gate (NC slots, no cache ops): when a
+        // bench phase is live, this core either responds or (core 4) runs the
+        // A72->A72 initiator. Returns when the phase ends.
+        extern void ipc_bench_core_entry(u32 core_idx);
+        /* IPC bench phase gate: NC slot at PIPEIT_NC_BASE+0x180 (see
+         * neuro/pipeit.h IPC_NC_ACTIVE); a raw address avoids pulling the
+         * header into the core layer. */
+        if (*(volatile u64 *)(0x10000000ULL + 0x180)) {
+            ipc_bench_core_entry(core_idx);
+            continue;
+        }
         // Inter-cluster coherency workaround: invalidate cached copy of
         // g_pipeit_active before each read so A72 cluster sees fresh DRAM
         // value written by core 0. Required because A72 SMPEN cannot be
@@ -1139,7 +1150,7 @@ void smp_secondary_main(u64 core_idx) {
             }
             // Pipeline stopped — fall through to workqueue mode
         }
-        
+
         wq_worker_poll((u32)core_idx);
         (*counter)++;
         asm volatile("dmb ish" ::: "memory");

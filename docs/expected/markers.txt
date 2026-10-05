@@ -30,8 +30,17 @@ ONLINE after
 [PIPE_BENCH]
 [RUNTIME] inference
 
+# --- SGI delivery: REQUIRED, and deliberately numeric ------------------------
+# Both markers below are required because a run without them did not prove SGI
+# at all. [SGI_TOTAL] in particular is what tools/check_sgi.ps1 asserts against:
+# the structural contract above cannot express "all six cores received an SGI",
+# because six [PIPE_DIAG] lines can be present while every counter reads zero.
+# This numeric pair is the ONE deliberate exception to the structural-only rule
+# stated at the top of this file.
+[SGI_TEST]
+[SGI_TOTAL]
+
 # --- informational: expected today, but removable without failing -------------
-@ [SGI_TEST]
 @ [BND]
 @ [RTYPER]
 @ [GICCLK]
@@ -41,3 +50,10 @@ ONLINE after
 @ [A72WAKE]
 @ [LOADTEST]
 
+
+
+# SGI-driven pipeline chain (2026-10-04): when mode_sgi_a72=1 the stage chain
+# hidden->output->done must complete the bench with zero timeouts and the
+# three sgi_sent counters must each equal the frame count. check_sgi.ps1
+# asserts [SGI_TOTAL] >= MinTotal per core for these runs.
+[SGI_SWEEP]
